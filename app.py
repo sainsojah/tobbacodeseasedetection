@@ -13,6 +13,9 @@ from datetime import datetime
 from ultralytics import YOLO
 import firebase_admin
 from firebase_admin import credentials, firestore
+import torch
+import torch.serialization
+from ultralytics.nn.tasks import DetectionModel
 
 # ==============================
 # INITIALIZATION
@@ -26,7 +29,16 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
 FIREBASE_CONFIG = os.environ.get("FIREBASE_CONFIG")
 ADMIN_PHONE = os.environ.get("ADMIN_PHONE_NUMBER")
 
-# Firebase connection
+# ==============================
+# DEBUG LOGGING FUNCTION
+# ==============================
+def debug_log(message):
+    """Print debug with timestamp"""
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+
+# ==============================
+# FIREBASE CONNECTION
+# ==============================
 db = None
 if FIREBASE_CONFIG:
     try:
@@ -34,17 +46,32 @@ if FIREBASE_CONFIG:
         cred = credentials.Certificate(cred_dict)
         firebase_admin.initialize_app(cred)
         db = firestore.client()
-        print("✅ Firebase connected")
+        debug_log("✅ Firebase connected")
     except Exception as e:
-        print(f"❌ Firebase error: {e}")
+        debug_log(f"❌ Firebase error: {e}")
 
-# YOLO Model
+# ==============================
+# MODEL LOADING WITH PYTORCH 2.6 FIX
+# ==============================
 model = None
 try:
+    # Add DetectionModel to safe globals (required for PyTorch 2.6+)
+    torch.serialization.add_safe_globals([DetectionModel])
+    debug_log("✅ Added DetectionModel to safe globals")
+    
+    # Load model
     model = YOLO("best.pt")
-    print("✅ YOLO model loaded")
+    debug_log("✅ YOLO model loaded successfully")
+    
+    # Warm up the model with a dummy input
+    dummy_input = np.zeros((640, 640, 3), dtype=np.uint8)
+    model(dummy_input)
+    debug_log("✅ Model warmed up successfully")
+    
 except Exception as e:
-    print(f"❌ Model error: {e}")
+    debug_log(f"❌ Model error: {e}")
+    import traceback
+    traceback.print_exc()
 
 # ==============================
 # CONSTANTS & CONTENT
@@ -151,10 +178,11 @@ def send_whatsapp(to, text):
         "text": {"body": text}
     }
     try:
-        requests.post(url, json=payload, headers=headers, timeout=10)
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        debug_log(f"📤 WhatsApp sent to {to}: {response.status_code}")
         return True
     except Exception as e:
-        print(f"WhatsApp send error: {e}")
+        debug_log(f"❌ WhatsApp send error: {e}")
         return False
 
 def get_user(phone):
@@ -165,7 +193,7 @@ def get_user(phone):
         doc = db.collection("users").document(phone).get()
         return doc.to_dict() if doc.exists else None
     except Exception as e:
-        print(f"Firebase get error: {e}")
+        debug_log(f"❌ Firebase get error: {e}")
         return None
 
 def save_user(phone, data):
@@ -176,7 +204,7 @@ def save_user(phone, data):
         db.collection("users").document(phone).set(data, merge=True)
         return True
     except Exception as e:
-        print(f"Firebase save error: {e}")
+        debug_log(f"❌ Firebase save error: {e}")
         return False
 
 def log_detection(phone, name, disease, confidence):
@@ -191,22 +219,30 @@ def log_detection(phone, name, disease, confidence):
             "confidence": confidence,
             "timestamp": firestore.SERVER_TIMESTAMP
         })
+        debug_log(f"📊 Detection logged: {disease} ({confidence:.1f}%)")
     except Exception as e:
-        print(f"Log error: {e}")
+        debug_log(f"❌ Log error: {e}")
 
 def download_image(media_id):
-    """Download image from WhatsApp"""
+    """Download image from WhatsApp with better error handling"""
     try:
+        debug_log(f"📥 Downloading media ID: {media_id}")
+        
         # Get media URL
         url_resp = requests.get(
             f"https://graph.facebook.com/v18.0/{media_id}",
             headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
             timeout=10
         )
+        
         if url_resp.status_code != 200:
+            debug_log(f"❌ Failed to get media URL: {url_resp.status_code}")
             return None
         
-        media_url = url_resp.json().get("url")
+        media_data = url_resp.json()
+        media_url = media_data.get("url")
+        debug_log(f"✅ Got media URL: {media_url[:50]}...")
+        
         if not media_url:
             return None
         
@@ -216,25 +252,40 @@ def download_image(media_id):
             headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
             timeout=30
         )
-        return img_resp.content if img_resp.status_code == 200 else None
+        
+        if img_resp.status_code == 200:
+            debug_log(f"✅ Image downloaded: {len(img_resp.content)} bytes")
+            return img_resp.content
+        else:
+            debug_log(f"❌ Failed to download image: {img_resp.status_code}")
+            return None
+            
     except Exception as e:
-        print(f"Download error: {e}")
+        debug_log(f"❌ Download error: {e}")
         return None
 
 def detect_disease(image_bytes):
-    """Run YOLO detection on image"""
+    """Run YOLO detection with proper error handling"""
     if not model:
+        debug_log("❌ Model not loaded")
         return None
+    
     try:
+        debug_log("🔄 Converting image to numpy array...")
         # Convert bytes to image
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if img is None:
+            debug_log("❌ Failed to decode image - invalid format")
             return None
         
+        debug_log(f"✅ Image decoded: {img.shape}")
+        
         # Run inference
+        debug_log("🔄 Running inference...")
         results = model(img)
+        debug_log("✅ Inference complete")
         
         if results and results[0].boxes is not None and len(results[0].boxes) > 0:
             # Get top prediction (highest confidence)
@@ -245,11 +296,16 @@ def detect_disease(image_bytes):
             
             disease = model.names[int(top.cls[0])]
             confidence = float(top.conf[0]) * 100
+            debug_log(f"✅ Detected: {disease} ({confidence:.1f}%)")
             return disease, confidence
-        
-        return "No Disease Detected", 0
+        else:
+            debug_log("❌ No detections found")
+            return "No Disease Detected", 0
+            
     except Exception as e:
-        print(f"Detection error: {e}")
+        debug_log(f"❌ Detection error: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def get_user_history(phone, limit=5):
@@ -273,7 +329,7 @@ def get_user_history(phone, limit=5):
             history.append(data)
         return history
     except Exception as e:
-        print(f"History error: {e}")
+        debug_log(f"❌ History error: {e}")
         return []
 
 # ==============================
@@ -281,6 +337,8 @@ def get_user_history(phone, limit=5):
 # ==============================
 def handle_message(phone, msg_type, content):
     """Main message handler"""
+    debug_log(f"📨 Handling message: type={msg_type}, phone={phone}")
+    
     user = get_user(phone)
     nav = "\n\n---\n0️⃣ Menu"
     
@@ -307,20 +365,29 @@ def handle_message(phone, msg_type, content):
 
     # WAITING FOR IMAGE
     if state == USER_STATES["WAITING_IMAGE"] and msg_type == "image":
-        send_whatsapp(phone, f"🔍 *Analyzing your image, {name}...*")
+        debug_log(f"📸 Processing image from {phone}")
+        send_whatsapp(phone, f"🔍 Downloading your image, {name}...")
         
         image_bytes = download_image(content)
         if not image_bytes:
+            debug_log("❌ Download failed")
+            send_whatsapp(phone, "❌ Failed to download image. Please try again." + nav)
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
-            return send_whatsapp(phone, "❌ Failed to download image. Please try again." + nav)
+            return
+        
+        debug_log(f"✅ Downloaded {len(image_bytes)} bytes")
+        send_whatsapp(phone, f"✅ Image downloaded! Running AI analysis...")
         
         result = detect_disease(image_bytes)
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         
         if not result:
-            return send_whatsapp(phone, "❌ Analysis failed. Please try another image." + nav)
+            debug_log("❌ Detection failed")
+            send_whatsapp(phone, "❌ AI analysis failed. Please try another photo with good lighting." + nav)
+            return
         
         disease, confidence = result
+        debug_log(f"✅ Detection result: {disease} ({confidence:.1f}%)")
         log_detection(phone, name, disease, confidence)
         
         # PHASE 1 & 4 LOGIC: Confidence filtering and healthy response
@@ -478,7 +545,9 @@ def webhook():
         challenge = request.args.get("hub.challenge")
         
         if verify_token == VERIFY_TOKEN:
+            debug_log("✅ Webhook verified")
             return challenge, 200
+        debug_log("❌ Webhook verification failed")
         return "Forbidden", 403
     
     # Handle incoming messages
@@ -518,7 +587,7 @@ def webhook():
         return jsonify({"status": "ok"}), 200
         
     except Exception as e:
-        print(f"Webhook error: {e}")
+        debug_log(f"❌ Webhook error: {e}")
         return jsonify({"status": "error"}), 500
 
 @app.route("/health", methods=["GET"])
@@ -541,4 +610,5 @@ def home():
 # ==============================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
+    debug_log(f"🚀 Starting Tobacco AI Assistant on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
