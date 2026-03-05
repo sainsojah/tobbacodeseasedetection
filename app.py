@@ -16,6 +16,11 @@ from firebase_admin import credentials, firestore
 import torch
 import torch.serialization
 from ultralytics.nn.tasks import DetectionModel
+import gc  # Garbage collection
+
+# Memory optimizations
+torch.set_num_threads(1)  # Limit CPU threads
+cv2.setNumThreads(0)  # Disable OpenCV threads
 
 # ==============================
 # INITIALIZATION
@@ -51,41 +56,30 @@ if FIREBASE_CONFIG:
         debug_log(f"❌ Firebase error: {e}")
 
 # ==============================
-# SIMPLIFIED MODEL LOADING
+# MODEL LOADING - OPTIMIZED
 # ==============================
 model = None
 try:
-    import torch
-    import torch.serialization
-    
     debug_log("🔄 Loading YOLO model...")
-    
-    # Monkey patch torch.load to always use weights_only=False
-    original_load = torch.load
-    def safe_load(f, *args, **kwargs):
-        kwargs['weights_only'] = False
-        return original_load(f, *args, **kwargs)
-    
-    # Apply the patch
-    torch.load = safe_load
     
     # Load model
     model = YOLO("best.pt")
     
-    # Restore original (optional)
-    torch.load = original_load
+    # Apply optimizations
+    model.conf = 0.25  # Confidence threshold
+    model.iou = 0.45   # IOU threshold
+    model.max_det = 1  # Only detect one object
     
-    debug_log("✅ YOLO model loaded successfully")
+    debug_log("✅ YOLO model loaded")
     
-    # Warm up
-    dummy_input = np.zeros((640, 640, 3), dtype=np.uint8)
-    model(dummy_input)
+    # Quick warm-up with tiny image
+    dummy = np.zeros((160, 160, 3), dtype=np.uint8)
+    model(dummy, verbose=False)
     debug_log("✅ Model warmed up")
     
 except Exception as e:
     debug_log(f"❌ Model error: {e}")
-    import traceback
-    traceback.print_exc()
+    model = None
 # ==============================
 # CONSTANTS & CONTENT
 # ==============================
@@ -278,47 +272,42 @@ def download_image(media_id):
         return None
 
 def detect_disease(image_bytes):
-    """Run YOLO detection with proper error handling"""
+    """Memory-optimized detection"""
     if not model:
-        debug_log("❌ Model not loaded")
         return None
     
     try:
-        debug_log("🔄 Converting image to numpy array...")
-        # Convert bytes to image
+        # Decode image
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
         if img is None:
-            debug_log("❌ Failed to decode image - invalid format")
             return None
         
-        debug_log(f"✅ Image decoded: {img.shape}")
+        # Force small size (320x320 max)
+        h, w = img.shape[:2]
+        if max(h, w) > 320:
+            scale = 320 / max(h, w)
+            new_w, new_h = int(w * scale), int(h * scale)
+            img = cv2.resize(img, (new_w, new_h))
+            debug_log(f"🔄 Resized to {new_w}x{new_h}")
         
-        # Run inference
-        debug_log("🔄 Running inference...")
-        results = model(img)
-        debug_log("✅ Inference complete")
+        # Run inference with minimal settings
+        results = model(img, conf=0.25, verbose=False, max_det=1)
         
-        if results and results[0].boxes is not None and len(results[0].boxes) > 0:
-            # Get top prediction (highest confidence)
-            boxes = results[0].boxes
-            confidences = boxes.conf.cpu().numpy()
-            top_idx = np.argmax(confidences)
-            top = boxes[top_idx]
-            
-            disease = model.names[int(top.cls[0])]
-            confidence = float(top.conf[0]) * 100
-            debug_log(f"✅ Detected: {disease} ({confidence:.1f}%)")
+        # Clean up immediately
+        del img
+        gc.collect()
+        
+        if results and results[0].boxes and len(results[0].boxes) > 0:
+            box = results[0].boxes[0]
+            disease = model.names[int(box.cls[0])]
+            confidence = float(box.conf[0]) * 100
             return disease, confidence
         else:
-            debug_log("❌ No detections found")
             return "No Disease Detected", 0
             
     except Exception as e:
         debug_log(f"❌ Detection error: {e}")
-        import traceback
-        traceback.print_exc()
         return None
 
 def get_user_history(phone, limit=5):
@@ -625,5 +614,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     debug_log(f"🚀 Starting Tobacco AI Assistant on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
+
 
 
