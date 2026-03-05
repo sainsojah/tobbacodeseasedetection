@@ -56,10 +56,16 @@ if FIREBASE_CONFIG:
         debug_log(f"❌ Firebase error: {e}")
 
 # ==============================
-# MODEL LOADING - OPTIMIZED
+# MODEL LOADING - OPTIMIZED WITH SAFE GLOBALS
 # ==============================
 model = None
 try:
+    debug_log("🔄 Adding safe globals for PyTorch 2.6...")
+    
+    # Add DetectionModel to safe globals (required for PyTorch 2.6+)
+    torch.serialization.add_safe_globals([DetectionModel])
+    debug_log("✅ Added DetectionModel to safe globals")
+    
     debug_log("🔄 Loading YOLO model...")
     
     # Load model
@@ -79,7 +85,27 @@ try:
     
 except Exception as e:
     debug_log(f"❌ Model error: {e}")
-    model = None
+    # Fallback attempt
+    try:
+        debug_log("🔄 Attempting fallback load...")
+        import torch
+        # Monkey patch torch.load
+        original_load = torch.load
+        def patched_load(f, *args, **kwargs):
+            kwargs['weights_only'] = False
+            return original_load(f, *args, **kwargs)
+        torch.load = patched_load
+        
+        model = YOLO("best.pt")
+        model.conf = 0.25
+        model.max_det = 1
+        debug_log("✅ Model loaded with fallback")
+        
+        # Restore original
+        torch.load = original_load
+    except Exception as e2:
+        debug_log(f"❌ Fallback also failed: {e2}")
+        model = None
 # ==============================
 # CONSTANTS & CONTENT
 # ==============================
@@ -614,6 +640,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     debug_log(f"🚀 Starting Tobacco AI Assistant on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
+
 
 
 
