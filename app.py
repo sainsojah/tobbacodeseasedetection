@@ -55,15 +55,24 @@ if FIREBASE_CONFIG:
 # ==============================
 model = None
 try:
+    import torch
+    import torch.serialization
+    from ultralytics.nn.tasks import DetectionModel
+    
+    debug_log("🔄 Adding DetectionModel to safe globals...")
     # Add DetectionModel to safe globals (required for PyTorch 2.6+)
     torch.serialization.add_safe_globals([DetectionModel])
     debug_log("✅ Added DetectionModel to safe globals")
     
-    # Load model
-    model = YOLO("best.pt")
+    # Also try the context manager approach as backup
+    debug_log("🔄 Loading YOLO model...")
+    with torch.serialization.safe_globals([DetectionModel]):
+        model = YOLO("best.pt")
+    
     debug_log("✅ YOLO model loaded successfully")
     
     # Warm up the model with a dummy input
+    debug_log("🔄 Warming up model...")
     dummy_input = np.zeros((640, 640, 3), dtype=np.uint8)
     model(dummy_input)
     debug_log("✅ Model warmed up successfully")
@@ -72,6 +81,15 @@ except Exception as e:
     debug_log(f"❌ Model error: {e}")
     import traceback
     traceback.print_exc()
+    
+    # Fallback attempt with weights_only=False if the safe globals approach fails
+    try:
+        debug_log("🔄 Attempting fallback load with weights_only=False...")
+        import torch
+        model = YOLO("best.pt")
+        debug_log("✅ Model loaded with fallback method")
+    except Exception as e2:
+        debug_log(f"❌ Fallback also failed: {e2}")
 
 # ==============================
 # CONSTANTS & CONTENT
@@ -612,3 +630,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     debug_log(f"🚀 Starting Tobacco AI Assistant on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
+
