@@ -4,6 +4,8 @@ requests==2.31.0
 firebase-admin==6.4.0
 opencv-python-headless==4.8.1.78
 numpy==1.24.3
-ultralytics==8.0.220
-setuptools==69.0.2  # Add this line
-wheel==0.42.0        # Add this line
+ultralytics==8.1.0
+torch==2.5.1
+torchvision==0.20.1
+setuptools==69.0.2
+wheel==0.42.0
