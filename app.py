@@ -1,26 +1,16 @@
 """
-Tobacco AI Assistant - Single File Refactored Version
-All-in-one, simplified, maintainable, with Phase 1 & 4 Logic
+Tobacco AI Assistant - Render WhatsApp Bot
+Handles all WhatsApp logic, calls Hugging Face for ML detection
 """
 import os
 import json
 import random
 import requests
-import cv2
-import numpy as np
 from flask import Flask, request, jsonify
 from datetime import datetime
-from ultralytics import YOLO
 import firebase_admin
 from firebase_admin import credentials, firestore
-import torch
-import torch.serialization
-from ultralytics.nn.tasks import DetectionModel
-import gc  # Garbage collection
-
-# Memory optimizations
-torch.set_num_threads(1)  # Limit CPU threads
-cv2.setNumThreads(0)  # Disable OpenCV threads
+import gc
 
 # ==============================
 # INITIALIZATION
@@ -33,10 +23,8 @@ PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
 FIREBASE_CONFIG = os.environ.get("FIREBASE_CONFIG")
 ADMIN_PHONE = os.environ.get("ADMIN_PHONE_NUMBER")
+HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "https://saintsoulider-tobacco-ai.hf.space")  # Your Hugging Face Space URL
 
-# ==============================
-# DEBUG LOGGING FUNCTION
-# ==============================
 def debug_log(message):
     """Print debug with timestamp"""
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
@@ -55,57 +43,6 @@ if FIREBASE_CONFIG:
     except Exception as e:
         debug_log(f"❌ Firebase error: {e}")
 
-# ==============================
-# MODEL LOADING - OPTIMIZED WITH SAFE GLOBALS
-# ==============================
-model = None
-try:
-    debug_log("🔄 Adding safe globals for PyTorch 2.6...")
-    
-    # Add DetectionModel to safe globals (required for PyTorch 2.6+)
-    torch.serialization.add_safe_globals([DetectionModel])
-    debug_log("✅ Added DetectionModel to safe globals")
-    
-    debug_log("🔄 Loading YOLO model...")
-    
-    # Load model
-    model = YOLO("best.pt")
-    
-    # Apply optimizations
-    model.conf = 0.25  # Confidence threshold
-    model.iou = 0.45   # IOU threshold
-    model.max_det = 1  # Only detect one object
-    
-    debug_log("✅ YOLO model loaded")
-    
-    # Quick warm-up with tiny image
-    dummy = np.zeros((160, 160, 3), dtype=np.uint8)
-    model(dummy, verbose=False)
-    debug_log("✅ Model warmed up")
-    
-except Exception as e:
-    debug_log(f"❌ Model error: {e}")
-    # Fallback attempt
-    try:
-        debug_log("🔄 Attempting fallback load...")
-        import torch
-        # Monkey patch torch.load
-        original_load = torch.load
-        def patched_load(f, *args, **kwargs):
-            kwargs['weights_only'] = False
-            return original_load(f, *args, **kwargs)
-        torch.load = patched_load
-        
-        model = YOLO("best.pt")
-        model.conf = 0.25
-        model.max_det = 1
-        debug_log("✅ Model loaded with fallback")
-        
-        # Restore original
-        torch.load = original_load
-    except Exception as e2:
-        debug_log(f"❌ Fallback also failed: {e2}")
-        model = None
 # ==============================
 # CONSTANTS & CONTENT
 # ==============================
@@ -176,23 +113,8 @@ FACTS = [
     "🌍 Tobacco is grown in over 100 countries"
 ]
 
-# Disease Treatments (expanded for all possibilities)
-DISEASE_INFO = {
-    "Black Spot": "• Apply copper fungicides\n• Remove infected leaves\n• Improve air circulation",
-    "Black Shank": "• Remove infected plants\n• Use resistant varieties\n• Improve soil drainage",
-    "Early Blight": "• Apply fungicides like Mancozeb\n• Remove lower leaves\n• Rotate crops",
-    "Late Blight": "• Remove infected plants immediately\n• Apply Ridomil Gold\n• Improve air flow",
-    "Leaf Mold": "• Reduce humidity\n• Apply sulfur-based fungicides\n• Improve ventilation",
-    "Leaf Spot": "• Apply copper fungicides\n• Remove affected leaves\n• Avoid overhead watering",
-    "Powdery Mildew": "• Apply sulfur\n• Improve air circulation\n• Avoid high nitrogen",
-    "Septoria Blight": "• Apply protectant fungicides\n• Remove infected leaves\n• Crop rotation",
-    "Tobacco Mosaic Virus": "• NO CURE - Remove infected plants\n• Wash hands with milk/soap\n• Use resistant varieties",
-    "Spider Mites": "• Apply miticides\n• Use insecticidal soap\n• Maintain humidity",
-    "Healthy": "🎉 Great job! Continue good practices:\n• Regular monitoring\n• Balanced fertilization\n• Proper irrigation"
-}
-
-# Confidence thresholds (Phase 1 & 4)
-CONFIDENCE_THRESHOLD = 45.0  # Below this = reject
+# Confidence threshold (used for messaging)
+CONFIDENCE_THRESHOLD = 25.0
 
 # ==============================
 # HELPER FUNCTIONS
@@ -257,7 +179,7 @@ def log_detection(phone, name, disease, confidence):
         debug_log(f"❌ Log error: {e}")
 
 def download_image(media_id):
-    """Download image from WhatsApp with better error handling"""
+    """Download image from WhatsApp"""
     try:
         debug_log(f"📥 Downloading media ID: {media_id}")
         
@@ -297,43 +219,50 @@ def download_image(media_id):
         debug_log(f"❌ Download error: {e}")
         return None
 
-def detect_disease(image_bytes):
-    """Memory-optimized detection"""
-    if not model:
-        return None
-    
+def call_huggingface_detection(image_bytes):
+    """
+    Call Hugging Face Space for ML detection
+    Uses the /predict endpoint with image upload
+    """
     try:
-        # Decode image
-        nparr = np.frombuffer(image_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is None:
-            return None
+        debug_log("🔄 Calling Hugging Face ML service...")
         
-        # Force small size (320x320 max)
-        h, w = img.shape[:2]
-        if max(h, w) > 320:
-            scale = 320 / max(h, w)
-            new_w, new_h = int(w * scale), int(h * scale)
-            img = cv2.resize(img, (new_w, new_h))
-            debug_log(f"🔄 Resized to {new_w}x{new_h}")
+        # Prepare the image for upload
+        files = {
+            'file': ('image.jpg', image_bytes, 'image/jpeg')
+        }
         
-        # Run inference with minimal settings
-        results = model(img, conf=0.25, verbose=False, max_det=1)
+        # Make request to Hugging Face Space
+        response = requests.post(
+            f"{HF_SPACE_URL}/predict",
+            files=files,
+            timeout=30  # 30 second timeout (HF takes ~13s)
+        )
         
-        # Clean up immediately
-        del img
-        gc.collect()
-        
-        if results and results[0].boxes and len(results[0].boxes) > 0:
-            box = results[0].boxes[0]
-            disease = model.names[int(box.cls[0])]
-            confidence = float(box.conf[0]) * 100
-            return disease, confidence
-        else:
-            return "No Disease Detected", 0
+        if response.status_code == 200:
+            result = response.json()
+            debug_log(f"✅ HF Response: {result}")
             
+            if result.get("success"):
+                return {
+                    "disease": result.get("disease"),
+                    "confidence": result.get("confidence"),
+                    "treatment": result.get("treatment"),
+                    "is_healthy": result.get("is_healthy", False),
+                    "low_confidence": result.get("low_confidence", False)
+                }
+            else:
+                debug_log(f"❌ HF returned error: {result.get('error')}")
+                return None
+        else:
+            debug_log(f"❌ HF HTTP error: {response.status_code}")
+            return None
+            
+    except requests.exceptions.Timeout:
+        debug_log("❌ HF request timed out (30s)")
+        return None
     except Exception as e:
-        debug_log(f"❌ Detection error: {e}")
+        debug_log(f"❌ HF call error: {e}")
         return None
 
 def get_user_history(phone, limit=5):
@@ -404,9 +333,10 @@ def handle_message(phone, msg_type, content):
             return
         
         debug_log(f"✅ Downloaded {len(image_bytes)} bytes")
-        send_whatsapp(phone, f"✅ Image downloaded! Running AI analysis...")
+        send_whatsapp(phone, f"✅ Image downloaded! Running AI analysis on cloud...")
         
-        result = detect_disease(image_bytes)
+        # Call Hugging Face for detection instead of local model
+        result = call_huggingface_detection(image_bytes)
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         
         if not result:
@@ -414,12 +344,14 @@ def handle_message(phone, msg_type, content):
             send_whatsapp(phone, "❌ AI analysis failed. Please try another photo with good lighting." + nav)
             return
         
-        disease, confidence = result
+        disease = result["disease"]
+        confidence = result["confidence"]
+        
         debug_log(f"✅ Detection result: {disease} ({confidence:.1f}%)")
         log_detection(phone, name, disease, confidence)
         
-        # PHASE 1 & 4 LOGIC: Confidence filtering and healthy response
-        if disease == "No Disease Detected" or confidence < CONFIDENCE_THRESHOLD:
+        # Format response based on detection result
+        if result["low_confidence"]:
             send_whatsapp(phone, 
                 f"⚠️ *Low Confidence ({confidence:.1f}%)*\n\n"
                 f"Please upload a clearer, closer photo of the tobacco leaf with good lighting.\n\n"
@@ -428,7 +360,7 @@ def handle_message(phone, msg_type, content):
                 f"• Show affected area clearly\n"
                 f"• Use natural light" + nav)
         
-        elif disease == "Healthy":
+        elif result["is_healthy"]:
             send_whatsapp(phone, 
                 f"🎉 *Healthy Leaf Detected!*\n\n"
                 f"Confidence: {confidence:.1f}%\n\n"
@@ -438,12 +370,11 @@ def handle_message(phone, msg_type, content):
                 f"• Follow your fertilization schedule" + nav)
         
         else:
-            treatment = DISEASE_INFO.get(disease, "• Consult your local agronomist immediately.")
             send_whatsapp(phone, 
                 f"📊 *DISEASE DETECTED*\n\n"
                 f"*Disease:* {disease}\n"
                 f"*Confidence:* {confidence:.1f}%\n\n"
-                f"*Recommended Treatment:*\n{treatment}" + nav)
+                f"*Recommended Treatment:*\n{result['treatment']}" + nav)
         return
 
     # AWAITING FEEDBACK
@@ -587,7 +518,7 @@ def webhook():
         changes = entry.get("changes", [{}])[0]
         value = changes.get("value", {})
         
-        # Ignore status updates (delivery receipts, read receipts)
+        # Ignore status updates
         if "statuses" in value:
             return jsonify({"status": "ignored"}), 200
         
@@ -623,15 +554,15 @@ def health():
     """Health check endpoint"""
     return jsonify({
         "status": "healthy",
-        "model": model is not None,
         "firebase": db is not None,
+        "huggingface_url": HF_SPACE_URL,
         "timestamp": datetime.now().isoformat()
     }), 200
 
 @app.route("/", methods=["GET"])
 def home():
     """Root endpoint"""
-    return "🌿 Tobacco AI Assistant is running!"
+    return "🌿 Tobacco AI Assistant is running! (Using Hugging Face for ML)"
 
 # ==============================
 # START THE APP
@@ -639,8 +570,5 @@ def home():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     debug_log(f"🚀 Starting Tobacco AI Assistant on port {port}")
+    debug_log(f"🤖 Using Hugging Face Space: {HF_SPACE_URL}")
     app.run(host="0.0.0.0", port=port, debug=False)
-
-
-
-
