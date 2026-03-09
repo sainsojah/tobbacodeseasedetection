@@ -23,7 +23,7 @@ PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
 FIREBASE_CONFIG = os.environ.get("FIREBASE_CONFIG")
 ADMIN_PHONE = os.environ.get("ADMIN_PHONE_NUMBER")
-HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "https://saintsoulider-tobacco-ai.hf.space")  # Your Hugging Face Space URL
+HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "https://saintsouldier-tobacco-ai.hf.space")  # Your Hugging Face Space URL
 
 def debug_log(message):
     """Print debug with timestamp"""
@@ -572,3 +572,4 @@ if __name__ == "__main__":
     debug_log(f"🚀 Starting Tobacco AI Assistant on port {port}")
     debug_log(f"🤖 Using Hugging Face Space: {HF_SPACE_URL}")
     app.run(host="0.0.0.0", port=port, debug=False)
+
