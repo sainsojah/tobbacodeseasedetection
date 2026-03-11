@@ -1,6 +1,6 @@
 """
 Tobacco AI Assistant - Render WhatsApp Bot
-Fixed Menu Navigation & AI Rate Limit Handling
+Fixed: Removed self-imposed rate limiters
 """
 import os
 import json
@@ -28,13 +28,9 @@ FIREBASE_CONFIG = os.environ.get("FIREBASE_CONFIG")
 ADMIN_PHONE = os.environ.get("ADMIN_PHONE_NUMBER")
 HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "https://saintsouldier-tobacco-ai.hf.space")
 
-# AI API Keys (Gemini for tips/facts and grading)
-AI_API_KEY = os.environ.get("AI_API_KEY")  # Gemini API key
+# AI API Keys
+AI_API_KEY = os.environ.get("AI_API_KEY")
 AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini")
-
-# Rate limiting for AI calls
-last_ai_call = 0
-AI_CALL_DELAY = 2  # Minimum seconds between AI calls to avoid rate limits
 
 def debug_log(message):
     """Print debug with timestamp"""
@@ -48,17 +44,6 @@ def trim_message(text, max_length=900):
     if len(text) > max_length:
         return text[:max_length-3] + "..."
     return text
-
-# Rate limiter for AI calls
-def wait_for_rate_limit():
-    """Ensure we don't exceed API rate limits"""
-    global last_ai_call
-    now = time.time()
-    time_since_last = now - last_ai_call
-    if time_since_last < AI_CALL_DELAY:
-        sleep_time = AI_CALL_DELAY - time_since_last
-        time.sleep(sleep_time)
-    last_ai_call = time.time()
 
 # ==============================
 # FIREBASE CONNECTION
@@ -86,8 +71,8 @@ USER_STATES = {
     "AWAITING_AI_QUESTION": "awaiting_ai_question",
     "FARMING_MENU": "farming_menu",
     "WAITING_GRADE_IMAGE": "waiting_grade_image",
-    "EXPERT_MENU": "expert_menu",  # New state for expert menu
-    "DASHBOARD_MENU": "dashboard_menu"  # New state for dashboard menu
+    "EXPERT_MENU": "expert_menu",
+    "DASHBOARD_MENU": "dashboard_menu"
 }
 
 # ==============================
@@ -212,10 +197,10 @@ GUIDES = {
 }
 
 # ==============================
-# GEMINI-POWERED DAILY TIPS & FACTS (with rate limit handling)
+# GEMINI-POWERED DAILY TIPS & FACTS (UNBLOCKED)
 # ==============================
 def get_gemini_tip():
-    """Generate a fresh daily farming tip using Gemini"""
+    """Generate a fresh daily farming tip - NO self-limiting"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return random.choice([
             "🚜 Rotate tobacco with maize or beans to prevent soil-borne diseases",
@@ -224,8 +209,6 @@ def get_gemini_tip():
         ])
     
     try:
-        wait_for_rate_limit()  # Respect rate limits
-        
         current_month = datetime.now().strftime("%B")
         
         # Determine current season in Zimbabwe
@@ -236,7 +219,9 @@ def get_gemini_tip():
         else:
             season = "land preparation season"
         
-        prompt = f"""Generate ONE short farming tip for Zimbabwe tobacco farmers during {season}. Max 250 characters. Start with an emoji."""
+        debug_log(f"🔄 Generating tip for {season}")
+        
+        prompt = f"""Generate ONE short farming tip for Zimbabwe tobacco farmers during {season}. Max 250 characters. Start with an emoji. Be practical and specific."""
         
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={AI_API_KEY}"
         
@@ -256,21 +241,25 @@ def get_gemini_tip():
             data = response.json()
             if "candidates" in data and len(data["candidates"]) > 0:
                 tip = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                debug_log(f"✅ Tip generated")
                 return trim_message(tip, 250)
-        
-        # Fallback
-        return random.choice([
-            "🌱 Monitor your fields daily for early disease signs.",
-            "💧 Water early morning to prevent fungal growth.",
-            "🔍 Check lower leaves regularly for first signs of disease."
-        ])
+        elif response.status_code == 429:
+            debug_log(f"❌ Gemini rate limit (429)")
+        else:
+            debug_log(f"❌ Gemini error: {response.status_code}")
             
     except Exception as e:
         debug_log(f"❌ Tip generation error: {e}")
-        return "🌱 Keep monitoring your fields for any disease symptoms."
+    
+    # Fallback
+    return random.choice([
+        "🌱 Monitor your fields daily for early disease signs.",
+        "💧 Water early morning to prevent fungal growth.",
+        "🔍 Check lower leaves regularly for first signs of disease."
+    ])
 
 def get_gemini_fact():
-    """Generate a fresh interesting fact using Gemini"""
+    """Generate a fresh interesting fact - NO self-limiting"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return random.choice([
             "🌱 Tobacco is related to tomatoes and potatoes!",
@@ -279,9 +268,9 @@ def get_gemini_fact():
         ])
     
     try:
-        wait_for_rate_limit()  # Respect rate limits
+        debug_log(f"🔄 Generating fact")
         
-        prompt = """Generate ONE interesting fact about Zimbabwe tobacco farming. Max 250 characters. Start with an emoji."""
+        prompt = """Generate ONE interesting fact about Zimbabwe tobacco farming. Max 250 characters. Start with an emoji. Make it educational."""
         
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={AI_API_KEY}"
         
@@ -301,18 +290,22 @@ def get_gemini_fact():
             data = response.json()
             if "candidates" in data and len(data["candidates"]) > 0:
                 fact = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                debug_log(f"✅ Fact generated")
                 return trim_message(fact, 250)
-        
-        # Fallback
-        return random.choice([
-            "🌱 Zimbabwe's tobacco industry employs over 500,000 people.",
-            "📜 Tobacco has been cultivated for over 8,000 years.",
-            "🌍 Zimbabwe exports tobacco to over 50 countries."
-        ])
+        elif response.status_code == 429:
+            debug_log(f"❌ Gemini rate limit (429)")
+        else:
+            debug_log(f"❌ Gemini error: {response.status_code}")
             
     except Exception as e:
         debug_log(f"❌ Fact generation error: {e}")
-        return "🌱 Zimbabwe tobacco is known worldwide for its quality."
+    
+    # Fallback
+    return random.choice([
+        "🌱 Zimbabwe's tobacco industry employs over 500,000 people.",
+        "📜 Tobacco has been cultivated for over 8,000 years.",
+        "🌍 Zimbabwe exports tobacco to over 50 countries."
+    ])
 
 # ==============================
 # USER STATISTICS FUNCTION
@@ -396,29 +389,31 @@ def get_offline_disease_advice(disease):
         return f"ℹ️ For specific advice on {disease}, please ask the AI advisor (type *ai your question*)"
 
 # ==============================
-# AI LEAF GRADING FUNCTION
+# AI LEAF GRADING (UNBLOCKED)
 # ==============================
 def grade_leaf_with_ai(image_bytes):
-    """Use Gemini Vision to analyze leaf quality and assign grade"""
+    """Grade leaf with NO self-imposed rate limiting"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return None, "AI grading not configured"
     
     try:
-        wait_for_rate_limit()  # Respect rate limits
+        debug_log(f"🔄 Calling Gemini Vision API for grading...")
         
         # Convert image to base64 for Gemini
         image_base64 = base64.b64encode(image_bytes).decode('utf-8')
         
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={AI_API_KEY}"
         
-        prompt = """Analyze this tobacco leaf image for quality. Return a brief WhatsApp-friendly analysis:
+        prompt = """Analyze this tobacco leaf image for quality. Return a brief WhatsApp-friendly analysis in this exact format:
 
-Grade (A/B/C/D):
-Color:
-Damage:
-Market Value:
+🍃 *LEAF QUALITY ANALYSIS*
 
-Keep it short, 3-4 lines."""
+Grade: [A/B/C/D]
+Color: [brief description]
+Damage: [brief description]
+Market: [Premium/Good/Average/Poor]
+
+Keep it short, 4-5 lines max."""
         
         payload = {
             "contents": [{
@@ -440,14 +435,18 @@ Keep it short, 3-4 lines."""
             data = response.json()
             if "candidates" in data and len(data["candidates"]) > 0:
                 analysis = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                debug_log(f"✅ Gemini Vision success")
                 return "Grade", trim_message(analysis, 500)
             else:
+                debug_log(f"⚠️ Gemini Vision returned no candidates")
                 return None, "❌ Could not analyze leaf image."
+        
         elif response.status_code == 429:
-            debug_log("❌ Rate limit hit in grading")
-            return None, "⚠️ AI grading service is busy. Please try again in a few minutes."
+            debug_log(f"❌ REAL Gemini rate limit hit (429)")
+            return None, "⚠️ Google's Vision AI is busy. Please try again in a minute."
+        
         else:
-            debug_log(f"❌ Gemini vision error: {response.status_code}")
+            debug_log(f"❌ Gemini Vision error: {response.status_code}")
             return None, "⚠️ Grading service temporarily unavailable."
             
     except Exception as e:
@@ -455,10 +454,10 @@ Keep it short, 3-4 lines."""
         return None, "❌ Error analyzing leaf quality."
 
 # ==============================
-# AI ADVISOR (with rate limit handling)
+# AI ADVISOR (UNBLOCKED)
 # ==============================
 def ask_ai_advisor(question):
-    """AI advisor with rate limit handling and fallback"""
+    """AI advisor with NO self-imposed rate limiting"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return "🤖 AI advisor not configured. Please add API key."
     
@@ -470,13 +469,15 @@ def ask_ai_advisor(question):
                 disease_found = disease
                 break
         
-        wait_for_rate_limit()  # Respect rate limits
+        debug_log(f"🔄 Calling Gemini API for: {question[:50]}...")
         
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={AI_API_KEY}"
         
-        prompt = f"""You are a Zimbabwe tobacco expert. Answer briefly (max 400 characters):
-        
-Question: {question}"""
+        prompt = f"""You are a Zimbabwe tobacco expert. Answer briefly and practically:
+
+Question: {question}
+
+Keep response under 400 characters for WhatsApp."""
         
         payload = {
             "contents": [{
@@ -489,21 +490,25 @@ Question: {question}"""
         if response.status_code == 200:
             data = response.json()
             if "candidates" in data and len(data["candidates"]) > 0:
-                answer = data["candidates"][0]["content"]["parts"][0]["text"]
+                answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                debug_log(f"✅ Gemini API success")
                 return trim_message(answer, 900)
             else:
+                debug_log(f"⚠️ Gemini returned no candidates")
                 if disease_found:
                     return trim_message(get_offline_disease_advice(disease_found), 900)
                 else:
                     return "ℹ️ Please ask a specific farming question."
+        
         elif response.status_code == 429:
-            debug_log("❌ Rate limit hit in AI advisor")
+            debug_log(f"❌ REAL Gemini rate limit hit (429)")
             if disease_found:
                 return trim_message(get_offline_disease_advice(disease_found), 900)
             else:
-                return "⚠️ AI service is busy. Please try again in a few minutes.\n\nYou can also type *menu* to access farming guides."
+                return "⚠️ Google's AI service is busy. Please try again in a minute.\n\nYou can also type *menu* to access farming guides."
+        
         else:
-            debug_log(f"❌ Gemini error: {response.status_code}")
+            debug_log(f"❌ Gemini API error: {response.status_code}")
             if disease_found:
                 return trim_message(get_offline_disease_advice(disease_found), 900)
             else:
@@ -597,7 +602,6 @@ def download_image(media_id):
         
         media_data = url_resp.json()
         media_url = media_data.get("url")
-        debug_log(f"✅ Got media URL")
         
         if not media_url:
             return None
