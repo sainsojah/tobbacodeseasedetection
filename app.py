@@ -1,19 +1,21 @@
 """
 Tobacco AI Assistant - Render WhatsApp Bot
-Fixed: Removed self-imposed rate limiters
+Fixed: Rate limiting, safer parsing, retry logic, optimized grading
 """
 import os
 import json
 import random
 import requests
+import time
+import base64
+import re
+import gc
 from flask import Flask, request, jsonify
 from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
-import gc
-import base64
-import re
-import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ==============================
 # INITIALIZATION
@@ -44,6 +46,25 @@ def trim_message(text, max_length=900):
     if len(text) > max_length:
         return text[:max_length-3] + "..."
     return text
+
+# ==============================
+# HTTP SESSION WITH RETRIES
+# ==============================
+def create_session_with_retries():
+    """Create requests session with retry logic for API calls"""
+    session = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[408, 429, 500, 502, 503, 504],
+        allowed_methods=["POST", "GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=5, pool_maxsize=5)
+    session.mount('https://', adapter)
+    return session
+
+# Create global session
+http_session = create_session_with_retries()
 
 # ==============================
 # FIREBASE CONNECTION
@@ -197,117 +218,6 @@ GUIDES = {
 }
 
 # ==============================
-# GEMINI-POWERED DAILY TIPS & FACTS (UNBLOCKED)
-# ==============================
-def get_gemini_tip():
-    """Generate a fresh daily farming tip - NO self-limiting"""
-    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
-        return random.choice([
-            "🚜 Rotate tobacco with maize or beans to prevent soil-borne diseases",
-            "💧 Water in the morning to reduce humidity and prevent fungal growth",
-            "🔍 Check fields weekly for early signs of disease"
-        ])
-    
-    try:
-        current_month = datetime.now().strftime("%B")
-        
-        # Determine current season in Zimbabwe
-        if current_month in ["November", "December", "January", "February", "March"]:
-            season = "rainy/planting season"
-        elif current_month in ["April", "May", "June", "July"]:
-            season = "harvesting/curing season"
-        else:
-            season = "land preparation season"
-        
-        debug_log(f"🔄 Generating tip for {season}")
-        
-        prompt = f"""Generate ONE short farming tip for Zimbabwe tobacco farmers during {season}. Max 250 characters. Start with an emoji. Be practical and specific."""
-        
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={AI_API_KEY}"
-        
-        payload = {
-            "contents": [{
-                "parts": [{"text": prompt}]
-            }],
-            "generationConfig": {
-                "temperature": 0.8,
-                "maxOutputTokens": 100
-            }
-        }
-        
-        response = requests.post(url, json=payload, timeout=15)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if "candidates" in data and len(data["candidates"]) > 0:
-                tip = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                debug_log(f"✅ Tip generated")
-                return trim_message(tip, 250)
-        elif response.status_code == 429:
-            debug_log(f"❌ Gemini rate limit (429)")
-        else:
-            debug_log(f"❌ Gemini error: {response.status_code}")
-            
-    except Exception as e:
-        debug_log(f"❌ Tip generation error: {e}")
-    
-    # Fallback
-    return random.choice([
-        "🌱 Monitor your fields daily for early disease signs.",
-        "💧 Water early morning to prevent fungal growth.",
-        "🔍 Check lower leaves regularly for first signs of disease."
-    ])
-
-def get_gemini_fact():
-    """Generate a fresh interesting fact - NO self-limiting"""
-    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
-        return random.choice([
-            "🌱 Tobacco is related to tomatoes and potatoes!",
-            "🍃 Zimbabwe produces world-class flue-cured tobacco",
-            "📜 Tobacco has been cultivated for over 8,000 years"
-        ])
-    
-    try:
-        debug_log(f"🔄 Generating fact")
-        
-        prompt = """Generate ONE interesting fact about Zimbabwe tobacco farming. Max 250 characters. Start with an emoji. Make it educational."""
-        
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={AI_API_KEY}"
-        
-        payload = {
-            "contents": [{
-                "parts": [{"text": prompt}]
-            }],
-            "generationConfig": {
-                "temperature": 0.9,
-                "maxOutputTokens": 100
-            }
-        }
-        
-        response = requests.post(url, json=payload, timeout=15)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if "candidates" in data and len(data["candidates"]) > 0:
-                fact = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                debug_log(f"✅ Fact generated")
-                return trim_message(fact, 250)
-        elif response.status_code == 429:
-            debug_log(f"❌ Gemini rate limit (429)")
-        else:
-            debug_log(f"❌ Gemini error: {response.status_code}")
-            
-    except Exception as e:
-        debug_log(f"❌ Fact generation error: {e}")
-    
-    # Fallback
-    return random.choice([
-        "🌱 Zimbabwe's tobacco industry employs over 500,000 people.",
-        "📜 Tobacco has been cultivated for over 8,000 years.",
-        "🌍 Zimbabwe exports tobacco to over 50 countries."
-    ])
-
-# ==============================
 # USER STATISTICS FUNCTION
 # ==============================
 def get_user_statistics(phone):
@@ -389,75 +299,10 @@ def get_offline_disease_advice(disease):
         return f"ℹ️ For specific advice on {disease}, please ask the AI advisor (type *ai your question*)"
 
 # ==============================
-# AI LEAF GRADING (UNBLOCKED)
-# ==============================
-def grade_leaf_with_ai(image_bytes):
-    """Grade leaf with NO self-imposed rate limiting"""
-    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
-        return None, "AI grading not configured"
-    
-    try:
-        debug_log(f"🔄 Calling Gemini Vision API for grading...")
-        
-        # Convert image to base64 for Gemini
-        image_base64 = base64.b64encode(image_bytes).decode('utf-8')
-        
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={AI_API_KEY}"
-        
-        prompt = """Analyze this tobacco leaf image for quality. Return a brief WhatsApp-friendly analysis in this exact format:
-
-🍃 *LEAF QUALITY ANALYSIS*
-
-Grade: [A/B/C/D]
-Color: [brief description]
-Damage: [brief description]
-Market: [Premium/Good/Average/Poor]
-
-Keep it short, 4-5 lines max."""
-        
-        payload = {
-            "contents": [{
-                "parts": [
-                    {"text": prompt},
-                    {
-                        "inline_data": {
-                            "mime_type": "image/jpeg",
-                            "data": image_base64
-                        }
-                    }
-                ]
-            }]
-        }
-        
-        response = requests.post(url, json=payload, timeout=25)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if "candidates" in data and len(data["candidates"]) > 0:
-                analysis = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                debug_log(f"✅ Gemini Vision success")
-                return "Grade", trim_message(analysis, 500)
-            else:
-                debug_log(f"⚠️ Gemini Vision returned no candidates")
-                return None, "❌ Could not analyze leaf image."
-        
-        elif response.status_code == 429:
-            debug_log(f"❌ REAL Gemini rate limit hit (429)")
-            return None, "⚠️ Google's Vision AI is busy. Please try again in a minute."
-        
-        else:
-            debug_log(f"❌ Gemini Vision error: {response.status_code}")
-            return None, "⚠️ Grading service temporarily unavailable."
-            
-    except Exception as e:
-        debug_log(f"❌ Leaf grading error: {e}")
-        return None, "❌ Error analyzing leaf quality."
-
-# ==============================
-# AI ADVISOR (UNBLOCKED)
+# AI ADVISOR (Fixed with rate limiting & safer parsing)
 # ==============================
 def ask_ai_advisor(question):
-    """AI advisor with NO self-imposed rate limiting"""
+    """AI advisor with rate limiting and safer response parsing"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return "🤖 AI advisor not configured. Please add API key."
     
@@ -469,43 +314,67 @@ def ask_ai_advisor(question):
                 disease_found = disease
                 break
         
-        debug_log(f"🔄 Calling Gemini API for: {question[:50]}...")
+        # ⏱️ Add small delay to prevent rate limiting (1 second)
+        time.sleep(1)
         
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={AI_API_KEY}"
+        debug_log(f"🔄 Calling Gemini API with model gemini-1.5-flash")
         
-        prompt = f"""You are a Zimbabwe tobacco expert. Answer briefly and practically:
-
-Question: {question}
-
-Keep response under 400 characters for WhatsApp."""
+        # Use the session with retries
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={AI_API_KEY}"
         
+        headers = {'Content-Type': 'application/json'}
         payload = {
             "contents": [{
-                "parts": [{"text": prompt}]
-            }]
+                "parts": [{
+                    "text": f"You are a Zimbabwe tobacco expert. Answer briefly and practically:\n\nQuestion: {question}\n\nKeep response under 400 characters for WhatsApp."
+                }]
+            }],
+            "generationConfig": {
+                "temperature": 0.7,
+                "maxOutputTokens": 200,
+                "topP": 0.8,
+                "topK": 10
+            }
         }
         
-        response = requests.post(url, json=payload, timeout=25)
+        # Increased timeout to 20 seconds
+        response = http_session.post(url, headers=headers, json=payload, timeout=20)
         
         if response.status_code == 200:
-            data = response.json()
-            if "candidates" in data and len(data["candidates"]) > 0:
-                answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                debug_log(f"✅ Gemini API success")
-                return trim_message(answer, 900)
-            else:
-                debug_log(f"⚠️ Gemini returned no candidates")
-                if disease_found:
-                    return trim_message(get_offline_disease_advice(disease_found), 900)
+            result = response.json()
+            
+            # 🛡️ SAFER PARSING
+            if "candidates" in result and result["candidates"]:
+                candidate = result["candidates"][0]
+                if "content" in candidate and "parts" in candidate["content"]:
+                    answer = candidate["content"]["parts"][0]["text"].strip()
+                    debug_log(f"✅ Gemini API success")
+                    return trim_message(answer, 900)
                 else:
-                    return "ℹ️ Please ask a specific farming question."
+                    debug_log(f"⚠️ Content structure missing")
+            else:
+                debug_log(f"⚠️ No candidates in response")
+                
+            # If we got here but no text, use fallback
+            if disease_found:
+                return trim_message(get_offline_disease_advice(disease_found), 900)
+            else:
+                return "ℹ️ Please ask a specific farming question."
         
         elif response.status_code == 429:
             debug_log(f"❌ REAL Gemini rate limit hit (429)")
+            time.sleep(2)  # Wait 2 seconds on rate limit
             if disease_found:
                 return trim_message(get_offline_disease_advice(disease_found), 900)
             else:
                 return "⚠️ Google's AI service is busy. Please try again in a minute.\n\nYou can also type *menu* to access farming guides."
+        
+        elif response.status_code == 404:
+            debug_log(f"❌ Model not found - check model name")
+            if disease_found:
+                return trim_message(get_offline_disease_advice(disease_found), 900)
+            else:
+                return "⚠️ AI model configuration error. Using offline knowledge base."
         
         else:
             debug_log(f"❌ Gemini API error: {response.status_code}")
@@ -514,11 +383,213 @@ Keep response under 400 characters for WhatsApp."""
             else:
                 return "⚠️ AI service temporarily unavailable. Please try again later."
             
+    except requests.exceptions.Timeout:
+        debug_log(f"❌ AI request timed out")
+        if disease_found:
+            return trim_message(get_offline_disease_advice(disease_found), 900)
+        else:
+            return "⚠️ AI service is taking too long. Please try again."
     except Exception as e:
         debug_log(f"❌ AI advisor error: {e}")
         if disease_found:
             return trim_message(get_offline_disease_advice(disease_found), 900)
         return "❌ Service error. Please try again later."
+
+# ==============================
+# AI LEAF GRADING (Optimized to prevent timeouts)
+# ==============================
+def grade_leaf_with_ai(image_bytes):
+    """Grade leaf with optimized settings to prevent memory issues"""
+    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
+        return None, "AI grading not configured"
+    
+    try:
+        # ⏱️ Add small delay to prevent rate limiting
+        time.sleep(1)
+        
+        debug_log(f"🔄 Calling Gemini Vision API for grading...")
+        
+        # Use Flash 1.5 - it's faster and smaller (less likely to cause SIGKILL)
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={AI_API_KEY}"
+        
+        # Convert image to base64 for Gemini
+        image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+        
+        headers = {'Content-Type': 'application/json'}
+        
+        # Simplified prompt - less processing needed
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": "Grade this tobacco leaf by color, quality, and damage. Be brief. Return in format:\nGrade: [A/B/C/D]\nColor: [brief]\nDamage: [brief]\nMarket: [Premium/Good/Average/Poor]"},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": image_base64
+                        }
+                    }
+                ]
+            }],
+            "generationConfig": {
+                "temperature": 0.7,
+                "maxOutputTokens": 150,
+                "topP": 0.8
+            }
+        }
+        
+        # 30 second timeout for grading
+        response = http_session.post(url, headers=headers, json=payload, timeout=30)
+        
+        if response.status_code == 200:
+            result = response.json()
+            
+            # Safer parsing
+            if "candidates" in result and result["candidates"]:
+                candidate = result["candidates"][0]
+                if "content" in candidate and "parts" in candidate["content"]:
+                    analysis = candidate["content"]["parts"][0]["text"].strip()
+                    debug_log(f"✅ Gemini Vision success")
+                    return "Grade", trim_message(analysis, 500)
+                else:
+                    debug_log(f"⚠️ Unexpected response structure")
+                    return None, "❌ Could not analyze leaf image format."
+            else:
+                debug_log(f"⚠️ No candidates in response")
+                return None, "❌ Could not analyze leaf image."
+        
+        elif response.status_code == 429:
+            debug_log(f"❌ Gemini rate limit hit (429)")
+            return None, "⚠️ Google's Vision AI is busy. Please try again in a minute."
+        
+        elif response.status_code == 404:
+            debug_log(f"❌ Model not found - check model name")
+            return None, "⚠️ AI model configuration error."
+        
+        else:
+            debug_log(f"❌ Gemini Vision error: {response.status_code}")
+            return None, "⚠️ Grading service temporarily unavailable."
+            
+    except requests.exceptions.Timeout:
+        debug_log(f"❌ Grading request timed out")
+        return None, "⏱️ Grading is taking too long. Try a smaller image."
+    except Exception as e:
+        debug_log(f"❌ Leaf grading error: {e}")
+        return None, "❌ Error analyzing leaf quality."
+    finally:
+        # Clean up
+        gc.collect()
+
+# ==============================
+# GEMINI-POWERED DAILY TIPS (with rate limiting)
+# ==============================
+def get_gemini_tip():
+    """Generate a fresh daily farming tip with rate limiting"""
+    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
+        return random.choice([
+            "🚜 Rotate tobacco with maize or beans to prevent soil-borne diseases",
+            "💧 Water in the morning to reduce humidity and prevent fungal growth",
+            "🔍 Check fields weekly for early signs of disease"
+        ])
+    
+    try:
+        # ⏱️ Small delay for rate limiting
+        time.sleep(0.5)
+        
+        current_month = datetime.now().strftime("%B")
+        
+        # Determine current season in Zimbabwe
+        if current_month in ["November", "December", "January", "February", "March"]:
+            season = "rainy/planting season"
+        elif current_month in ["April", "May", "June", "July"]:
+            season = "harvesting/curing season"
+        else:
+            season = "land preparation season"
+        
+        debug_log(f"🔄 Generating tip for {season}")
+        
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={AI_API_KEY}"
+        
+        headers = {'Content-Type': 'application/json'}
+        prompt = f"Generate ONE short farming tip for Zimbabwe tobacco farmers during {season}. Max 250 characters. Start with an emoji."
+        
+        payload = {
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }],
+            "generationConfig": {
+                "temperature": 0.8,
+                "maxOutputTokens": 100
+            }
+        }
+        
+        response = http_session.post(url, headers=headers, json=payload, timeout=15)
+        
+        if response.status_code == 200:
+            result = response.json()
+            if "candidates" in result and result["candidates"]:
+                tip = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+                return trim_message(tip, 250)
+            
+    except Exception as e:
+        debug_log(f"❌ Tip generation error: {e}")
+    
+    # Fallback
+    return random.choice([
+        "🌱 Monitor your fields daily for early disease signs.",
+        "💧 Water early morning to prevent fungal growth.",
+        "🔍 Check lower leaves regularly."
+    ])
+
+# ==============================
+# GEMINI-POWERED FUN FACTS (with rate limiting)
+# ==============================
+def get_gemini_fact():
+    """Generate a fresh interesting fact with rate limiting"""
+    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
+        return random.choice([
+            "🌱 Tobacco is related to tomatoes and potatoes!",
+            "🍃 Zimbabwe produces world-class flue-cured tobacco",
+            "📜 Tobacco has been cultivated for over 8,000 years"
+        ])
+    
+    try:
+        # ⏱️ Small delay for rate limiting
+        time.sleep(0.5)
+        
+        debug_log(f"🔄 Generating fact")
+        
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={AI_API_KEY}"
+        
+        headers = {'Content-Type': 'application/json'}
+        prompt = "Generate ONE interesting fact about Zimbabwe tobacco farming. Max 250 characters. Start with an emoji."
+        
+        payload = {
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }],
+            "generationConfig": {
+                "temperature": 0.9,
+                "maxOutputTokens": 100
+            }
+        }
+        
+        response = http_session.post(url, headers=headers, json=payload, timeout=15)
+        
+        if response.status_code == 200:
+            result = response.json()
+            if "candidates" in result and result["candidates"]:
+                fact = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+                return trim_message(fact, 250)
+            
+    except Exception as e:
+        debug_log(f"❌ Fact generation error: {e}")
+    
+    # Fallback
+    return random.choice([
+        "🌱 Zimbabwe's tobacco industry employs over 500,000 people.",
+        "📜 Tobacco has been cultivated for over 8,000 years.",
+        "🌍 Zimbabwe exports tobacco to over 50 countries."
+    ])
 
 # ==============================
 # HELPER FUNCTIONS
@@ -1103,7 +1174,7 @@ if __name__ == "__main__":
     debug_log(f"🚀 Starting Tobacco AI Assistant on port {port}")
     debug_log(f"🤖 Using Hugging Face Space: {HF_SPACE_URL}")
     if AI_API_KEY:
-        debug_log(f"🧠 AI Advisor enabled")
+        debug_log(f"🧠 AI Advisor enabled with rate limiting and retries")
     else:
         debug_log(f"ℹ️ AI Advisor disabled")
     app.run(host="0.0.0.0", port=port, debug=False)
