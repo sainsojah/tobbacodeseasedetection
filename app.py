@@ -1,6 +1,6 @@
 """
 Tobacco AI Assistant - Render WhatsApp Bot
-Handles all WhatsApp logic, calls Hugging Face for ML detection
+Enhanced with All Improvements: Farming Menu Navigation, AI Fallback, Stats, Confidence Display
 """
 import os
 import json
@@ -11,6 +11,8 @@ from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
 import gc
+import base64
+import re
 
 # ==============================
 # INITIALIZATION
@@ -23,11 +25,22 @@ PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
 FIREBASE_CONFIG = os.environ.get("FIREBASE_CONFIG")
 ADMIN_PHONE = os.environ.get("ADMIN_PHONE_NUMBER")
-HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "https://saintsouldier-tobacco-ai.hf.space")  # Your Hugging Face Space URL
+HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "https://saintsouldier-tobacco-ai.hf.space")
+
+# AI API Keys (Gemini for tips/facts and grading)
+AI_API_KEY = os.environ.get("AI_API_KEY")  # Gemini API key
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini")  # Using Gemini for everything
 
 def debug_log(message):
     """Print debug with timestamp"""
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+
+# Helper to trim long messages for WhatsApp
+def trim_message(text, max_length=900):
+    """Trim message to safe WhatsApp length"""
+    if len(text) > max_length:
+        return text[:max_length-3] + "..."
+    return text
 
 # ==============================
 # FIREBASE CONNECTION
@@ -44,77 +57,546 @@ if FIREBASE_CONFIG:
         debug_log(f"❌ Firebase error: {e}")
 
 # ==============================
-# CONSTANTS & CONTENT
+# ENHANCED USER STATES
 # ==============================
 USER_STATES = {
     "AWAITING_NAME": "awaiting_name",
     "ACTIVE": "active",
     "WAITING_IMAGE": "waiting_image",
     "AWAITING_FEEDBACK": "awaiting_feedback",
-    "AWAITING_EXPERT": "awaiting_expert"
+    "AWAITING_EXPERT": "awaiting_expert",
+    "AWAITING_AI_QUESTION": "awaiting_ai_question",
+    "FARMING_MENU": "farming_menu",
+    "WAITING_GRADE_IMAGE": "waiting_grade_image"
 }
 
-# Educational Guides
-GUIDES = {
-    "planting": """🌱 *PLANTING GUIDE*
+# ==============================
+# DISEASE KNOWLEDGE BASE (Offline Fallback)
+# ==============================
+DISEASE_KNOWLEDGE_BASE = {
+    "Black Shank": {
+        "cause": "Phytophthora fungus in waterlogged soil",
+        "treatment": "Remove infected plants, apply Ridomil fungicide",
+        "prevention": "Crop rotation with maize, use resistant varieties, improve drainage"
+    },
+    "Black Spot": {
+        "cause": "Fungal infection (Cercospora nicotianae)",
+        "treatment": "Apply copper-based fungicides, remove infected leaves",
+        "prevention": "Improve air circulation, avoid overhead irrigation"
+    },
+    "Early Blight": {
+        "cause": "Alternaria fungus",
+        "treatment": "Apply Mancozeb or chlorothalonil, remove lower leaves",
+        "prevention": "Crop rotation, proper spacing, avoid working in wet fields"
+    },
+    "Late Blight": {
+        "cause": "Phytophthora infestans (water mold)",
+        "treatment": "Remove infected plants immediately, apply Ridomil Gold",
+        "prevention": "Avoid excessive moisture, use disease-free transplants"
+    },
+    "Leaf Mold": {
+        "cause": "Passalora fulva fungus in high humidity",
+        "treatment": "Apply sulfur-based fungicides, improve ventilation",
+        "prevention": "Reduce humidity, proper plant spacing"
+    },
+    "Leaf Spot": {
+        "cause": "Various fungal pathogens",
+        "treatment": "Apply copper fungicides, remove affected leaves",
+        "prevention": "Avoid overhead watering, improve air circulation"
+    },
+    "Powdery Mildew": {
+        "cause": "Erysiphe fungus",
+        "treatment": "Apply sulfur or potassium bicarbonate",
+        "prevention": "Avoid high nitrogen, maintain good air flow"
+    },
+    "Tobacco Mosaic Virus": {
+        "cause": "TMV virus (highly contagious)",
+        "treatment": "NO CURE - remove infected plants immediately",
+        "prevention": "Wash hands with milk/soap, use resistant varieties, disinfect tools"
+    },
+    "Spider Mites": {
+        "cause": "Tiny arachnids (Tetranychus species)",
+        "treatment": "Apply miticides or insecticidal soap",
+        "prevention": "Maintain humidity, avoid water stress"
+    }
+}
+
+# Confidence threshold
+CONFIDENCE_THRESHOLD = 25.0
+
+# ==============================
+# STATIC GUIDES (Fallback if AI fails)
+# ==============================
+PLANTING_GUIDE = """🌱 *PLANTING GUIDE*
 ━━━━━━━━━━━━━━━━━━
 • Bed size: 1m wide x 10m long
 • Plant population: 15,000 plants/ha
 • Spacing: 1.1-1.2m between ridges
 • Transplant: 6-8 weeks after sowing
-• Water immediately after planting""",
+• Water immediately after planting
+• Gap filling within 7-10 days"""
 
-    "fertilizer": """🧪 *FERTILIZER GUIDE*
+FERTILIZER_GUIDE = """🧪 *FERTILIZER GUIDE*
 ━━━━━━━━━━━━━━━━━━
 • Basal: Compound L (5:14:7) 400-600 kg/ha
 • Top dressing 1: Ammonium Nitrate 150-200 kg/ha
 • Top dressing 2: Potassium Nitrate 100-150 kg/ha
 • Apply when soil is moist
-• Never place fertilizer directly under plant""",
+• Never place fertilizer directly under plant
+• Test soil pH (target 5.5-6.5)"""
 
-    "harvesting": """🌾 *HARVESTING GUIDE*
+HARVESTING_GUIDE = """🌾 *HARVESTING GUIDE*
 ━━━━━━━━━━━━━━━━━━
 • Harvest from bottom upward (priming)
-• 2-3 leaves per priming, 4-6 primings total
-• Curing phases:
-  1. Yellowing: 32-38°C (48 hrs)
-  2. Leaf drying: 38-52°C (48 hrs)
-  3. Midrib drying: 52-60°C (24 hrs)
-  4. Killing out: 60-71°C (6 hrs)""",
+• 2-3 leaves per harvest, 4-6 primings total
+• Priming 1 (Sand leaves): 60-65 days
+• Priming 2-3 (Cutters): Best quality
+• Priming 4-5 (Leaf): Upper middle
+• Priming 6 (Tips): Highest nicotine
 
-    "marketing": """💰 *MARKETING 2026*
+Ripeness indicators:
+• Color: Light green to yellow-green
+• Texture: Slightly sticky
+• Midrib: Snaps cleanly
+• Tips: Curved down"""
+
+CURING_GUIDE = """🔥 *CURING GUIDE*
+━━━━━━━━━━━━━━━━━━
+Yellowing (32-38°C, 48hrs, 85-90% humidity)
+• Leaves turn yellow, chlorophyll breaks down
+
+Leaf drying (38-52°C, 48hrs, 70-80% humidity)
+• Lamina dries, color sets
+
+Midrib drying (52-60°C, 24hrs, 50-60% humidity)
+• Stems become brittle
+
+Killing out (60-71°C, 6hrs, 30-40% humidity)
+• Sterilize, fix final color"""
+
+MARKETING_GUIDE = """💰 *MARKETING 2026*
 ━━━━━━━━━━━━━━━━━━
 • Opening: March 2026
 • Biometric ID REQUIRED
 • Register before February 2026
 • Grades: A (Premium), B (Good), C (Fair), D (Low)
-• Payment within 24 hours"""
+• Payment within 24 hours
+• Documents: ID, TIMB registration, grower number"""
+
+GUIDES = {
+    "planting": PLANTING_GUIDE,
+    "fertilizer": FERTILIZER_GUIDE,
+    "harvesting": HARVESTING_GUIDE,
+    "curing": CURING_GUIDE,
+    "marketing": MARKETING_GUIDE
 }
 
-# Daily Tips
-TIPS = [
-    "🚜 Rotate tobacco with maize or beans to prevent soil-borne diseases",
-    "💧 Water in the morning to reduce humidity and prevent fungal growth",
-    "🔍 Check fields weekly for early signs of disease",
-    "🌱 Transplant seedlings in the evening to reduce shock",
-    "🧪 Test soil before applying fertilizer",
-    "🌿 Remove sucker growth weekly",
-    "☀️ Harvest leaves when dry to prevent rot",
-    "📊 Keep records of disease outbreaks",
-    "🧤 Wash hands after handling infected plants"
-]
+# ==============================
+# GEMINI-POWERED DAILY TIPS & FACTS
+# ==============================
+def get_gemini_tip():
+    """
+    Generate a fresh daily farming tip using Gemini
+    Based on current season, weather, and Zimbabwe agricultural news
+    Max 3 sentences, 250 characters
+    """
+    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
+        # Fallback to static tips if no API key
+        fallback_tips = [
+            "🚜 Rotate tobacco with maize or beans to prevent soil-borne diseases",
+            "💧 Water in the morning to reduce humidity and prevent fungal growth",
+            "🔍 Check fields weekly for early signs of disease"
+        ]
+        return random.choice(fallback_tips)
+    
+    try:
+        current_month = datetime.now().strftime("%B")
+        current_year = datetime.now().year
+        
+        # Determine current season in Zimbabwe
+        if current_month in ["November", "December", "January", "February", "March"]:
+            season = "rainy/planting season"
+        elif current_month in ["April", "May", "June", "July"]:
+            season = "harvesting/curing season"
+        else:
+            season = "land preparation season"
+        
+        prompt = f"""Generate ONE short farming tip for Zimbabwe tobacco farmers.
+        
+        Current context:
+        - Month: {current_month} {current_year}
+        - Season: {season}
+        
+        Requirements:
+        - Maximum 3 sentences
+        - Maximum 250 characters
+        - Start with an emoji (🌱, 💧, 🔍, 🌿, ☀️, etc.)
+        - Make it relevant to {season}
+        - Include any current 2026 updates if relevant
+        - Be practical and actionable
+        - Focus on Zimbabwe tobacco farming
+        
+        Example format:
+        🌱 During {season}, focus on monitoring for early blight after recent rains.
+        
+        Generate only the tip, no explanations."""
+        
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={AI_API_KEY}"
+        
+        payload = {
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }],
+            "generationConfig": {
+                "temperature": 0.8,
+                "maxOutputTokens": 100
+            }
+        }
+        
+        response = requests.post(url, json=payload, timeout=15)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if "candidates" in data and len(data["candidates"]) > 0:
+                tip = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                
+                # Ensure it has an emoji
+                if not any(emoji in tip for emoji in ["🚜", "💧", "🔍", "🌱", "🧪", "🌿", "☀️", "📊", "🌡️", "🔥"]):
+                    tip = "🌱 " + tip
+                
+                # Truncate if too long
+                if len(tip) > 250:
+                    tip = tip[:247] + "..."
+                
+                return tip
+            else:
+                return random.choice([
+                    "🌱 Check your seedlings for damping off disease this week.",
+                    "💧 Remember to water early morning to prevent fungal growth.",
+                    "🔍 Scout fields regularly for early signs of disease."
+                ])
+        else:
+            debug_log(f"❌ Gemini tip error: {response.text}")
+            return random.choice([
+                "🌱 Rotate crops to prevent soil-borne diseases.",
+                "💧 Water in the morning for best results.",
+                "🔍 Early detection saves crops - check your fields!"
+            ])
+            
+    except Exception as e:
+        debug_log(f"❌ Tip generation error: {e}")
+        return "🌱 Keep monitoring your fields for any disease symptoms."
 
-# Fun Facts
-FACTS = [
-    "🌱 Tobacco is related to tomatoes and potatoes!",
-    "🍃 Zimbabwe produces world-class flue-cured tobacco",
-    "📜 Tobacco has been cultivated for over 8,000 years",
-    "🌿 One plant can produce up to 30 leaves",
-    "🌍 Tobacco is grown in over 100 countries"
-]
+def get_gemini_fact():
+    """
+    Generate a fresh interesting fact using Gemini
+    Based on current tobacco news and Zimbabwe agricultural context
+    Max 3 sentences, 250 characters
+    """
+    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
+        # Fallback to static facts
+        fallback_facts = [
+            "🌱 Tobacco is related to tomatoes and potatoes!",
+            "🍃 Zimbabwe produces world-class flue-cured tobacco",
+            "📜 Tobacco has been cultivated for over 8,000 years"
+        ]
+        return random.choice(fallback_facts)
+    
+    try:
+        current_year = datetime.now().year
+        
+        prompt = f"""Generate ONE interesting fact about tobacco farming.
+        
+        Requirements:
+        - Maximum 3 sentences
+        - Maximum 250 characters
+        - Start with an emoji (🌱, 📜, 🌍, 📊, 🔬, etc.)
+        - Focus on Zimbabwe tobacco industry when possible
+        - Include {current_year} updates if relevant
+        - Make it educational and engaging
+        - Can be historical, scientific, or economic
+        
+        Examples:
+        🌱 Zimbabwe tobacco farmers can earn up to $5/kg for Grade A leaf in 2026.
+        📜 The first tobacco seeds arrived in Zimbabwe in the 1890s.
+        🌍 Zimbabwe is among the top 10 flue-cured tobacco exporters globally.
+        
+        Generate only the fact, no explanations."""
+        
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={AI_API_KEY}"
+        
+        payload = {
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }],
+            "generationConfig": {
+                "temperature": 0.9,
+                "maxOutputTokens": 100
+            }
+        }
+        
+        response = requests.post(url, json=payload, timeout=15)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if "candidates" in data and len(data["candidates"]) > 0:
+                fact = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                
+                # Ensure it has an emoji
+                if not any(emoji in fact for emoji in ["🌱", "📜", "🌍", "📊", "🔬", "🌡️", "💰", "🚜"]):
+                    fact = "📊 " + fact
+                
+                # Truncate if too long
+                if len(fact) > 250:
+                    fact = fact[:247] + "..."
+                
+                return fact
+            else:
+                return random.choice([
+                    "🌱 Zimbabwe's tobacco industry employs over 500,000 people.",
+                    "📜 Tobacco has been cultivated for over 8,000 years.",
+                    "🌍 Zimbabwe exports tobacco to over 50 countries."
+                ])
+        else:
+            debug_log(f"❌ Gemini fact error: {response.text}")
+            return random.choice([
+                "🌱 Tobacco is related to tomatoes and potatoes!",
+                "🍃 Zimbabwe produces world-class flue-cured tobacco",
+                "📊 Proper curing can increase leaf value by 40%."
+            ])
+            
+    except Exception as e:
+        debug_log(f"❌ Fact generation error: {e}")
+        return "🌱 Zimbabwe tobacco is known worldwide for its quality."
 
-# Confidence threshold (used for messaging)
-CONFIDENCE_THRESHOLD = 25.0
+# ==============================
+# USER STATISTICS FUNCTION
+# ==============================
+def get_user_statistics(phone):
+    """Get detailed statistics for a user"""
+    if not db:
+        return {
+            "total_scans": 0,
+            "top_disease": "None",
+            "healthy_count": 0
+        }
+    
+    try:
+        docs = db.collection("detections")\
+            .where("phone", "==", phone)\
+            .stream()
+        
+        total_scans = 0
+        disease_counts = {}
+        healthy_count = 0
+        
+        for doc in docs:
+            data = doc.to_dict()
+            total_scans += 1
+            disease = data.get("disease", "Unknown")
+            
+            if disease == "Healthy":
+                healthy_count += 1
+            else:
+                disease_counts[disease] = disease_counts.get(disease, 0) + 1
+        
+        # Find most common disease
+        top_disease = "None"
+        if disease_counts:
+            top_disease = max(disease_counts, key=disease_counts.get)
+        
+        return {
+            "total_scans": total_scans,
+            "top_disease": top_disease,
+            "healthy_count": healthy_count
+        }
+    except Exception as e:
+        debug_log(f"❌ Stats error: {e}")
+        return {
+            "total_scans": 0,
+            "top_disease": "None",
+            "healthy_count": 0
+        }
+
+# ==============================
+# CONFIDENCE INTERPRETATION
+# ==============================
+def get_confidence_message(confidence):
+    """Return human-readable confidence level with emoji"""
+    if confidence > 85:
+        return "✔ *High Accuracy*"
+    elif confidence > 60:
+        return "⚠ *Medium Accuracy*"
+    else:
+        return "❗ *Low Accuracy - please retake photo*"
+
+# ==============================
+# OFFLINE DISEASE ADVICE
+# ==============================
+def get_offline_disease_advice(disease):
+    """Get disease advice from local knowledge base"""
+    if disease in DISEASE_KNOWLEDGE_BASE:
+        info = DISEASE_KNOWLEDGE_BASE[disease]
+        return f"""📚 *{disease} - Quick Reference*
+
+🔍 *Cause:*
+{info['cause']}
+
+💊 *Treatment:*
+{info['treatment']}
+
+🛡️ *Prevention:*
+{info['prevention']}"""
+    else:
+        return f"ℹ️ For specific advice on {disease}, please ask the AI advisor (type *ai your question*)"
+
+# ==============================
+# AI LEAF GRADING FUNCTION
+# ==============================
+def grade_leaf_with_ai(image_bytes):
+    """
+    Use Gemini Vision to analyze leaf quality and assign grade
+    Returns grade and detailed analysis
+    """
+    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
+        return None, "AI grading not configured"
+    
+    try:
+        # Convert image to base64 for Gemini
+        image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+        
+        # Gemini Vision API endpoint
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={AI_API_KEY}"
+        
+        prompt = """Analyze this tobacco leaf image and return a short WhatsApp-friendly response.
+
+Determine:
+1. Leaf quality grade (A, B, C, or D)
+2. Color uniformity
+3. Leaf damage
+4. Market suitability
+
+Grade definitions:
+A - Premium: Large, uniform color, no spots
+B - Good: Medium leaves, minor spots
+C - Fair: Small leaves, off-color, some damage
+D - Low: Damaged leaves, poor color
+
+Return ONLY a brief analysis in this format:
+🍃 *Leaf Quality Analysis*
+
+Grade: [A/B/C/D]
+Market Value: [Premium/Good/Average/Poor]
+
+Observations:
+• Color: [brief description]
+• Damage: [brief description]
+• Uniformity: [brief description]"""
+        
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": image_base64
+                        }
+                    }
+                ]
+            }]
+        }
+        
+        response = requests.post(url, json=payload, timeout=25)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if "candidates" in data and len(data["candidates"]) > 0:
+                analysis = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                return "Grade", trim_message(analysis)
+            else:
+                return None, "❌ Could not analyze leaf image."
+        else:
+            debug_log(f"❌ Gemini vision error: {response.text}")
+            return None, "⚠️ Grading service temporarily unavailable."
+            
+    except Exception as e:
+        debug_log(f"❌ Leaf grading error: {e}")
+        return None, "❌ Error analyzing leaf quality."
+
+# ==============================
+# AI ADVISOR (with disease fallback and improved handling)
+# ==============================
+def ask_ai_advisor(question):
+    """Enhanced AI advisor with disease-specific fallback and truncation"""
+    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
+        return "🤖 AI advisor not configured. Please add API key."
+    
+    try:
+        # Check if question contains a known disease name
+        disease_found = None
+        for disease in DISEASE_KNOWLEDGE_BASE.keys():
+            if disease.lower() in question.lower():
+                disease_found = disease
+                break
+        
+        news_keywords = ["news", "latest", "recent", "2026", "this year", "current", "update", "new", "today"]
+        needs_news = any(keyword in question.lower() for keyword in news_keywords)
+        
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={AI_API_KEY}"
+        
+        system_context = (
+            "You are a Zimbabwean Tobacco Agronomy Expert. "
+            "Provide practical, concise advice using metric units. "
+            "Base your answers on Zimbabwe agricultural standards (TIMB, Kutsaga Research). "
+            "Keep responses under 900 characters for WhatsApp."
+        )
+        
+        if needs_news:
+            system_context += " The user is asking for recent information. Include 2026 updates if available."
+        
+        payload = {
+            "contents": [{
+                "parts": [{
+                    "text": f"{system_context}\n\nFarmer's Question: {question}"
+                }]
+            }]
+        }
+        
+        # Increased timeout to 25s for Render stability
+        response = requests.post(url, json=payload, timeout=25)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if "candidates" in data and len(data["candidates"]) > 0:
+                answer = data["candidates"][0]["content"]["parts"][0]["text"]
+                
+                # Truncate to safe WhatsApp length
+                answer = trim_message(answer, 900)
+                return answer
+            else:
+                # Fallback if AI returns empty
+                if disease_found:
+                    return trim_message(get_offline_disease_advice(disease_found), 900)
+                else:
+                    return ("⚠️ AI advisor is temporarily unavailable.\n\n"
+                            "*General Advice:* Ensure good drainage, use TIMB-certified seeds, "
+                            "and scout your fields daily for early disease signs.")
+        else:
+            debug_log(f"❌ Gemini error: {response.text}")
+            # Fallback AI Advice if API fails
+            if disease_found:
+                return trim_message(get_offline_disease_advice(disease_found), 900)
+            else:
+                return ("⚠️ AI advisor is temporarily unavailable.\n\n"
+                        "*General Advice:* Ensure good drainage, use TIMB-certified seeds, "
+                        "and scout your fields daily for early disease signs.")
+            
+    except Exception as e:
+        debug_log(f"❌ AI advisor error: {e}")
+        if disease_found:
+            return trim_message(get_offline_disease_advice(disease_found), 900)
+        return "❌ AI service error. Please try again later."
 
 # ==============================
 # HELPER FUNCTIONS
@@ -177,19 +659,19 @@ def log_detection(phone, name, disease, confidence):
         debug_log(f"📊 Detection logged: {disease} ({confidence:.1f}%)")
     except Exception as e:
         debug_log(f"❌ Log error: {e}")
+    
+    # Run garbage collection after logging
+    gc.collect()
 
 def download_image(media_id):
     """Download image from WhatsApp"""
     try:
         debug_log(f"📥 Downloading media ID: {media_id}")
-        
-        # Get media URL
         url_resp = requests.get(
             f"https://graph.facebook.com/v18.0/{media_id}",
             headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
             timeout=10
         )
-        
         if url_resp.status_code != 200:
             debug_log(f"❌ Failed to get media URL: {url_resp.status_code}")
             return None
@@ -201,7 +683,6 @@ def download_image(media_id):
         if not media_url:
             return None
         
-        # Download image
         img_resp = requests.get(
             media_url,
             headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
@@ -214,29 +695,19 @@ def download_image(media_id):
         else:
             debug_log(f"❌ Failed to download image: {img_resp.status_code}")
             return None
-            
     except Exception as e:
         debug_log(f"❌ Download error: {e}")
         return None
 
 def call_huggingface_detection(image_bytes):
-    """
-    Call Hugging Face Space for ML detection
-    Uses the /predict endpoint with image upload
-    """
+    """Call Hugging Face Space for ML detection"""
     try:
         debug_log("🔄 Calling Hugging Face ML service...")
-        
-        # Prepare the image for upload
-        files = {
-            'file': ('image.jpg', image_bytes, 'image/jpeg')
-        }
-        
-        # Make request to Hugging Face Space
+        files = {'file': ('image.jpg', image_bytes, 'image/jpeg')}
         response = requests.post(
             f"{HF_SPACE_URL}/predict",
             files=files,
-            timeout=30  # 30 second timeout (HF takes ~13s)
+            timeout=30
         )
         
         if response.status_code == 200:
@@ -257,13 +728,15 @@ def call_huggingface_detection(image_bytes):
         else:
             debug_log(f"❌ HF HTTP error: {response.status_code}")
             return None
-            
     except requests.exceptions.Timeout:
         debug_log("❌ HF request timed out (30s)")
         return None
     except Exception as e:
         debug_log(f"❌ HF call error: {e}")
         return None
+    finally:
+        # Clean up after heavy operation
+        gc.collect()
 
 def get_user_history(phone, limit=5):
     """Get user's detection history"""
@@ -289,15 +762,31 @@ def get_user_history(phone, limit=5):
         debug_log(f"❌ History error: {e}")
         return []
 
+def send_main_menu(phone):
+    """Helper function to send main menu"""
+    menu = (
+        "🌿 *TOBACCO AI MAIN MENU*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "1️⃣ *Disease Detection* - Send photo\n"
+        "2️⃣ *Farming Practices* - Guides & AI advice\n"
+        "3️⃣ *My Dashboard* - Stats, History, Tips\n"
+        "4️⃣ *Leaf Grading* - Quality assessment\n"
+        "5️⃣ *Expert Help* - Agronomist & AI\n"
+        "6️⃣ *Feedback* - Send comments\n\n"
+        "Reply with number (e.g., *1*)\n"
+        "Or type *help* for commands"
+    )
+    return send_whatsapp(phone, menu)
+
 # ==============================
-# MESSAGE HANDLER
+# ENHANCED MESSAGE HANDLER
 # ==============================
 def handle_message(phone, msg_type, content):
-    """Main message handler"""
+    """Main message handler with all enhancements"""
     debug_log(f"📨 Handling message: type={msg_type}, phone={phone}")
     
     user = get_user(phone)
-    nav = "\n\n---\n0️⃣ Menu"
+    nav = "\n\n---\n0️⃣ Main Menu"
     
     # NEW USER
     if not user:
@@ -320,9 +809,76 @@ def handle_message(phone, msg_type, content):
             f"• Send a *photo* to detect diseases\n"
             f"• Type *menu* for all options")
 
-    # WAITING FOR IMAGE
+    # AWAITING AI QUESTION
+    if state == USER_STATES["AWAITING_AI_QUESTION"] and msg_type == "text":
+        if content.lower() == "cancel":
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            send_whatsapp(phone, "AI advisor cancelled." + nav)
+            return
+        
+        send_whatsapp(phone, f"🤔 AI Advisor is thinking...")
+        answer = ask_ai_advisor(content)
+        send_whatsapp(phone, trim_message(answer) + nav)
+        save_user(phone, {"state": USER_STATES["ACTIVE"]})
+        return
+
+    # FARMING PRACTICES SUBMENU HANDLER (IMPROVED)
+    if state == USER_STATES["FARMING_MENU"] and msg_type == "text":
+        cmd = content.lower().strip()
+        
+        if cmd == "0":
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            return send_main_menu(phone)
+        
+        farming_topics = {
+            "1": "Latest planting and nursery standards for tobacco in Zimbabwe, including seedbed preparation and spacing.",
+            "2": "Current fertilizer application rates for tobacco in Zimbabwe (Compound L and Ammonium Nitrate).",
+            "3": "Best practices for tobacco harvesting and priming in Zimbabwe.",
+            "4": "Complete flue-curing guide: yellowing, leaf drying, and midrib drying phases.",
+            "5": "Latest 2026 tobacco marketing season news and TIMB requirements.",
+            "6": "General tobacco farming advice"
+        }
+        
+        if cmd in farming_topics:
+            send_whatsapp(phone, "🤖 *AI Advisor is fetching the latest information...*")
+            answer = ask_ai_advisor(farming_topics[cmd])
+            # Clear navigation: choose another topic or go back
+            response_msg = f"{answer}\n\n━━━━━━━━━━━━━━━\n💡 *Choose another topic (1-6) or 0 for Main Menu*"
+            send_whatsapp(phone, trim_message(response_msg))
+        else:
+            send_whatsapp(phone, "❌ Please choose 1-6 (or *0* for Main Menu).")
+        return
+
+    # LEAF GRADING
+    if state == USER_STATES["WAITING_GRADE_IMAGE"] and msg_type == "image":
+        debug_log(f"📸 Processing grading image from {phone}")
+        send_whatsapp(phone, f"🔍 Analyzing leaf quality, {name}...")
+        
+        image_bytes = download_image(content)
+        if not image_bytes:
+            debug_log("❌ Download failed")
+            send_whatsapp(phone, "❌ Failed to download image. Please try again." + nav)
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            return
+        
+        debug_log(f"✅ Downloaded {len(image_bytes)} bytes")
+        
+        grade, analysis = grade_leaf_with_ai(image_bytes)
+        
+        if grade:
+            send_whatsapp(phone, trim_message(analysis))
+        else:
+            send_whatsapp(phone, trim_message(analysis))
+        
+        save_user(phone, {"state": USER_STATES["ACTIVE"]})
+        send_whatsapp(phone, nav)
+        # Clean up after image processing
+        gc.collect()
+        return
+
+    # DISEASE DETECTION (image)
     if state == USER_STATES["WAITING_IMAGE"] and msg_type == "image":
-        debug_log(f"📸 Processing image from {phone}")
+        debug_log(f"📸 Processing disease detection from {phone}")
         send_whatsapp(phone, f"🔍 Downloading your image, {name}...")
         
         image_bytes = download_image(content)
@@ -333,48 +889,42 @@ def handle_message(phone, msg_type, content):
             return
         
         debug_log(f"✅ Downloaded {len(image_bytes)} bytes")
-        send_whatsapp(phone, f"✅ Image downloaded! Running AI analysis on cloud...")
+        send_whatsapp(phone, f"✅ Image downloaded! Running AI analysis...")
         
-        # Call Hugging Face for detection instead of local model
         result = call_huggingface_detection(image_bytes)
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         
         if not result:
             debug_log("❌ Detection failed")
-            send_whatsapp(phone, "❌ AI analysis failed. Please try another photo with good lighting." + nav)
+            send_whatsapp(phone, "❌ AI analysis failed. Please try another photo." + nav)
             return
         
         disease = result["disease"]
         confidence = result["confidence"]
+        confidence_msg = get_confidence_message(confidence)
         
-        debug_log(f"✅ Detection result: {disease} ({confidence:.1f}%)")
+        debug_log(f"✅ Detection result: {disease} ({confidence:.1f}%) - {confidence_msg}")
         log_detection(phone, name, disease, confidence)
         
-        # Format response based on detection result
+        # Build response message with confidence interpretation
         if result["low_confidence"]:
-            send_whatsapp(phone, 
-                f"⚠️ *Low Confidence ({confidence:.1f}%)*\n\n"
-                f"Please upload a clearer, closer photo of the tobacco leaf with good lighting.\n\n"
-                f"Tips:\n"
-                f"• Hold camera steady\n"
-                f"• Show affected area clearly\n"
-                f"• Use natural light" + nav)
-        
+            response = f"⚠️ *Low Confidence ({confidence:.1f}%)*\n\n{confidence_msg}\n\nPlease upload a clearer photo."
         elif result["is_healthy"]:
-            send_whatsapp(phone, 
-                f"🎉 *Healthy Leaf Detected!*\n\n"
-                f"Confidence: {confidence:.1f}%\n\n"
-                f"Great job! Keep up your good farming practices:\n"
-                f"• Continue regular monitoring\n"
-                f"• Maintain field hygiene\n"
-                f"• Follow your fertilization schedule" + nav)
-        
+            response = f"🎉 *Healthy Leaf Detected!*\n\nConfidence: {confidence:.1f}%\n{confidence_msg}\n\nGreat job! Keep monitoring regularly."
         else:
-            send_whatsapp(phone, 
-                f"📊 *DISEASE DETECTED*\n\n"
-                f"*Disease:* {disease}\n"
-                f"*Confidence:* {confidence:.1f}%\n\n"
-                f"*Recommended Treatment:*\n{result['treatment']}" + nav)
+            response = f"📊 *{disease} DETECTED*\n\nConfidence: {confidence:.1f}%\n{confidence_msg}\n\n*Treatment:*\n{result['treatment']}"
+        
+        send_whatsapp(phone, trim_message(response))
+        
+        # Add offline knowledge base advice after detection
+        if not result["is_healthy"] and not result["low_confidence"]:
+            offline_advice = get_offline_disease_advice(disease)
+            send_whatsapp(phone, trim_message(offline_advice) + "\n\nType *ai your question* for more specific advice")
+        else:
+            send_whatsapp(phone, nav)
+        
+        # Clean up after heavy operation
+        gc.collect()
         return
 
     # AWAITING FEEDBACK
@@ -395,102 +945,160 @@ def handle_message(phone, msg_type, content):
         else:
             if ADMIN_PHONE:
                 send_whatsapp(ADMIN_PHONE, f"🚨 *EXPERT REQUEST from {name}*\n{phone}\n\n{content}")
-            send_whatsapp(phone, "👨‍🌾 Your request has been sent to an agronomist. They will contact you soon." + nav)
+            send_whatsapp(phone, "👨‍🌾 Your request has been sent. An expert will contact you soon." + nav)
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         return
 
-    # MAIN MENU COMMANDS (ACTIVE state)
+    # TEXT COMMANDS
     if msg_type == "text":
         cmd = content.lower().strip()
         
+        # MAIN MENU
         if cmd in ["menu", "0"]:
-            menu = (
-                "🌿 *MAIN MENU*\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                "1️⃣ *Disease Detection* - Send photo\n"
-                "2️⃣ *Planting Guide* - Nursery to field\n"
-                "3️⃣ *Fertilizer Guide* - Application rates\n"
-                "4️⃣ *Harvesting Guide* - Priming & curing\n"
-                "5️⃣ *Marketing Guide* - Selling tips\n"
-                "6️⃣ *Scan History* - Past diagnoses\n"
-                "7️⃣ *Daily Tip* - Farming advice\n"
-                "8️⃣ *Fun Fact* - Did you know?\n"
-                "9️⃣ *Feedback* - Send comments\n"
-                "🔟 *Talk to Expert* - Ask agronomist\n\n"
-                "Reply with the number (e.g., *1*)"
-            )
-            send_whatsapp(phone, menu)
+            return send_main_menu(phone)
         
+        # 1. DISEASE DETECTION
         elif cmd in ["1", "detect"]:
             save_user(phone, {"state": USER_STATES["WAITING_IMAGE"]})
             send_whatsapp(phone, 
                 "📸 *Disease Detection*\n\n"
-                "Please send a clear photo of the tobacco leaf.\n\n"
-                "📝 *Tips for best results:*\n"
-                "• Good lighting (natural light)\n"
-                "• Close-up of affected area\n"
-                "• Hold camera steady\n"
-                "• Plain background")
+                "Send a clear photo of the tobacco leaf.\n\n"
+                "Tips: Good lighting, close-up, steady camera")
         
-        elif cmd in ["2", "planting"]:
-            send_whatsapp(phone, GUIDES["planting"] + nav)
+        # 2. FARMING PRACTICES (Submenu)
+        elif cmd in ["2", "farming"]:
+            save_user(phone, {"state": USER_STATES["FARMING_MENU"]})
+            farming_menu = (
+                "🌱 *FARMING PRACTICES*\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "1️⃣ *Planting Guide* - Nursery to field\n"
+                "2️⃣ *Fertilizer Guide* - Application rates\n"
+                "3️⃣ *Harvesting Guide* - Priming & handling\n"
+                "4️⃣ *Curing Guide* - Complete process\n"
+                "5️⃣ *Marketing Guide* - Selling 2026\n"
+                "6️⃣ *Ask AI* - General farming questions\n\n"
+                "🤖 *AI-powered with latest Zimbabwe info*\n\n"
+                "Reply with number (e.g., *1*)\n"
+                "0️⃣ Main Menu"
+            )
+            send_whatsapp(phone, farming_menu)
         
-        elif cmd in ["3", "fertilizer"]:
-            send_whatsapp(phone, GUIDES["fertilizer"] + nav)
+        # 3. MY DASHBOARD (IMPROVED)
+        elif cmd in ["3", "dashboard"]:
+            stats = get_user_statistics(phone)
+            
+            dashboard = (
+                "📊 *MY DASHBOARD*\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"👤 *Farmer:* {name}\n"
+                f"📱 *Phone:* {phone}\n\n"
+                f"📝 *Total Scans:* {stats['total_scans']}\n"
+                f"🦠 *Common Issue:* {stats['top_disease']}\n"
+                f"🌿 *Healthy Leaves:* {stats['healthy_count']}\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "📋 Type *history* - View last 5 scans\n"
+                "💡 Type *tip* - Daily farming tip\n"
+                "🎲 Type *fact* - Tobacco fun fact\n\n"
+                "0️⃣ Main Menu"
+            )
+            send_whatsapp(phone, dashboard)
         
-        elif cmd in ["4", "harvesting"]:
-            send_whatsapp(phone, GUIDES["harvesting"] + nav)
+        # 4. LEAF GRADING
+        elif cmd in ["4", "grade"]:
+            save_user(phone, {"state": USER_STATES["WAITING_GRADE_IMAGE"]})
+            send_whatsapp(phone, 
+                "🏷️ *LEAF QUALITY GRADING*\n\n"
+                "Send a clear photo of your cured leaf for quality assessment.\n\n"
+                "I'll analyze:\n"
+                "• Color quality\n"
+                "• Spots & blemishes\n"
+                "• Texture\n"
+                "• Overall grade (A-D)\n\n"
+                "Tips: Good lighting, flat surface")
         
-        elif cmd in ["5", "marketing"]:
-            send_whatsapp(phone, GUIDES["marketing"] + nav)
+        # 5. EXPERT HELP
+        elif cmd in ["5", "expert"]:
+            expert_menu = (
+                "👨‍🌾 *EXPERT HELP*\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "🤖 *AI Advisor* - Type *ai [question]*\n"
+                "   Example: *ai how to prevent black shank*\n\n"
+                "👤 *Human Expert* - Type *expert*\n"
+                "   Get help from an agronomist\n\n"
+                "0️⃣ Main Menu"
+            )
+            send_whatsapp(phone, expert_menu)
         
-        elif cmd in ["6", "history"]:
-            history = get_user_history(phone)
-            if not history:
-                send_whatsapp(phone, "📋 *No scan history yet.*\n\nSend a photo to start detecting diseases!" + nav)
-            else:
-                msg = "📋 *YOUR SCAN HISTORY*\n━━━━━━━━━━━━━━━━━━\n"
-                for i, h in enumerate(history[:5], 1):
-                    msg += f"{i}. *{h.get('disease', 'Unknown')}* - {h.get('confidence', 0):.1f}%\n"
-                    msg += f"   📅 {h.get('date', 'Unknown')}\n\n"
-                msg += nav
-                send_whatsapp(phone, msg)
-        
-        elif cmd in ["7", "tip"]:
-            send_whatsapp(phone, f"💡 *Daily Tip*\n\n{random.choice(TIPS)}" + nav)
-        
-        elif cmd in ["8", "fact"]:
-            send_whatsapp(phone, f"🎲 *Fun Fact*\n\n{random.choice(FACTS)}" + nav)
-        
-        elif cmd in ["9", "feedback"]:
+        # 6. FEEDBACK
+        elif cmd in ["6", "feedback"]:
             save_user(phone, {"state": USER_STATES["AWAITING_FEEDBACK"]})
             send_whatsapp(phone, 
                 "📝 *Send Feedback*\n\n"
                 "Type your message below (or *cancel* to go back):")
         
-        elif cmd in ["10", "expert"]:
+        # AI ADVISOR (direct)
+        elif cmd.startswith("ai "):
+            question = cmd[3:].strip()
+            if question:
+                send_whatsapp(phone, f"🤔 AI Advisor is thinking...")
+                answer = ask_ai_advisor(question)
+                send_whatsapp(phone, trim_message(answer) + nav)
+            else:
+                send_whatsapp(phone, "❓ Please ask a question. Example: *ai how to prevent black shank*")
+        
+        # HISTORY
+        elif cmd == "history":
+            history = get_user_history(phone)
+            if not history:
+                send_whatsapp(phone, "📋 *No scan history yet.*\n\nSend a photo to start!" + nav)
+            else:
+                msg = "📋 *YOUR SCAN HISTORY*\n━━━━━━━━━━━━━━━━━━\n"
+                for i, h in enumerate(history[:5], 1):
+                    msg += f"{i}. *{h.get('disease', 'Unknown')}* - {h.get('confidence', 0):.1f}%\n"
+                    msg += f"   📅 {h.get('date', 'Unknown')}\n\n"
+                send_whatsapp(phone, trim_message(msg) + nav)
+        
+        # TIP (Gemini-powered)
+        elif cmd == "tip":
+            send_whatsapp(phone, f"💡 *Daily Tip*\n\n{get_gemini_tip()}" + nav)
+        
+        # FACT (Gemini-powered)
+        elif cmd == "fact":
+            send_whatsapp(phone, f"🎲 *Did You Know?*\n\n{get_gemini_fact()}" + nav)
+        
+        # EXPERT REQUEST
+        elif cmd == "expert":
             save_user(phone, {"state": USER_STATES["AWAITING_EXPERT"]})
             send_whatsapp(phone, 
-                "👨‍🌾 *Talk to an Expert*\n\n"
-                "Describe your farming issue below. An agronomist will contact you soon.\n\n"
-                "(Type *cancel* to go back)")
+                "👨‍🌾 *Talk to an Agronomist*\n\n"
+                "Describe your farming issue below. A human expert will respond soon.\n\n"
+                "Type your message (or *cancel* to go back):")
         
+        # HELP
         elif cmd == "help":
-            send_whatsapp(phone, 
-                "📚 *HELP*\n━━━━━━━━━━━━━━━━━━\n"
-                "• *menu* - Show main menu\n"
-                "• *detect* - Start detection\n"
-                "• *history* - View past scans\n"
-                "• *tip* - Daily farming tip\n"
-                "• *fact* - Fun fact\n"
-                "• *feedback* - Send comments\n"
-                "• *expert* - Talk to agronomist\n"
-                "• *help* - Show this message")
+            help_text = (
+                "📚 *QUICK HELP*\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "• *menu* - Main menu\n"
+                "• *1* - Disease detection\n"
+                "• *2* - Farming practices\n"
+                "• *3* - My dashboard\n"
+                "• *4* - Leaf grading\n"
+                "• *5* - Expert help\n"
+                "• *6* - Feedback\n"
+                "• *ai [question]* - Ask AI\n"
+                "• *grade* - Quality assessment\n"
+                "• *history* - Your scans\n"
+                "• *tip* - Daily tip (AI)\n"
+                "• *fact* - Fun fact (AI)\n"
+                "• *expert* - Talk to human"
+            )
+            send_whatsapp(phone, help_text)
         
         else:
             send_whatsapp(phone, 
                 "❓ Command not recognized.\n\n"
-                "Type *menu* to see all options or *help* for commands.")
+                "Type *menu* to see options or *help* for commands")
 
 # ==============================
 # FLASK ROUTES
@@ -498,7 +1106,6 @@ def handle_message(phone, msg_type, content):
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     """Main webhook endpoint"""
-    # Webhook verification
     if request.method == "GET":
         verify_token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
@@ -509,20 +1116,15 @@ def webhook():
         debug_log("❌ Webhook verification failed")
         return "Forbidden", 403
     
-    # Handle incoming messages
     try:
         data = request.json
-        
-        # Extract message data safely
         entry = data.get("entry", [{}])[0]
         changes = entry.get("changes", [{}])[0]
         value = changes.get("value", {})
         
-        # Ignore status updates
         if "statuses" in value:
             return jsonify({"status": "ignored"}), 200
         
-        # Get messages
         messages = value.get("messages", [])
         if not messages:
             return jsonify({"status": "ok"}), 200
@@ -531,7 +1133,6 @@ def webhook():
         from_number = msg.get("from")
         msg_type = msg.get("type")
         
-        # Extract content based on type
         if msg_type == "text":
             content = msg.get("text", {}).get("body", "")
         elif msg_type == "image":
@@ -539,7 +1140,6 @@ def webhook():
         else:
             return jsonify({"status": "ignored"}), 200
         
-        # Process message
         if msg_type in ["text", "image"]:
             handle_message(from_number, msg_type, content)
         
@@ -556,13 +1156,14 @@ def health():
         "status": "healthy",
         "firebase": db is not None,
         "huggingface_url": HF_SPACE_URL,
+        "ai_provider": AI_PROVIDER if AI_API_KEY else "disabled",
         "timestamp": datetime.now().isoformat()
     }), 200
 
 @app.route("/", methods=["GET"])
 def home():
     """Root endpoint"""
-    return "🌿 Tobacco AI Assistant is running! (Using Hugging Face for ML)"
+    return "🌿 Tobacco AI Assistant is running! (Enhanced with AI Tips/Facts & Leaf Grading)"
 
 # ==============================
 # START THE APP
@@ -571,5 +1172,9 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     debug_log(f"🚀 Starting Tobacco AI Assistant on port {port}")
     debug_log(f"🤖 Using Hugging Face Space: {HF_SPACE_URL}")
+    if AI_API_KEY:
+        debug_log(f"🧠 Gemini AI Advisor enabled with {AI_PROVIDER}")
+    else:
+        debug_log(f"ℹ️ AI Advisor disabled (add AI_API_KEY to enable)")
+    debug_log(f"📊 Disease Knowledge Base loaded with {len(DISEASE_KNOWLEDGE_BASE)} diseases")
     app.run(host="0.0.0.0", port=port, debug=False)
-
