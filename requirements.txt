@@ -1,20 +1,10 @@
-# Web Framework
-flask==3.0.0
+
+flask==3.0.3
 gunicorn==21.2.0
-
-# HTTP Requests
 requests==2.31.0
-urllib3==2.0.7
-
-# Firebase
-firebase-admin==6.4.0
-
-# Image Processing
-Pillow==10.1.0
-numpy==1.24.3
-
-# Google Gemini AI - CRITICAL for AI advisor to work
+urllib3==2.2.1
+firebase-admin==6.5.0
+Pillow==10.3.0
+numpy==1.26.4
 google-generativeai==0.8.4
-
-# Additional utilities
-python-dotenv==1.0.0
+python-dotenv==1.0.1
