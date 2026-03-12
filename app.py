@@ -1,6 +1,6 @@
 """
 Tobacco AI Assistant - Render WhatsApp Bot
-Fixed: Rate limiting, safer parsing, retry logic, optimized grading
+Fixed: Navigation, Model Fallback, Response Handling
 """
 import os
 import json
@@ -33,6 +33,14 @@ HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "https://saintsouldier-tobacco-ai.
 # AI API Keys
 AI_API_KEY = os.environ.get("AI_API_KEY")
 AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini")
+
+# Try different model names - will be used in fallback sequence
+GEMINI_MODELS = [
+    'gemini-1.5-flash',
+    'gemini-1.5-pro',
+    'gemini-pro',
+    'gemini-1.0-pro'
+]
 
 def debug_log(message):
     """Print debug with timestamp"""
@@ -299,191 +307,155 @@ def get_offline_disease_advice(disease):
         return f"ℹ️ For specific advice on {disease}, please ask the AI advisor (type *ai your question*)"
 
 # ==============================
-# AI ADVISOR (Fixed with rate limiting & safer parsing)
+# AI ADVISOR WITH MODEL FALLBACK
 # ==============================
 def ask_ai_advisor(question):
-    """AI advisor with rate limiting and safer response parsing"""
+    """AI advisor with model fallback and rate limiting"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return "🤖 AI advisor not configured. Please add API key."
     
-    try:
-        # Check if question contains a known disease name
-        disease_found = None
-        for disease in DISEASE_KNOWLEDGE_BASE.keys():
-            if disease.lower() in question.lower():
-                disease_found = disease
-                break
-        
-        # ⏱️ Add small delay to prevent rate limiting (1 second)
-        time.sleep(1)
-        
-        debug_log(f"🔄 Calling Gemini API with model gemini-1.5-flash")
-        
-        # Use the session with retries
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={AI_API_KEY}"
-        
-        headers = {'Content-Type': 'application/json'}
-        payload = {
-            "contents": [{
-                "parts": [{
-                    "text": f"You are a Zimbabwe tobacco expert. Answer briefly and practically:\n\nQuestion: {question}\n\nKeep response under 400 characters for WhatsApp."
-                }]
-            }],
-            "generationConfig": {
-                "temperature": 0.7,
-                "maxOutputTokens": 200,
-                "topP": 0.8,
-                "topK": 10
+    # Check if question contains a known disease name
+    disease_found = None
+    for disease in DISEASE_KNOWLEDGE_BASE.keys():
+        if disease.lower() in question.lower():
+            disease_found = disease
+            break
+    
+    # Try each model in sequence until one works
+    for model_name in GEMINI_MODELS:
+        try:
+            # ⏱️ Add small delay to prevent rate limiting
+            time.sleep(1)
+            
+            debug_log(f"🔄 Trying Gemini model: {model_name}")
+            
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={AI_API_KEY}"
+            
+            headers = {'Content-Type': 'application/json'}
+            payload = {
+                "contents": [{
+                    "parts": [{
+                        "text": f"You are a Zimbabwe tobacco expert. Answer briefly and practically:\n\nQuestion: {question}\n\nKeep response under 400 characters for WhatsApp."
+                    }]
+                }],
+                "generationConfig": {
+                    "temperature": 0.7,
+                    "maxOutputTokens": 200,
+                    "topP": 0.8,
+                    "topK": 10
+                }
             }
-        }
-        
-        # Increased timeout to 20 seconds
-        response = http_session.post(url, headers=headers, json=payload, timeout=20)
-        
-        if response.status_code == 200:
-            result = response.json()
             
-            # 🛡️ SAFER PARSING
-            if "candidates" in result and result["candidates"]:
-                candidate = result["candidates"][0]
-                if "content" in candidate and "parts" in candidate["content"]:
-                    answer = candidate["content"]["parts"][0]["text"].strip()
-                    debug_log(f"✅ Gemini API success")
-                    return trim_message(answer, 900)
-                else:
-                    debug_log(f"⚠️ Content structure missing")
-            else:
-                debug_log(f"⚠️ No candidates in response")
+            response = http_session.post(url, headers=headers, json=payload, timeout=20)
+            
+            if response.status_code == 200:
+                result = response.json()
                 
-            # If we got here but no text, use fallback
-            if disease_found:
-                return trim_message(get_offline_disease_advice(disease_found), 900)
-            else:
-                return "ℹ️ Please ask a specific farming question."
-        
-        elif response.status_code == 429:
-            debug_log(f"❌ REAL Gemini rate limit hit (429)")
-            time.sleep(2)  # Wait 2 seconds on rate limit
-            if disease_found:
-                return trim_message(get_offline_disease_advice(disease_found), 900)
-            else:
-                return "⚠️ Google's AI service is busy. Please try again in a minute.\n\nYou can also type *menu* to access farming guides."
-        
-        elif response.status_code == 404:
-            debug_log(f"❌ Model not found - check model name")
-            if disease_found:
-                return trim_message(get_offline_disease_advice(disease_found), 900)
-            else:
-                return "⚠️ AI model configuration error. Using offline knowledge base."
-        
-        else:
-            debug_log(f"❌ Gemini API error: {response.status_code}")
-            if disease_found:
-                return trim_message(get_offline_disease_advice(disease_found), 900)
-            else:
-                return "⚠️ AI service temporarily unavailable. Please try again later."
+                if "candidates" in result and result["candidates"]:
+                    candidate = result["candidates"][0]
+                    if "content" in candidate and "parts" in candidate["content"]:
+                        answer = candidate["content"]["parts"][0]["text"].strip()
+                        debug_log(f"✅ Success with model: {model_name}")
+                        return trim_message(answer, 900)
             
-    except requests.exceptions.Timeout:
-        debug_log(f"❌ AI request timed out")
-        if disease_found:
-            return trim_message(get_offline_disease_advice(disease_found), 900)
-        else:
-            return "⚠️ AI service is taking too long. Please try again."
-    except Exception as e:
-        debug_log(f"❌ AI advisor error: {e}")
-        if disease_found:
-            return trim_message(get_offline_disease_advice(disease_found), 900)
-        return "❌ Service error. Please try again later."
+            elif response.status_code == 404:
+                debug_log(f"⚠️ Model {model_name} not found, trying next...")
+                continue
+            elif response.status_code == 429:
+                debug_log(f"⚠️ Rate limited on {model_name}, waiting...")
+                time.sleep(2)
+                continue
+            else:
+                debug_log(f"⚠️ Error {response.status_code} on {model_name}")
+                continue
+                
+        except Exception as e:
+            debug_log(f"❌ Error with {model_name}: {e}")
+            continue
+    
+    # If all models fail, use fallback
+    debug_log(f"⚠️ All Gemini models failed, using fallback")
+    if disease_found:
+        return trim_message(get_offline_disease_advice(disease_found), 900)
+    else:
+        return "⚠️ AI service temporarily unavailable. Please try again later or use the farming guides (type *menu*)."
 
 # ==============================
-# AI LEAF GRADING (Optimized to prevent timeouts)
+# AI LEAF GRADING WITH MODEL FALLBACK
 # ==============================
 def grade_leaf_with_ai(image_bytes):
-    """Grade leaf with optimized settings to prevent memory issues"""
+    """Grade leaf with model fallback sequence"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return None, "AI grading not configured"
     
-    try:
-        # ⏱️ Add small delay to prevent rate limiting
-        time.sleep(1)
-        
-        debug_log(f"🔄 Calling Gemini Vision API for grading...")
-        
-        # Use Flash 1.5 - it's faster and smaller (less likely to cause SIGKILL)
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={AI_API_KEY}"
-        
-        # Convert image to base64 for Gemini
-        image_base64 = base64.b64encode(image_bytes).decode('utf-8')
-        
-        headers = {'Content-Type': 'application/json'}
-        
-        # Simplified prompt - less processing needed
-        payload = {
-            "contents": [{
-                "parts": [
-                    {"text": "Grade this tobacco leaf by color, quality, and damage. Be brief. Return in format:\nGrade: [A/B/C/D]\nColor: [brief]\nDamage: [brief]\nMarket: [Premium/Good/Average/Poor]"},
-                    {
-                        "inline_data": {
-                            "mime_type": "image/jpeg",
-                            "data": image_base64
+    # Try each model in sequence
+    for model_name in GEMINI_MODELS:
+        try:
+            time.sleep(1)
+            
+            debug_log(f"🔄 Trying Gemini Vision with model: {model_name}")
+            
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={AI_API_KEY}"
+            
+            # Convert image to base64 for Gemini
+            image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+            
+            headers = {'Content-Type': 'application/json'}
+            
+            payload = {
+                "contents": [{
+                    "parts": [
+                        {"text": "Grade this tobacco leaf by color, quality, and damage. Be brief. Return in format:\nGrade: [A/B/C/D]\nColor: [brief]\nDamage: [brief]\nMarket: [Premium/Good/Average/Poor]"},
+                        {
+                            "inline_data": {
+                                "mime_type": "image/jpeg",
+                                "data": image_base64
+                            }
                         }
-                    }
-                ]
-            }],
-            "generationConfig": {
-                "temperature": 0.7,
-                "maxOutputTokens": 150,
-                "topP": 0.8
+                    ]
+                }],
+                "generationConfig": {
+                    "temperature": 0.7,
+                    "maxOutputTokens": 150,
+                    "topP": 0.8
+                }
             }
-        }
-        
-        # 30 second timeout for grading
-        response = http_session.post(url, headers=headers, json=payload, timeout=30)
-        
-        if response.status_code == 200:
-            result = response.json()
             
-            # Safer parsing
-            if "candidates" in result and result["candidates"]:
-                candidate = result["candidates"][0]
-                if "content" in candidate and "parts" in candidate["content"]:
-                    analysis = candidate["content"]["parts"][0]["text"].strip()
-                    debug_log(f"✅ Gemini Vision success")
-                    return "Grade", trim_message(analysis, 500)
-                else:
-                    debug_log(f"⚠️ Unexpected response structure")
-                    return None, "❌ Could not analyze leaf image format."
+            response = http_session.post(url, headers=headers, json=payload, timeout=30)
+            
+            if response.status_code == 200:
+                result = response.json()
+                
+                if "candidates" in result and result["candidates"]:
+                    candidate = result["candidates"][0]
+                    if "content" in candidate and "parts" in candidate["content"]:
+                        analysis = candidate["content"]["parts"][0]["text"].strip()
+                        debug_log(f"✅ Success with model: {model_name}")
+                        return "Grade", trim_message(analysis, 500)
+            
+            elif response.status_code == 404:
+                debug_log(f"⚠️ Model {model_name} not found for vision, trying next...")
+                continue
+            elif response.status_code == 429:
+                debug_log(f"⚠️ Rate limited on {model_name}, waiting...")
+                time.sleep(2)
+                continue
             else:
-                debug_log(f"⚠️ No candidates in response")
-                return None, "❌ Could not analyze leaf image."
-        
-        elif response.status_code == 429:
-            debug_log(f"❌ Gemini rate limit hit (429)")
-            return None, "⚠️ Google's Vision AI is busy. Please try again in a minute."
-        
-        elif response.status_code == 404:
-            debug_log(f"❌ Model not found - check model name")
-            return None, "⚠️ AI model configuration error."
-        
-        else:
-            debug_log(f"❌ Gemini Vision error: {response.status_code}")
-            return None, "⚠️ Grading service temporarily unavailable."
-            
-    except requests.exceptions.Timeout:
-        debug_log(f"❌ Grading request timed out")
-        return None, "⏱️ Grading is taking too long. Try a smaller image."
-    except Exception as e:
-        debug_log(f"❌ Leaf grading error: {e}")
-        return None, "❌ Error analyzing leaf quality."
-    finally:
-        # Clean up
-        gc.collect()
+                debug_log(f"⚠️ Error {response.status_code} on {model_name}")
+                continue
+                
+        except Exception as e:
+            debug_log(f"❌ Error with {model_name}: {e}")
+            continue
+    
+    # If all models fail
+    return None, "⚠️ Grading service temporarily unavailable. Please try again later."
 
 # ==============================
-# GEMINI-POWERED DAILY TIPS (with rate limiting)
+# GEMINI-POWERED DAILY TIPS
 # ==============================
 def get_gemini_tip():
-    """Generate a fresh daily farming tip with rate limiting"""
+    """Generate a fresh daily farming tip"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return random.choice([
             "🚜 Rotate tobacco with maize or beans to prevent soil-borne diseases",
@@ -491,60 +463,65 @@ def get_gemini_tip():
             "🔍 Check fields weekly for early signs of disease"
         ])
     
-    try:
-        # ⏱️ Small delay for rate limiting
-        time.sleep(0.5)
-        
-        current_month = datetime.now().strftime("%B")
-        
-        # Determine current season in Zimbabwe
-        if current_month in ["November", "December", "January", "February", "March"]:
-            season = "rainy/planting season"
-        elif current_month in ["April", "May", "June", "July"]:
-            season = "harvesting/curing season"
-        else:
-            season = "land preparation season"
-        
-        debug_log(f"🔄 Generating tip for {season}")
-        
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={AI_API_KEY}"
-        
-        headers = {'Content-Type': 'application/json'}
-        prompt = f"Generate ONE short farming tip for Zimbabwe tobacco farmers during {season}. Max 250 characters. Start with an emoji."
-        
-        payload = {
-            "contents": [{
-                "parts": [{"text": prompt}]
-            }],
-            "generationConfig": {
-                "temperature": 0.8,
-                "maxOutputTokens": 100
-            }
-        }
-        
-        response = http_session.post(url, headers=headers, json=payload, timeout=15)
-        
-        if response.status_code == 200:
-            result = response.json()
-            if "candidates" in result and result["candidates"]:
-                tip = result["candidates"][0]["content"]["parts"][0]["text"].strip()
-                return trim_message(tip, 250)
+    # Try models for tip generation
+    for model_name in GEMINI_MODELS:
+        try:
+            time.sleep(0.5)
             
-    except Exception as e:
-        debug_log(f"❌ Tip generation error: {e}")
+            current_month = datetime.now().strftime("%B")
+            
+            # Determine current season in Zimbabwe
+            if current_month in ["November", "December", "January", "February", "March"]:
+                season = "rainy/planting season"
+            elif current_month in ["April", "May", "June", "July"]:
+                season = "harvesting/curing season"
+            else:
+                season = "land preparation season"
+            
+            debug_log(f"🔄 Generating tip with {model_name}")
+            
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={AI_API_KEY}"
+            
+            headers = {'Content-Type': 'application/json'}
+            prompt = f"Generate ONE short farming tip for Zimbabwe tobacco farmers during {season}. Max 250 characters. Start with an emoji."
+            
+            payload = {
+                "contents": [{
+                    "parts": [{"text": prompt}]
+                }],
+                "generationConfig": {
+                    "temperature": 0.8,
+                    "maxOutputTokens": 100
+                }
+            }
+            
+            response = http_session.post(url, headers=headers, json=payload, timeout=15)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if "candidates" in result and result["candidates"]:
+                    tip = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    return trim_message(tip, 250)
+            elif response.status_code == 404:
+                continue
+            else:
+                continue
+                
+        except Exception:
+            continue
     
     # Fallback
     return random.choice([
         "🌱 Monitor your fields daily for early disease signs.",
         "💧 Water early morning to prevent fungal growth.",
-        "🔍 Check lower leaves regularly."
+        "🔍 Check lower leaves regularly for pests and diseases."
     ])
 
 # ==============================
-# GEMINI-POWERED FUN FACTS (with rate limiting)
+# GEMINI-POWERED FUN FACTS
 # ==============================
 def get_gemini_fact():
-    """Generate a fresh interesting fact with rate limiting"""
+    """Generate a fresh interesting fact"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return random.choice([
             "🌱 Tobacco is related to tomatoes and potatoes!",
@@ -552,37 +529,42 @@ def get_gemini_fact():
             "📜 Tobacco has been cultivated for over 8,000 years"
         ])
     
-    try:
-        # ⏱️ Small delay for rate limiting
-        time.sleep(0.5)
-        
-        debug_log(f"🔄 Generating fact")
-        
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={AI_API_KEY}"
-        
-        headers = {'Content-Type': 'application/json'}
-        prompt = "Generate ONE interesting fact about Zimbabwe tobacco farming. Max 250 characters. Start with an emoji."
-        
-        payload = {
-            "contents": [{
-                "parts": [{"text": prompt}]
-            }],
-            "generationConfig": {
-                "temperature": 0.9,
-                "maxOutputTokens": 100
-            }
-        }
-        
-        response = http_session.post(url, headers=headers, json=payload, timeout=15)
-        
-        if response.status_code == 200:
-            result = response.json()
-            if "candidates" in result and result["candidates"]:
-                fact = result["candidates"][0]["content"]["parts"][0]["text"].strip()
-                return trim_message(fact, 250)
+    # Try models for fact generation
+    for model_name in GEMINI_MODELS:
+        try:
+            time.sleep(0.5)
             
-    except Exception as e:
-        debug_log(f"❌ Fact generation error: {e}")
+            debug_log(f"🔄 Generating fact with {model_name}")
+            
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={AI_API_KEY}"
+            
+            headers = {'Content-Type': 'application/json'}
+            prompt = "Generate ONE interesting fact about Zimbabwe tobacco farming. Max 250 characters. Start with an emoji."
+            
+            payload = {
+                "contents": [{
+                    "parts": [{"text": prompt}]
+                }],
+                "generationConfig": {
+                    "temperature": 0.9,
+                    "maxOutputTokens": 100
+                }
+            }
+            
+            response = http_session.post(url, headers=headers, json=payload, timeout=15)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if "candidates" in result and result["candidates"]:
+                    fact = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    return trim_message(fact, 250)
+            elif response.status_code == 404:
+                continue
+            else:
+                continue
+                
+        except Exception:
+            continue
     
     # Fallback
     return random.choice([
@@ -771,6 +753,52 @@ def send_main_menu(phone):
     )
     return send_whatsapp(phone, menu)
 
+def send_farming_menu(phone):
+    """Send farming practices submenu"""
+    farming_menu = (
+        "🌱 *FARMING PRACTICES*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "1️⃣ *Planting Guide*\n"
+        "2️⃣ *Fertilizer Guide*\n"
+        "3️⃣ *Harvesting Guide*\n"
+        "4️⃣ *Curing Guide*\n"
+        "5️⃣ *Marketing Guide*\n"
+        "6️⃣ *Ask AI*\n\n"
+        "Reply with number (1-6)\n"
+        "0️⃣ Main Menu"
+    )
+    return send_whatsapp(phone, farming_menu)
+
+def send_dashboard_menu(phone, name, stats):
+    """Send dashboard menu"""
+    dashboard = (
+        "📊 *MY DASHBOARD*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"👤 *Farmer:* {name}\n"
+        f"📱 *Phone:* {phone}\n\n"
+        f"📝 *Total Scans:* {stats['total_scans']}\n"
+        f"🦠 *Common Issue:* {stats['top_disease']}\n"
+        f"🌿 *Healthy Leaves:* {stats['healthy_count']}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "1️⃣ *View History*\n"
+        "2️⃣ *Daily Tip*\n"
+        "3️⃣ *Fun Fact*\n\n"
+        "0️⃣ Main Menu"
+    )
+    return send_whatsapp(phone, dashboard)
+
+def send_expert_menu(phone):
+    """Send expert help menu"""
+    expert_menu = (
+        "👨‍🌾 *EXPERT HELP*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "1️⃣ *AI Advisor* - Ask anything\n"
+        "2️⃣ *Human Expert* - Talk to agronomist\n\n"
+        "Reply with number (1 or 2)\n"
+        "0️⃣ Main Menu"
+    )
+    return send_whatsapp(phone, expert_menu)
+
 # ==============================
 # ENHANCED MESSAGE HANDLER
 # ==============================
@@ -796,11 +824,13 @@ def handle_message(phone, msg_type, content):
     if state == USER_STATES["AWAITING_NAME"] and msg_type == "text":
         clean_name = content.strip().title()
         save_user(phone, {"name": clean_name, "state": USER_STATES["ACTIVE"]})
-        return send_whatsapp(phone, 
+        welcome_msg = (
             f"✅ *Welcome, {clean_name}!*\n\n"
             f"What would you like to do?\n\n"
             f"• Send a *photo* to detect diseases\n"
-            f"• Type *menu* for all options")
+            f"• Type *menu* for all options"
+        )
+        return send_whatsapp(phone, welcome_msg)
 
     # EXPERT MENU HANDLER
     if state == USER_STATES["EXPERT_MENU"] and msg_type == "text":
@@ -835,27 +865,34 @@ def handle_message(phone, msg_type, content):
             # History
             history = get_user_history(phone)
             if not history:
-                send_whatsapp(phone, "📋 *No scan history yet.*\n\nSend a photo to start!" + nav)
+                msg = "📋 *No scan history yet.*\n\nSend a photo to start!"
+                send_whatsapp(phone, msg)
+                # Return to dashboard menu
+                stats = get_user_statistics(phone)
+                return send_dashboard_menu(phone, name, stats)
             else:
                 msg = "📋 *YOUR SCAN HISTORY*\n━━━━━━━━━━━━━━━━━━\n"
                 for i, h in enumerate(history[:5], 1):
                     msg += f"{i}. *{h.get('disease', 'Unknown')}* - {h.get('confidence', 0):.1f}%\n"
                     msg += f"   📅 {h.get('date', 'Unknown')}\n\n"
-                send_whatsapp(phone, trim_message(msg) + "\n\n3️⃣ *Dashboard Menu*")
-            save_user(phone, {"state": USER_STATES["DASHBOARD_MENU"]})
-            return
+                send_whatsapp(phone, trim_message(msg))
+                # Return to dashboard menu
+                stats = get_user_statistics(phone)
+                return send_dashboard_menu(phone, name, stats)
         elif cmd == "2":
             # Tip
             tip = get_gemini_tip()
-            send_whatsapp(phone, f"💡 *Daily Tip*\n\n{tip}\n\n3️⃣ *Dashboard Menu*")
-            save_user(phone, {"state": USER_STATES["DASHBOARD_MENU"]})
-            return
+            send_whatsapp(phone, f"💡 *Daily Tip*\n\n{tip}")
+            # Return to dashboard menu
+            stats = get_user_statistics(phone)
+            return send_dashboard_menu(phone, name, stats)
         elif cmd == "3":
             # Fact
             fact = get_gemini_fact()
-            send_whatsapp(phone, f"🎲 *Did You Know?*\n\n{fact}\n\n3️⃣ *Dashboard Menu*")
-            save_user(phone, {"state": USER_STATES["DASHBOARD_MENU"]})
-            return
+            send_whatsapp(phone, f"🎲 *Did You Know?*\n\n{fact}")
+            # Return to dashboard menu
+            stats = get_user_statistics(phone)
+            return send_dashboard_menu(phone, name, stats)
         else:
             return send_whatsapp(phone, "❌ Please choose 1, 2, or 3 (or *0* for Main Menu).")
 
@@ -863,14 +900,13 @@ def handle_message(phone, msg_type, content):
     if state == USER_STATES["AWAITING_AI_QUESTION"] and msg_type == "text":
         if content.lower() == "cancel":
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
-            send_whatsapp(phone, "AI advisor cancelled." + nav)
-            return
+            return send_main_menu(phone)
         
         send_whatsapp(phone, f"🤔 AI Advisor is thinking...")
         answer = ask_ai_advisor(content)
-        send_whatsapp(phone, trim_message(answer) + nav)
+        send_whatsapp(phone, trim_message(answer))
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
-        return
+        return send_main_menu(phone)
 
     # FARMING PRACTICES SUBMENU HANDLER
     if state == USER_STATES["FARMING_MENU"] and msg_type == "text":
@@ -880,23 +916,28 @@ def handle_message(phone, msg_type, content):
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
             return send_main_menu(phone)
         
-        farming_topics = {
-            "1": "Latest planting and nursery standards for tobacco in Zimbabwe.",
-            "2": "Current fertilizer application rates for tobacco in Zimbabwe.",
-            "3": "Best practices for tobacco harvesting and priming in Zimbabwe.",
-            "4": "Complete flue-curing guide for tobacco.",
-            "5": "Latest 2026 tobacco marketing season news and TIMB requirements.",
-            "6": "General tobacco farming advice"
+        # Static guides for quick response
+        static_guides = {
+            "1": PLANTING_GUIDE,
+            "2": FERTILIZER_GUIDE,
+            "3": HARVESTING_GUIDE,
+            "4": CURING_GUIDE,
+            "5": MARKETING_GUIDE
         }
         
-        if cmd in farming_topics:
-            send_whatsapp(phone, "🤖 *AI Advisor is fetching the latest information...*")
-            answer = ask_ai_advisor(farming_topics[cmd])
-            response_msg = f"{answer}\n\n━━━━━━━━━━━━━━━\n💡 *Choose another topic (1-6) or 0 for Main Menu*"
-            send_whatsapp(phone, trim_message(response_msg))
+        if cmd in static_guides:
+            send_whatsapp(phone, static_guides[cmd])
+            # Stay in farming menu
+            return send_farming_menu(phone)
+        elif cmd == "6":
+            save_user(phone, {"state": USER_STATES["AWAITING_AI_QUESTION"]})
+            return send_whatsapp(phone, 
+                "🤖 *AI Advisor*\n\n"
+                "Ask me anything about tobacco farming.\n\n"
+                "Type your question below (or *cancel* to go back):")
         else:
             send_whatsapp(phone, "❌ Please choose 1-6 (or *0* for Main Menu).")
-        return
+            return send_farming_menu(phone)
 
     # LEAF GRADING
     if state == USER_STATES["WAITING_GRADE_IMAGE"] and msg_type == "image":
@@ -906,15 +947,18 @@ def handle_message(phone, msg_type, content):
         image_bytes = download_image(content)
         if not image_bytes:
             debug_log("❌ Download failed")
-            send_whatsapp(phone, "❌ Failed to download image. Please try again." + nav)
+            send_whatsapp(phone, "❌ Failed to download image. Please try again.")
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
-            return
+            return send_main_menu(phone)
         
         grade, analysis = grade_leaf_with_ai(image_bytes)
-        send_whatsapp(phone, trim_message(analysis))
+        if analysis:
+            send_whatsapp(phone, trim_message(analysis))
+        else:
+            send_whatsapp(phone, "❌ Could not analyze the image. Please try again.")
         
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
-        send_whatsapp(phone, nav)
+        send_main_menu(phone)
         gc.collect()
         return
 
@@ -926,9 +970,9 @@ def handle_message(phone, msg_type, content):
         image_bytes = download_image(content)
         if not image_bytes:
             debug_log("❌ Download failed")
-            send_whatsapp(phone, "❌ Failed to download image. Please try again." + nav)
+            send_whatsapp(phone, "❌ Failed to download image. Please try again.")
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
-            return
+            return send_main_menu(phone)
         
         send_whatsapp(phone, f"✅ Image downloaded! Running AI analysis...")
         
@@ -937,8 +981,8 @@ def handle_message(phone, msg_type, content):
         
         if not result:
             debug_log("❌ Detection failed")
-            send_whatsapp(phone, "❌ AI analysis failed. Please try another photo." + nav)
-            return
+            send_whatsapp(phone, "❌ AI analysis failed. Please try another photo.")
+            return send_main_menu(phone)
         
         disease = result["disease"]
         confidence = result["confidence"]
@@ -959,40 +1003,39 @@ def handle_message(phone, msg_type, content):
         if not result["is_healthy"] and not result["low_confidence"]:
             offline_advice = get_offline_disease_advice(disease)
             send_whatsapp(phone, trim_message(offline_advice) + "\n\nType *ai your question* for more advice")
-        else:
-            send_whatsapp(phone, nav)
         
+        send_main_menu(phone)
         gc.collect()
         return
 
     # AWAITING FEEDBACK
     if state == USER_STATES["AWAITING_FEEDBACK"] and msg_type == "text":
         if content.lower() == "cancel":
-            send_whatsapp(phone, "Feedback cancelled." + nav)
+            send_whatsapp(phone, "Feedback cancelled.")
         else:
             if ADMIN_PHONE:
                 send_whatsapp(ADMIN_PHONE, f"📝 *Feedback from {name}*\n{phone}\n\n{content}")
-            send_whatsapp(phone, "✅ Thank you! Your feedback has been sent." + nav)
+            send_whatsapp(phone, "✅ Thank you! Your feedback has been sent.")
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
-        return
+        return send_main_menu(phone)
 
     # AWAITING EXPERT
     if state == USER_STATES["AWAITING_EXPERT"] and msg_type == "text":
         if content.lower() == "cancel":
-            send_whatsapp(phone, "Expert request cancelled." + nav)
+            send_whatsapp(phone, "Expert request cancelled.")
         else:
             if ADMIN_PHONE:
                 send_whatsapp(ADMIN_PHONE, f"🚨 *EXPERT REQUEST from {name}*\n{phone}\n\n{content}")
-            send_whatsapp(phone, "👨‍🌾 Your request has been sent. An expert will contact you soon." + nav)
+            send_whatsapp(phone, "👨‍🌾 Your request has been sent. An expert will contact you soon.")
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
-        return
+        return send_main_menu(phone)
 
     # TEXT COMMANDS
     if msg_type == "text":
         cmd = content.lower().strip()
         
         # MAIN MENU
-        if cmd in ["menu", "0"]:
+        if cmd in ["menu", "0", "main"]:
             return send_main_menu(phone)
         
         # 1. DISEASE DETECTION
@@ -1006,40 +1049,13 @@ def handle_message(phone, msg_type, content):
         # 2. FARMING PRACTICES
         elif cmd in ["2", "farming"]:
             save_user(phone, {"state": USER_STATES["FARMING_MENU"]})
-            farming_menu = (
-                "🌱 *FARMING PRACTICES*\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                "1️⃣ *Planting Guide*\n"
-                "2️⃣ *Fertilizer Guide*\n"
-                "3️⃣ *Harvesting Guide*\n"
-                "4️⃣ *Curing Guide*\n"
-                "5️⃣ *Marketing Guide*\n"
-                "6️⃣ *Ask AI*\n\n"
-                "Reply with number (1-6)\n"
-                "0️⃣ Main Menu"
-            )
-            send_whatsapp(phone, farming_menu)
+            return send_farming_menu(phone)
         
         # 3. MY DASHBOARD
         elif cmd in ["3", "dashboard"]:
             stats = get_user_statistics(phone)
             save_user(phone, {"state": USER_STATES["DASHBOARD_MENU"]})
-            
-            dashboard = (
-                "📊 *MY DASHBOARD*\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                f"👤 *Farmer:* {name}\n"
-                f"📱 *Phone:* {phone}\n\n"
-                f"📝 *Total Scans:* {stats['total_scans']}\n"
-                f"🦠 *Common Issue:* {stats['top_disease']}\n"
-                f"🌿 *Healthy Leaves:* {stats['healthy_count']}\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                "1️⃣ *View History*\n"
-                "2️⃣ *Daily Tip*\n"
-                "3️⃣ *Fun Fact*\n\n"
-                "0️⃣ Main Menu"
-            )
-            send_whatsapp(phone, dashboard)
+            return send_dashboard_menu(phone, name, stats)
         
         # 4. LEAF GRADING
         elif cmd in ["4", "grade"]:
@@ -1053,15 +1069,7 @@ def handle_message(phone, msg_type, content):
         # 5. EXPERT HELP
         elif cmd in ["5", "expert"]:
             save_user(phone, {"state": USER_STATES["EXPERT_MENU"]})
-            expert_menu = (
-                "👨‍🌾 *EXPERT HELP*\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                "1️⃣ *AI Advisor* - Ask anything\n"
-                "2️⃣ *Human Expert* - Talk to agronomist\n\n"
-                "Reply with number (1 or 2)\n"
-                "0️⃣ Main Menu"
-            )
-            send_whatsapp(phone, expert_menu)
+            return send_expert_menu(phone)
         
         # 6. FEEDBACK
         elif cmd in ["6", "feedback"]:
@@ -1076,7 +1084,8 @@ def handle_message(phone, msg_type, content):
             if question:
                 send_whatsapp(phone, f"🤔 AI Advisor is thinking...")
                 answer = ask_ai_advisor(question)
-                send_whatsapp(phone, trim_message(answer) + nav)
+                send_whatsapp(phone, trim_message(answer))
+                return send_main_menu(phone)
             else:
                 send_whatsapp(phone, "❓ Example: *ai how to prevent black shank*")
         
@@ -1173,8 +1182,9 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     debug_log(f"🚀 Starting Tobacco AI Assistant on port {port}")
     debug_log(f"🤖 Using Hugging Face Space: {HF_SPACE_URL}")
+    debug_log(f"🧠 Available Gemini models: {', '.join(GEMINI_MODELS)}")
     if AI_API_KEY:
-        debug_log(f"🧠 AI Advisor enabled with rate limiting and retries")
+        debug_log(f"✅ AI Advisor enabled with model fallback")
     else:
         debug_log(f"ℹ️ AI Advisor disabled")
     app.run(host="0.0.0.0", port=port, debug=False)
