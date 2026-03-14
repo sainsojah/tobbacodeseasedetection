@@ -1,6 +1,6 @@
 """
 Tobacco AI Assistant - Render WhatsApp Bot
-Fixed: Correct Gemini model names for API v1beta
+Fixed: Updated with correct Gemini model names based on your available models
 """
 import os
 import json
@@ -16,7 +16,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import google.generativeai as genai  # IMPORT THIS
+import google.generativeai as genai
 
 # ==============================
 # INITIALIZATION
@@ -24,7 +24,7 @@ import google.generativeai as genai  # IMPORT THIS
 app = Flask(__name__)
 
 def debug_log(message):
-    """Print debug with timestamp - DEFINED FIRST!"""
+    """Print debug with timestamp"""
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
 
 # Load environment variables
@@ -37,22 +37,23 @@ HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "https://saintsouldier-tobacco-ai.
 
 # AI API Keys
 AI_API_KEY = os.environ.get("AI_API_KEY")
-AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini")
 
 # Configure Google Generative AI
 if AI_API_KEY and AI_API_KEY != "your_api_key_here":
     genai.configure(api_key=AI_API_KEY)
     debug_log("✅ Google Generative AI configured")
-    
-    # List available models for debugging
-    try:
-        models = genai.list_models()
-        debug_log("📋 Available models:")
-        for model in models:
-            if 'generateContent' in model.supported_generation_methods:
-                debug_log(f"   - {model.name}")
-    except Exception as e:
-        debug_log(f"⚠️ Could not list models: {e}")
+
+# CORRECT MODEL NAMES FROM YOUR SCREENSHOTS
+GEMINI_MODELS = [
+    'models/gemini-2.5-flash',
+    'models/gemini-2.5-pro',
+    'models/gemini-3.1-pro-preview',
+    'models/gemini-3.1-flash-lite-preview',
+    'models/gemini-2.0-flash',
+    'models/gemini-2.0-flash-lite',
+    'models/gemini-flash-latest',
+    'models/gemini-pro-latest'
+]
 
 # Generation config for Gemini
 generation_config = {
@@ -81,14 +82,23 @@ safety_settings = [
     },
 ]
 
-# CORRECTED MODEL NAMES FOR GEMINI API
-# The API expects model names with 'models/' prefix
-GEMINI_MODELS = [
-    'models/gemini-1.5-flash',
-    'models/gemini-1.5-pro',
-    'models/gemini-pro',
-    'models/gemini-1.0-pro'
-]
+# Vision-specific config (shorter responses)
+vision_config = {
+    "temperature": 0.7,
+    "max_output_tokens": 150,
+    "top_p": 0.8
+}
+
+# Tip/Fact specific config
+tip_config = {
+    "temperature": 0.8,
+    "max_output_tokens": 100
+}
+
+fact_config = {
+    "temperature": 0.9,
+    "max_output_tokens": 100
+}
 
 # Helper to trim long messages for WhatsApp
 def trim_message(text, max_length=900):
@@ -199,11 +209,8 @@ DISEASE_KNOWLEDGE_BASE = {
     }
 }
 
-# Confidence threshold
-CONFIDENCE_THRESHOLD = 25.0
-
 # ==============================
-# STATIC GUIDES (Fallback if AI fails)
+# STATIC GUIDES
 # ==============================
 PLANTING_GUIDE = """🌱 *PLANTING GUIDE*
 ━━━━━━━━━━━━━━━━━━
@@ -261,14 +268,6 @@ MARKETING_GUIDE = """💰 *MARKETING 2026*
 • Payment within 24 hours
 • Documents: ID, TIMB registration, grower number"""
 
-GUIDES = {
-    "planting": PLANTING_GUIDE,
-    "fertilizer": FERTILIZER_GUIDE,
-    "harvesting": HARVESTING_GUIDE,
-    "curing": CURING_GUIDE,
-    "marketing": MARKETING_GUIDE
-}
-
 # ==============================
 # USER STATISTICS FUNCTION
 # ==============================
@@ -300,7 +299,6 @@ def get_user_statistics(phone):
             else:
                 disease_counts[disease] = disease_counts.get(disease, 0) + 1
         
-        # Find most common disease
         top_disease = "None"
         if disease_counts:
             top_disease = max(disease_counts, key=disease_counts.get)
@@ -351,7 +349,7 @@ def get_offline_disease_advice(disease):
         return f"ℹ️ For specific advice on {disease}, please ask the AI advisor (type *ai your question*)"
 
 # ==============================
-# AI ADVISOR WITH MODEL FALLBACK USING GENAI LIBRARY
+# AI ADVISOR WITH MODEL FALLBACK
 # ==============================
 def ask_ai_advisor(question):
     """AI advisor using google.generativeai library"""
@@ -395,7 +393,7 @@ def ask_ai_advisor(question):
                 continue
                 
         except Exception as e:
-            debug_log(f"❌ Error with {model_name}: {e}")
+            debug_log(f"❌ Error with {model_name}: {str(e)[:100]}")
             continue
     
     # If all models fail, use fallback
@@ -406,7 +404,7 @@ def ask_ai_advisor(question):
         return "⚠️ AI service temporarily unavailable. Please try again later or use the farming guides (type *menu*)."
 
 # ==============================
-# AI LEAF GRADING WITH MODEL FALLBACK
+# AI LEAF GRADING
 # ==============================
 def grade_leaf_with_ai(image_bytes):
     """Grade leaf using google.generativeai library"""
@@ -423,26 +421,21 @@ def grade_leaf_with_ai(image_bytes):
             # Create the model with vision capabilities
             model = genai.GenerativeModel(
                 model_name=model_name,
-                generation_config={
-                    "temperature": 0.7,
-                    "max_output_tokens": 150,
-                    "top_p": 0.8
-                }
+                generation_config=vision_config,
+                safety_settings=safety_settings
             )
             
             # Prepare image for Gemini
-            image_parts = [
-                {
-                    "mime_type": "image/jpeg",
-                    "data": base64.b64encode(image_bytes).decode('utf-8')
-                }
-            ]
+            image_data = base64.b64encode(image_bytes).decode('utf-8')
             
             # Create prompt
             prompt = "Grade this tobacco leaf by color, quality, and damage. Be brief. Return in format:\nGrade: [A/B/C/D]\nColor: [brief]\nDamage: [brief]\nMarket: [Premium/Good/Average/Poor]"
             
             # Generate response with image
-            response = model.generate_content([prompt, image_parts[0]])
+            response = model.generate_content([
+                prompt,
+                {"mime_type": "image/jpeg", "data": image_data}
+            ])
             
             if response and response.text:
                 analysis = response.text.strip()
@@ -453,14 +446,13 @@ def grade_leaf_with_ai(image_bytes):
                 continue
                 
         except Exception as e:
-            debug_log(f"❌ Error with {model_name}: {e}")
+            debug_log(f"❌ Error with {model_name}: {str(e)[:100]}")
             continue
     
-    # If all models fail
     return None, "⚠️ Grading service temporarily unavailable. Please try again later."
 
 # ==============================
-# GEMINI-POWERED DAILY TIPS
+# DAILY TIP
 # ==============================
 def get_gemini_tip():
     """Generate a fresh daily farming tip"""
@@ -491,10 +483,8 @@ def get_gemini_tip():
             # Create model
             model = genai.GenerativeModel(
                 model_name=model_name,
-                generation_config={
-                    "temperature": 0.8,
-                    "max_output_tokens": 100
-                }
+                generation_config=tip_config,
+                safety_settings=safety_settings
             )
             
             # Generate tip
@@ -518,7 +508,7 @@ def get_gemini_tip():
     ])
 
 # ==============================
-# GEMINI-POWERED FUN FACTS
+# FUN FACT
 # ==============================
 def get_gemini_fact():
     """Generate a fresh interesting fact"""
@@ -539,10 +529,8 @@ def get_gemini_fact():
             # Create model
             model = genai.GenerativeModel(
                 model_name=model_name,
-                generation_config={
-                    "temperature": 0.9,
-                    "max_output_tokens": 100
-                }
+                generation_config=fact_config,
+                safety_settings=safety_settings
             )
             
             # Generate fact
@@ -566,7 +554,7 @@ def get_gemini_fact():
     ])
 
 # ==============================
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS (send_whatsapp, get_user, save_user, etc.)
 # ==============================
 def send_whatsapp(to, text):
     """Send WhatsApp message"""
@@ -729,6 +717,9 @@ def get_user_history(phone, limit=5):
         debug_log(f"❌ History error: {e}")
         return []
 
+# ==============================
+# MENU FUNCTIONS
+# ==============================
 def send_main_menu(phone):
     """Helper function to send main menu"""
     menu = (
@@ -792,14 +783,13 @@ def send_expert_menu(phone):
     return send_whatsapp(phone, expert_menu)
 
 # ==============================
-# ENHANCED MESSAGE HANDLER
+# MESSAGE HANDLER
 # ==============================
 def handle_message(phone, msg_type, content):
-    """Main message handler with all enhancements"""
+    """Main message handler"""
     debug_log(f"📨 Handling message: type={msg_type}, phone={phone}")
     
     user = get_user(phone)
-    nav = "\n\n---\n0️⃣ Main Menu"
     
     # NEW USER
     if not user:
@@ -854,12 +844,10 @@ def handle_message(phone, msg_type, content):
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
             return send_main_menu(phone)
         elif cmd == "1":
-            # History
             history = get_user_history(phone)
             if not history:
                 msg = "📋 *No scan history yet.*\n\nSend a photo to start!"
                 send_whatsapp(phone, msg)
-                # Return to dashboard menu
                 stats = get_user_statistics(phone)
                 return send_dashboard_menu(phone, name, stats)
             else:
@@ -868,21 +856,16 @@ def handle_message(phone, msg_type, content):
                     msg += f"{i}. *{h.get('disease', 'Unknown')}* - {h.get('confidence', 0):.1f}%\n"
                     msg += f"   📅 {h.get('date', 'Unknown')}\n\n"
                 send_whatsapp(phone, trim_message(msg))
-                # Return to dashboard menu
                 stats = get_user_statistics(phone)
                 return send_dashboard_menu(phone, name, stats)
         elif cmd == "2":
-            # Tip
             tip = get_gemini_tip()
             send_whatsapp(phone, f"💡 *Daily Tip*\n\n{tip}")
-            # Return to dashboard menu
             stats = get_user_statistics(phone)
             return send_dashboard_menu(phone, name, stats)
         elif cmd == "3":
-            # Fact
             fact = get_gemini_fact()
             send_whatsapp(phone, f"🎲 *Did You Know?*\n\n{fact}")
-            # Return to dashboard menu
             stats = get_user_statistics(phone)
             return send_dashboard_menu(phone, name, stats)
         else:
@@ -908,7 +891,6 @@ def handle_message(phone, msg_type, content):
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
             return send_main_menu(phone)
         
-        # Static guides for quick response
         static_guides = {
             "1": PLANTING_GUIDE,
             "2": FERTILIZER_GUIDE,
@@ -919,7 +901,6 @@ def handle_message(phone, msg_type, content):
         
         if cmd in static_guides:
             send_whatsapp(phone, static_guides[cmd])
-            # Stay in farming menu
             return send_farming_menu(phone)
         elif cmd == "6":
             save_user(phone, {"state": USER_STATES["AWAITING_AI_QUESTION"]})
@@ -954,7 +935,7 @@ def handle_message(phone, msg_type, content):
         gc.collect()
         return
 
-    # DISEASE DETECTION (image)
+    # DISEASE DETECTION
     if state == USER_STATES["WAITING_IMAGE"] and msg_type == "image":
         debug_log(f"📸 Processing disease detection from {phone}")
         send_whatsapp(phone, f"🔍 Downloading your image, {name}...")
@@ -1026,30 +1007,21 @@ def handle_message(phone, msg_type, content):
     if msg_type == "text":
         cmd = content.lower().strip()
         
-        # MAIN MENU
         if cmd in ["menu", "0", "main"]:
             return send_main_menu(phone)
-        
-        # 1. DISEASE DETECTION
         elif cmd in ["1", "detect"]:
             save_user(phone, {"state": USER_STATES["WAITING_IMAGE"]})
             send_whatsapp(phone, 
                 "📸 *Disease Detection*\n\n"
                 "Send a clear photo of the tobacco leaf.\n\n"
                 "Tips: Good lighting, close-up, steady camera")
-        
-        # 2. FARMING PRACTICES
         elif cmd in ["2", "farming"]:
             save_user(phone, {"state": USER_STATES["FARMING_MENU"]})
             return send_farming_menu(phone)
-        
-        # 3. MY DASHBOARD
         elif cmd in ["3", "dashboard"]:
             stats = get_user_statistics(phone)
             save_user(phone, {"state": USER_STATES["DASHBOARD_MENU"]})
             return send_dashboard_menu(phone, name, stats)
-        
-        # 4. LEAF GRADING
         elif cmd in ["4", "grade"]:
             save_user(phone, {"state": USER_STATES["WAITING_GRADE_IMAGE"]})
             send_whatsapp(phone, 
@@ -1057,20 +1029,14 @@ def handle_message(phone, msg_type, content):
                 "Send a clear photo of your cured leaf.\n\n"
                 "I'll analyze: grade, color, damage\n\n"
                 "Tips: Good lighting, flat surface")
-        
-        # 5. EXPERT HELP
         elif cmd in ["5", "expert"]:
             save_user(phone, {"state": USER_STATES["EXPERT_MENU"]})
             return send_expert_menu(phone)
-        
-        # 6. FEEDBACK
         elif cmd in ["6", "feedback"]:
             save_user(phone, {"state": USER_STATES["AWAITING_FEEDBACK"]})
             send_whatsapp(phone, 
                 "📝 *Send Feedback*\n\n"
                 "Type your message below (or *cancel*):")
-        
-        # AI ADVISOR (direct)
         elif cmd.startswith("ai "):
             question = cmd[3:].strip()
             if question:
@@ -1080,8 +1046,6 @@ def handle_message(phone, msg_type, content):
                 return send_main_menu(phone)
             else:
                 send_whatsapp(phone, "❓ Example: *ai how to prevent black shank*")
-        
-        # HELP
         elif cmd == "help":
             help_text = (
                 "📚 *QUICK HELP*\n"
@@ -1096,7 +1060,6 @@ def handle_message(phone, msg_type, content):
                 "• *ai [question]* - Ask AI"
             )
             send_whatsapp(phone, help_text)
-        
         else:
             send_whatsapp(phone, 
                 "❓ Command not recognized.\n\n"
@@ -1158,7 +1121,7 @@ def health():
         "status": "healthy",
         "firebase": db is not None,
         "huggingface_url": HF_SPACE_URL,
-        "ai_provider": AI_PROVIDER if AI_API_KEY else "disabled",
+        "ai_provider": "gemini" if AI_API_KEY else "disabled",
         "timestamp": datetime.now().isoformat()
     }), 200
 
