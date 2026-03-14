@@ -1,6 +1,6 @@
 """
 Tobacco AI Assistant - Render WhatsApp Bot
-Fixed: Navigation, Model Fallback, Response Handling
+Fixed: Complete working version with Google Generative AI
 """
 import os
 import json
@@ -16,6 +16,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import google.generativeai as genai  # IMPORT THIS
 
 # ==============================
 # INITIALIZATION
@@ -33,6 +34,38 @@ HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "https://saintsouldier-tobacco-ai.
 # AI API Keys
 AI_API_KEY = os.environ.get("AI_API_KEY")
 AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini")
+
+# Configure Google Generative AI
+if AI_API_KEY and AI_API_KEY != "your_api_key_here":
+    genai.configure(api_key=AI_API_KEY)
+    debug_log("✅ Google Generative AI configured")
+
+# Generation config for Gemini
+generation_config = {
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 10,
+    "max_output_tokens": 200,
+}
+
+safety_settings = [
+    {
+        "category": "HARM_CATEGORY_HARASSMENT",
+        "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+    },
+    {
+        "category": "HARM_CATEGORY_HATE_SPEECH",
+        "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+    },
+    {
+        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+    },
+    {
+        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+        "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+    },
+]
 
 # Try different model names - will be used in fallback sequence
 GEMINI_MODELS = [
@@ -307,10 +340,10 @@ def get_offline_disease_advice(disease):
         return f"ℹ️ For specific advice on {disease}, please ask the AI advisor (type *ai your question*)"
 
 # ==============================
-# AI ADVISOR WITH MODEL FALLBACK
+# AI ADVISOR WITH MODEL FALLBACK USING GENAI LIBRARY
 # ==============================
 def ask_ai_advisor(question):
-    """AI advisor with model fallback and rate limiting"""
+    """AI advisor using google.generativeai library"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return "🤖 AI advisor not configured. Please add API key."
     
@@ -329,44 +362,25 @@ def ask_ai_advisor(question):
             
             debug_log(f"🔄 Trying Gemini model: {model_name}")
             
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={AI_API_KEY}"
+            # Create the model with generation config
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config=generation_config,
+                safety_settings=safety_settings
+            )
             
-            headers = {'Content-Type': 'application/json'}
-            payload = {
-                "contents": [{
-                    "parts": [{
-                        "text": f"You are a Zimbabwe tobacco expert. Answer briefly and practically:\n\nQuestion: {question}\n\nKeep response under 400 characters for WhatsApp."
-                    }]
-                }],
-                "generationConfig": {
-                    "temperature": 0.7,
-                    "maxOutputTokens": 200,
-                    "topP": 0.8,
-                    "topK": 10
-                }
-            }
+            # Create prompt
+            prompt = f"You are a Zimbabwe tobacco expert. Answer briefly and practically:\n\nQuestion: {question}\n\nKeep response under 400 characters for WhatsApp."
             
-            response = http_session.post(url, headers=headers, json=payload, timeout=20)
+            # Generate response
+            response = model.generate_content(prompt)
             
-            if response.status_code == 200:
-                result = response.json()
-                
-                if "candidates" in result and result["candidates"]:
-                    candidate = result["candidates"][0]
-                    if "content" in candidate and "parts" in candidate["content"]:
-                        answer = candidate["content"]["parts"][0]["text"].strip()
-                        debug_log(f"✅ Success with model: {model_name}")
-                        return trim_message(answer, 900)
-            
-            elif response.status_code == 404:
-                debug_log(f"⚠️ Model {model_name} not found, trying next...")
-                continue
-            elif response.status_code == 429:
-                debug_log(f"⚠️ Rate limited on {model_name}, waiting...")
-                time.sleep(2)
-                continue
+            if response and response.text:
+                answer = response.text.strip()
+                debug_log(f"✅ Success with model: {model_name}")
+                return trim_message(answer, 900)
             else:
-                debug_log(f"⚠️ Error {response.status_code} on {model_name}")
+                debug_log(f"⚠️ Empty response from {model_name}")
                 continue
                 
         except Exception as e:
@@ -384,7 +398,7 @@ def ask_ai_advisor(question):
 # AI LEAF GRADING WITH MODEL FALLBACK
 # ==============================
 def grade_leaf_with_ai(image_bytes):
-    """Grade leaf with model fallback sequence"""
+    """Grade leaf using google.generativeai library"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return None, "AI grading not configured"
     
@@ -395,53 +409,36 @@ def grade_leaf_with_ai(image_bytes):
             
             debug_log(f"🔄 Trying Gemini Vision with model: {model_name}")
             
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={AI_API_KEY}"
-            
-            # Convert image to base64 for Gemini
-            image_base64 = base64.b64encode(image_bytes).decode('utf-8')
-            
-            headers = {'Content-Type': 'application/json'}
-            
-            payload = {
-                "contents": [{
-                    "parts": [
-                        {"text": "Grade this tobacco leaf by color, quality, and damage. Be brief. Return in format:\nGrade: [A/B/C/D]\nColor: [brief]\nDamage: [brief]\nMarket: [Premium/Good/Average/Poor]"},
-                        {
-                            "inline_data": {
-                                "mime_type": "image/jpeg",
-                                "data": image_base64
-                            }
-                        }
-                    ]
-                }],
-                "generationConfig": {
+            # Create the model with vision capabilities
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config={
                     "temperature": 0.7,
-                    "maxOutputTokens": 150,
-                    "topP": 0.8
+                    "max_output_tokens": 150,
+                    "top_p": 0.8
                 }
-            }
+            )
             
-            response = http_session.post(url, headers=headers, json=payload, timeout=30)
+            # Prepare image for Gemini
+            image_parts = [
+                {
+                    "mime_type": "image/jpeg",
+                    "data": base64.b64encode(image_bytes).decode('utf-8')
+                }
+            ]
             
-            if response.status_code == 200:
-                result = response.json()
-                
-                if "candidates" in result and result["candidates"]:
-                    candidate = result["candidates"][0]
-                    if "content" in candidate and "parts" in candidate["content"]:
-                        analysis = candidate["content"]["parts"][0]["text"].strip()
-                        debug_log(f"✅ Success with model: {model_name}")
-                        return "Grade", trim_message(analysis, 500)
+            # Create prompt
+            prompt = "Grade this tobacco leaf by color, quality, and damage. Be brief. Return in format:\nGrade: [A/B/C/D]\nColor: [brief]\nDamage: [brief]\nMarket: [Premium/Good/Average/Poor]"
             
-            elif response.status_code == 404:
-                debug_log(f"⚠️ Model {model_name} not found for vision, trying next...")
-                continue
-            elif response.status_code == 429:
-                debug_log(f"⚠️ Rate limited on {model_name}, waiting...")
-                time.sleep(2)
-                continue
+            # Generate response with image
+            response = model.generate_content([prompt, image_parts[0]])
+            
+            if response and response.text:
+                analysis = response.text.strip()
+                debug_log(f"✅ Success with model: {model_name}")
+                return "Grade", trim_message(analysis, 500)
             else:
-                debug_log(f"⚠️ Error {response.status_code} on {model_name}")
+                debug_log(f"⚠️ Empty response from {model_name}")
                 continue
                 
         except Exception as e:
@@ -480,30 +477,22 @@ def get_gemini_tip():
             
             debug_log(f"🔄 Generating tip with {model_name}")
             
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={AI_API_KEY}"
-            
-            headers = {'Content-Type': 'application/json'}
-            prompt = f"Generate ONE short farming tip for Zimbabwe tobacco farmers during {season}. Max 250 characters. Start with an emoji."
-            
-            payload = {
-                "contents": [{
-                    "parts": [{"text": prompt}]
-                }],
-                "generationConfig": {
+            # Create model
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config={
                     "temperature": 0.8,
-                    "maxOutputTokens": 100
+                    "max_output_tokens": 100
                 }
-            }
+            )
             
-            response = http_session.post(url, headers=headers, json=payload, timeout=15)
+            # Generate tip
+            prompt = f"Generate ONE short farming tip for Zimbabwe tobacco farmers during {season}. Max 250 characters. Start with an emoji."
+            response = model.generate_content(prompt)
             
-            if response.status_code == 200:
-                result = response.json()
-                if "candidates" in result and result["candidates"]:
-                    tip = result["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    return trim_message(tip, 250)
-            elif response.status_code == 404:
-                continue
+            if response and response.text:
+                tip = response.text.strip()
+                return trim_message(tip, 250)
             else:
                 continue
                 
@@ -536,30 +525,22 @@ def get_gemini_fact():
             
             debug_log(f"🔄 Generating fact with {model_name}")
             
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={AI_API_KEY}"
-            
-            headers = {'Content-Type': 'application/json'}
-            prompt = "Generate ONE interesting fact about Zimbabwe tobacco farming. Max 250 characters. Start with an emoji."
-            
-            payload = {
-                "contents": [{
-                    "parts": [{"text": prompt}]
-                }],
-                "generationConfig": {
+            # Create model
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config={
                     "temperature": 0.9,
-                    "maxOutputTokens": 100
+                    "max_output_tokens": 100
                 }
-            }
+            )
             
-            response = http_session.post(url, headers=headers, json=payload, timeout=15)
+            # Generate fact
+            prompt = "Generate ONE interesting fact about Zimbabwe tobacco farming. Max 250 characters. Start with an emoji."
+            response = model.generate_content(prompt)
             
-            if response.status_code == 200:
-                result = response.json()
-                if "candidates" in result and result["candidates"]:
-                    fact = result["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    return trim_message(fact, 250)
-            elif response.status_code == 404:
-                continue
+            if response and response.text:
+                fact = response.text.strip()
+                return trim_message(fact, 250)
             else:
                 continue
                 
@@ -1183,8 +1164,8 @@ if __name__ == "__main__":
     debug_log(f"🚀 Starting Tobacco AI Assistant on port {port}")
     debug_log(f"🤖 Using Hugging Face Space: {HF_SPACE_URL}")
     debug_log(f"🧠 Available Gemini models: {', '.join(GEMINI_MODELS)}")
-    if AI_API_KEY:
+    if AI_API_KEY and AI_API_KEY != "your_api_key_here":
         debug_log(f"✅ AI Advisor enabled with model fallback")
     else:
-        debug_log(f"ℹ️ AI Advisor disabled")
+        debug_log(f"ℹ️ AI Advisor disabled - set AI_API_KEY environment variable")
     app.run(host="0.0.0.0", port=port, debug=False)
