@@ -1,6 +1,6 @@
 """
 Tobacco AI Assistant - Render WhatsApp Bot
-Fixed: Complete working version with Google Generative AI
+Fixed: Correct Gemini model names for API v1beta
 """
 import os
 import json
@@ -43,6 +43,16 @@ AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini")
 if AI_API_KEY and AI_API_KEY != "your_api_key_here":
     genai.configure(api_key=AI_API_KEY)
     debug_log("✅ Google Generative AI configured")
+    
+    # List available models for debugging
+    try:
+        models = genai.list_models()
+        debug_log("📋 Available models:")
+        for model in models:
+            if 'generateContent' in model.supported_generation_methods:
+                debug_log(f"   - {model.name}")
+    except Exception as e:
+        debug_log(f"⚠️ Could not list models: {e}")
 
 # Generation config for Gemini
 generation_config = {
@@ -71,12 +81,13 @@ safety_settings = [
     },
 ]
 
-# Try different model names - will be used in fallback sequence
+# CORRECTED MODEL NAMES FOR GEMINI API
+# The API expects model names with 'models/' prefix
 GEMINI_MODELS = [
-    'gemini-1.5-flash',
-    'gemini-1.5-pro',
-    'gemini-pro',
-    'gemini-1.0-pro'
+    'models/gemini-1.5-flash',
+    'models/gemini-1.5-pro',
+    'models/gemini-pro',
+    'models/gemini-1.0-pro'
 ]
 
 # Helper to trim long messages for WhatsApp
