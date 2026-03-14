@@ -1,6 +1,6 @@
 """
 Tobacco AI Assistant - Render WhatsApp Bot
-Fixed: Complete responses with proper waiting and 150-word limit
+Fixed: Complete responses with proper waiting for ALL AI interactions
 """
 import os
 import json
@@ -45,8 +45,6 @@ if AI_API_KEY and AI_API_KEY != "your_api_key_here":
 
 # CORRECT MODEL NAMES - Prioritize stable models first
 GEMINI_MODELS = [
-    'models/gemini-1.5-flash',      # Most stable, widely available
-    'models/gemini-1.5-pro',         # Good for complex tasks
     'models/gemini-2.5-flash',       # Newer model
     'models/gemini-2.5-pro',         # Newer pro model
     'models/gemini-3.1-pro-preview', # Preview model
@@ -65,7 +63,7 @@ generation_config = {
     "temperature": 0.7,
     "top_p": 0.8,
     "top_k": 10,
-    "max_output_tokens": 800,  # Increased to allow longer responses
+    "max_output_tokens": 800,  # Allows ~150 words
 }
 
 safety_settings = [
@@ -371,10 +369,10 @@ def get_offline_disease_advice(disease):
         return f"ℹ️ For specific advice on {disease}, please ask the AI advisor (type *ai your question*)"
 
 # ==============================
-# IMPROVED AI ADVISOR WITH 150-WORD LIMIT INSTRUCTION
+# IMPROVED AI ADVISOR WITH WORD LIMIT
 # ==============================
 def ask_ai_advisor(question):
-    """AI advisor with 100-word limit instruction"""
+    """AI advisor with word limit instruction"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return "🤖 AI advisor not configured. Please add API key."
     
@@ -385,22 +383,19 @@ def ask_ai_advisor(question):
             disease_found = disease
             break
     
-    # Try each model in sequence until one works (fallback loop)
+    # Try each model in sequence until one works
     for model_name in GEMINI_MODELS:
         try:
-            # ⏱️ Add small delay to prevent rate limiting
             time.sleep(1)
-            
             debug_log(f"🔄 Trying Gemini model: {model_name}")
             
-            # Create the model with high token limit
             model = genai.GenerativeModel(
                 model_name=model_name,
                 generation_config=generation_config,
                 safety_settings=safety_settings
             )
             
-            # Create prompt with 150-word limit instruction
+            # Prompt with 150-word limit instruction
             prompt = f"""You are a Zimbabwe tobacco expert. Answer the following question.
 
 IMPORTANT: Keep your response under 150 words total. Be concise but complete.
@@ -413,19 +408,8 @@ Guidelines:
 3. End with a complete sentence
 4. Stay under 150 words"""
 
-            # Generate response with retry logic
-            max_attempts = 3
-            response = None
-            
-            for attempt in range(max_attempts):
-                try:
-                    response = model.generate_content(prompt)
-                    if response and response.text:
-                        break
-                except Exception as e:
-                    debug_log(f"⚠️ Attempt {attempt + 1} failed: {e}")
-                    time.sleep(2)
-                    continue
+            # Generate response
+            response = model.generate_content(prompt)
             
             if response and response.text:
                 answer = response.text.strip()
@@ -831,7 +815,7 @@ def send_expert_menu(phone):
     return send_whatsapp(phone, expert_menu)
 
 # ==============================
-# FIXED MESSAGE HANDLER - WITH DELAY BEFORE MENU
+# FIXED MESSAGE HANDLER - BOTH AI PATHS WORKING
 # ==============================
 def handle_message(phone, msg_type, content):
     """Main message handler with improved response handling"""
@@ -919,7 +903,7 @@ def handle_message(phone, msg_type, content):
         else:
             return send_whatsapp(phone, "❌ Please choose 1, 2, or 3 (or *0* for Main Menu).")
 
-    # AWAITING AI QUESTION - FIXED WITH DELAY BEFORE MENU
+    # AWAITING AI QUESTION - FIXED WITH DELAY
     if state == USER_STATES["AWAITING_AI_QUESTION"] and msg_type == "text":
         if content.lower() == "cancel":
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
@@ -931,7 +915,7 @@ def handle_message(phone, msg_type, content):
         # Get response
         result = ask_ai_advisor(content)
         
-        # Send the AI response (no trimming)
+        # Send the AI response
         send_whatsapp_with_retry(phone, result)
         
         # Wait 2 seconds to ensure user sees the full response
@@ -1078,7 +1062,7 @@ def handle_message(phone, msg_type, content):
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         return send_main_menu(phone)
 
-    # TEXT COMMANDS
+    # TEXT COMMANDS - FIXED AI COMMAND WITH DELAY
     if msg_type == "text":
         cmd = content.lower().strip()
         
@@ -1217,7 +1201,7 @@ if __name__ == "__main__":
     debug_log(f"🤖 Using Hugging Face Space: {HF_SPACE_URL}")
     debug_log(f"🧠 Available Gemini models: {', '.join(GEMINI_MODELS)}")
     if AI_API_KEY and AI_API_KEY != "your_api_key_here":
-        debug_log(f"✅ AI Advisor enabled with 150-word limit and 2-second delay")
+        debug_log(f"✅ AI Advisor enabled with 150-word limit and 2-second delay for ALL responses")
     else:
         debug_log(f"ℹ️ AI Advisor disabled - set AI_API_KEY environment variable")
     app.run(host="0.0.0.0", port=port, debug=False)
