@@ -1,6 +1,6 @@
 """
 Tobacco AI Assistant - Render WhatsApp Bot
-Fixed: Updated with correct Gemini model names based on your available models
+Fixed: Complete responses with loop waiting and proper token management
 """
 import os
 import json
@@ -55,12 +55,12 @@ GEMINI_MODELS = [
     'models/gemini-pro-latest'
 ]
 
-# Generation config for Gemini
+# HIGH TOKEN LIMITS FOR COMPLETE RESPONSES
 generation_config = {
     "temperature": 0.7,
     "top_p": 0.8,
     "top_k": 10,
-    "max_output_tokens": 200,
+    "max_output_tokens": 2048,  # Increased significantly
 }
 
 safety_settings = [
@@ -82,26 +82,26 @@ safety_settings = [
     },
 ]
 
-# Vision-specific config (shorter responses)
+# Vision-specific config
 vision_config = {
     "temperature": 0.7,
-    "max_output_tokens": 150,
+    "max_output_tokens": 1024,  # Increased
     "top_p": 0.8
 }
 
 # Tip/Fact specific config
 tip_config = {
     "temperature": 0.8,
-    "max_output_tokens": 100
+    "max_output_tokens": 500,  # Increased
 }
 
 fact_config = {
     "temperature": 0.9,
-    "max_output_tokens": 100
+    "max_output_tokens": 500,  # Increased
 }
 
-# Helper to trim long messages for WhatsApp
-def trim_message(text, max_length=900):
+# Helper to trim long messages for WhatsApp (WhatsApp limit is 4096 chars)
+def trim_message(text, max_length=4000):
     """Trim message to safe WhatsApp length"""
     if not text:
         return "No response available."
@@ -349,10 +349,10 @@ def get_offline_disease_advice(disease):
         return f"ℹ️ For specific advice on {disease}, please ask the AI advisor (type *ai your question*)"
 
 # ==============================
-# AI ADVISOR WITH MODEL FALLBACK
+# IMPROVED AI ADVISOR WITH LOOP AND COMPLETE RESPONSE HANDLING
 # ==============================
 def ask_ai_advisor(question):
-    """AI advisor using google.generativeai library"""
+    """AI advisor with loop to ensure complete response"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return "🤖 AI advisor not configured. Please add API key."
     
@@ -371,23 +371,70 @@ def ask_ai_advisor(question):
             
             debug_log(f"🔄 Trying Gemini model: {model_name}")
             
-            # Create the model with generation config
+            # Create the model with high token limit
             model = genai.GenerativeModel(
                 model_name=model_name,
                 generation_config=generation_config,
                 safety_settings=safety_settings
             )
             
-            # Create prompt
-            prompt = f"You are a Zimbabwe tobacco expert. Answer briefly and practically:\n\nQuestion: {question}\n\nKeep response under 400 characters for WhatsApp."
+            # Create prompt with clear instruction for complete response
+            prompt = f"""You are a Zimbabwe tobacco expert. Answer the following question thoroughly and completely.
+
+Question: {question}
+
+Important Guidelines:
+1. Provide a COMPLETE answer with ALL relevant details
+2. Include specific numbers, measurements, and steps
+3. Format with bullet points for readability
+4. Do not cut off mid-sentence - finish your thought
+5. If the answer is long, organize it in clear sections
+6. Use emojis where appropriate for WhatsApp
+
+Remember: Give a comprehensive response that fully answers the question."""
+
+            # Generate response with retry logic
+            max_attempts = 3
+            response = None
             
-            # Generate response
-            response = model.generate_content(prompt)
+            for attempt in range(max_attempts):
+                try:
+                    response = model.generate_content(prompt)
+                    if response and response.text:
+                        break
+                except Exception as e:
+                    debug_log(f"⚠️ Attempt {attempt + 1} failed: {e}")
+                    time.sleep(2)  # Wait before retry
+                    continue
             
             if response and response.text:
                 answer = response.text.strip()
-                debug_log(f"✅ Success with model: {model_name}")
-                return trim_message(answer, 900)
+                
+                # Check if response seems complete (ends with sentence punctuation)
+                if answer and not answer[-1] in ['.', '!', '?', ')', '"', "'"]:
+                    debug_log(f"⚠️ Response may be incomplete, but sending anyway")
+                
+                debug_log(f"✅ Success with model: {model_name} (response length: {len(answer)} chars)")
+                
+                # Check if response is too long and needs splitting
+                if len(answer) > 3500:
+                    # Split into multiple messages if needed
+                    parts = []
+                    current_part = ""
+                    for line in answer.split('\n'):
+                        if len(current_part) + len(line) + 1 < 3500:
+                            current_part += line + '\n'
+                        else:
+                            if current_part:
+                                parts.append(current_part.strip())
+                            current_part = line + '\n'
+                    if current_part:
+                        parts.append(current_part.strip())
+                    
+                    # Return first part (others will be sent separately)
+                    return parts
+                else:
+                    return answer
             else:
                 debug_log(f"⚠️ Empty response from {model_name}")
                 continue
@@ -399,7 +446,7 @@ def ask_ai_advisor(question):
     # If all models fail, use fallback
     debug_log(f"⚠️ All Gemini models failed, using fallback")
     if disease_found:
-        return trim_message(get_offline_disease_advice(disease_found), 900)
+        return get_offline_disease_advice(disease_found)
     else:
         return "⚠️ AI service temporarily unavailable. Please try again later or use the farming guides (type *menu*)."
 
@@ -429,8 +476,22 @@ def grade_leaf_with_ai(image_bytes):
             image_data = base64.b64encode(image_bytes).decode('utf-8')
             
             # Create prompt
-            prompt = "Grade this tobacco leaf by color, quality, and damage. Be brief. Return in format:\nGrade: [A/B/C/D]\nColor: [brief]\nDamage: [brief]\nMarket: [Premium/Good/Average/Poor]"
-            
+            prompt = """Grade this tobacco leaf thoroughly. Provide a complete analysis:
+
+📊 *LEAF GRADING RESULTS*
+━━━━━━━━━━━━━━━━━━
+Grade: [A/B/C/D] - [Premium/Good/Fair/Poor]
+Color: [detailed color description with notes on uniformity]
+Texture: [description of leaf texture - oily, dry, brittle, etc.]
+Size: [estimated size and completeness]
+Damage: [any spots, tears, holes, or imperfections]
+Moisture: [estimated moisture content - too dry, optimal, too moist]
+Market Value: [estimated market category and price potential]
+
+Additional Notes: [any other observations and recommendations]
+
+Be thorough and specific in your assessment."""
+
             # Generate response with image
             response = model.generate_content([
                 prompt,
@@ -440,7 +501,7 @@ def grade_leaf_with_ai(image_bytes):
             if response and response.text:
                 analysis = response.text.strip()
                 debug_log(f"✅ Success with model: {model_name}")
-                return "Grade", trim_message(analysis, 500)
+                return "Grade", analysis
             else:
                 debug_log(f"⚠️ Empty response from {model_name}")
                 continue
@@ -488,12 +549,21 @@ def get_gemini_tip():
             )
             
             # Generate tip
-            prompt = f"Generate ONE short farming tip for Zimbabwe tobacco farmers during {season}. Max 250 characters. Start with an emoji."
+            prompt = f"""Generate ONE practical farming tip for Zimbabwe tobacco farmers during {season}.
+
+The tip should:
+- Be specific and actionable
+- Include relevant details (measurements, timing, etc.)
+- Be complete (not cut off mid-sentence)
+- Start with an emoji
+- Max 500 characters
+
+Tip:"""
             response = model.generate_content(prompt)
             
             if response and response.text:
                 tip = response.text.strip()
-                return trim_message(tip, 250)
+                return tip
             else:
                 continue
                 
@@ -502,9 +572,9 @@ def get_gemini_tip():
     
     # Fallback
     return random.choice([
-        "🌱 Monitor your fields daily for early disease signs.",
-        "💧 Water early morning to prevent fungal growth.",
-        "🔍 Check lower leaves regularly for pests and diseases."
+        "🌱 Monitor your fields daily for early disease signs. Check both upper and lower leaves for spots, discoloration, or pests.",
+        "💧 Water early morning to reduce humidity and prevent fungal growth. Avoid evening watering which can promote disease.",
+        "🔍 Check lower leaves regularly for pests and diseases - problems often start there before spreading upward."
     ])
 
 # ==============================
@@ -534,12 +604,21 @@ def get_gemini_fact():
             )
             
             # Generate fact
-            prompt = "Generate ONE interesting fact about Zimbabwe tobacco farming. Max 250 characters. Start with an emoji."
+            prompt = """Generate ONE interesting, factual statement about Zimbabwe tobacco farming.
+
+The fact should:
+- Be accurate and specific
+- Include interesting details or statistics
+- Be complete (not cut off)
+- Start with an emoji
+- Max 500 characters
+
+Fact:"""
             response = model.generate_content(prompt)
             
             if response and response.text:
                 fact = response.text.strip()
-                return trim_message(fact, 250)
+                return fact
             else:
                 continue
                 
@@ -548,13 +627,13 @@ def get_gemini_fact():
     
     # Fallback
     return random.choice([
-        "🌱 Zimbabwe's tobacco industry employs over 500,000 people.",
-        "📜 Tobacco has been cultivated for over 8,000 years.",
-        "🌍 Zimbabwe exports tobacco to over 50 countries."
+        "🌱 Zimbabwe's tobacco industry employs over 500,000 people across farming, processing, and marketing sectors.",
+        "📜 Tobacco has been cultivated in Zimbabwe for over 8,000 years, originally used for ceremonial purposes.",
+        "🌍 Zimbabwe exports premium flue-cured tobacco to over 50 countries, with China being the largest market."
     ])
 
 # ==============================
-# HELPER FUNCTIONS (send_whatsapp, get_user, save_user, etc.)
+# HELPER FUNCTIONS
 # ==============================
 def send_whatsapp(to, text):
     """Send WhatsApp message"""
@@ -579,6 +658,14 @@ def send_whatsapp(to, text):
     except Exception as e:
         debug_log(f"❌ WhatsApp send error: {e}")
         return False
+
+def send_whatsapp_with_retry(to, text, max_retries=3):
+    """Send WhatsApp with retry logic"""
+    for attempt in range(max_retries):
+        if send_whatsapp(to, text):
+            return True
+        time.sleep(1)
+    return False
 
 def get_user(phone):
     """Get user from Firebase"""
@@ -783,10 +870,10 @@ def send_expert_menu(phone):
     return send_whatsapp(phone, expert_menu)
 
 # ==============================
-# MESSAGE HANDLER
+# UPDATED MESSAGE HANDLER WITH BETTER RESPONSE HANDLING
 # ==============================
 def handle_message(phone, msg_type, content):
-    """Main message handler"""
+    """Main message handler with improved response handling"""
     debug_log(f"📨 Handling message: type={msg_type}, phone={phone}")
     
     user = get_user(phone)
@@ -855,7 +942,7 @@ def handle_message(phone, msg_type, content):
                 for i, h in enumerate(history[:5], 1):
                     msg += f"{i}. *{h.get('disease', 'Unknown')}* - {h.get('confidence', 0):.1f}%\n"
                     msg += f"   📅 {h.get('date', 'Unknown')}\n\n"
-                send_whatsapp(phone, trim_message(msg))
+                send_whatsapp(phone, trim_message(msg, 3500))
                 stats = get_user_statistics(phone)
                 return send_dashboard_menu(phone, name, stats)
         elif cmd == "2":
@@ -871,15 +958,32 @@ def handle_message(phone, msg_type, content):
         else:
             return send_whatsapp(phone, "❌ Please choose 1, 2, or 3 (or *0* for Main Menu).")
 
-    # AWAITING AI QUESTION
+    # AWAITING AI QUESTION - IMPROVED WITH MULTI-PART RESPONSE HANDLING
     if state == USER_STATES["AWAITING_AI_QUESTION"] and msg_type == "text":
         if content.lower() == "cancel":
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
             return send_main_menu(phone)
         
+        # Send thinking message
         send_whatsapp(phone, f"🤔 AI Advisor is thinking...")
-        answer = ask_ai_advisor(content)
-        send_whatsapp(phone, trim_message(answer))
+        
+        # Get response (could be string or list of parts)
+        result = ask_ai_advisor(content)
+        
+        # Handle multi-part responses
+        if isinstance(result, list):
+            for i, part in enumerate(result):
+                if i == 0:
+                    # First part
+                    send_whatsapp_with_retry(phone, trim_message(part, 3500))
+                else:
+                    # Additional parts with a small delay
+                    time.sleep(1)
+                    send_whatsapp_with_retry(phone, trim_message(f"(Continued...)\n\n{part}", 3500))
+        else:
+            # Single response
+            send_whatsapp_with_retry(phone, trim_message(result, 3500))
+        
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         return send_main_menu(phone)
 
@@ -926,7 +1030,7 @@ def handle_message(phone, msg_type, content):
         
         grade, analysis = grade_leaf_with_ai(image_bytes)
         if analysis:
-            send_whatsapp(phone, trim_message(analysis))
+            send_whatsapp_with_retry(phone, trim_message(analysis, 3500))
         else:
             send_whatsapp(phone, "❌ Could not analyze the image. Please try again.")
         
@@ -971,11 +1075,11 @@ def handle_message(phone, msg_type, content):
         else:
             response = f"📊 *{disease} DETECTED*\n\nConfidence: {confidence:.1f}%\n{confidence_msg}\n\n*Treatment:*\n{result['treatment']}"
         
-        send_whatsapp(phone, trim_message(response))
+        send_whatsapp(phone, trim_message(response, 3500))
         
         if not result["is_healthy"] and not result["low_confidence"]:
             offline_advice = get_offline_disease_advice(disease)
-            send_whatsapp(phone, trim_message(offline_advice) + "\n\nType *ai your question* for more advice")
+            send_whatsapp(phone, trim_message(offline_advice, 3500) + "\n\nType *ai your question* for more advice")
         
         send_main_menu(phone)
         gc.collect()
@@ -1041,8 +1145,18 @@ def handle_message(phone, msg_type, content):
             question = cmd[3:].strip()
             if question:
                 send_whatsapp(phone, f"🤔 AI Advisor is thinking...")
-                answer = ask_ai_advisor(question)
-                send_whatsapp(phone, trim_message(answer))
+                result = ask_ai_advisor(question)
+                
+                if isinstance(result, list):
+                    for i, part in enumerate(result):
+                        if i == 0:
+                            send_whatsapp_with_retry(phone, trim_message(part, 3500))
+                        else:
+                            time.sleep(1)
+                            send_whatsapp_with_retry(phone, trim_message(f"(Continued...)\n\n{part}", 3500))
+                else:
+                    send_whatsapp_with_retry(phone, trim_message(result, 3500))
+                
                 return send_main_menu(phone)
             else:
                 send_whatsapp(phone, "❓ Example: *ai how to prevent black shank*")
@@ -1139,7 +1253,7 @@ if __name__ == "__main__":
     debug_log(f"🤖 Using Hugging Face Space: {HF_SPACE_URL}")
     debug_log(f"🧠 Available Gemini models: {', '.join(GEMINI_MODELS)}")
     if AI_API_KEY and AI_API_KEY != "your_api_key_here":
-        debug_log(f"✅ AI Advisor enabled with model fallback")
+        debug_log(f"✅ AI Advisor enabled with model fallback and multi-part response handling")
     else:
         debug_log(f"ℹ️ AI Advisor disabled - set AI_API_KEY environment variable")
     app.run(host="0.0.0.0", port=port, debug=False)
