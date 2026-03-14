@@ -1,6 +1,6 @@
 """
 Tobacco AI Assistant - Render WhatsApp Bot
-Fixed: Complete responses with loop waiting and proper token management
+Fixed: Complete responses with proper waiting and 150-word limit
 """
 import os
 import json
@@ -60,12 +60,12 @@ GEMINI_MODELS = [
 # Spam prevention - cooldown dictionary
 LAST_SCAN = {}
 
-# ADJUSTED TOKEN LIMITS - Aim for 800 chars max
+# INCREASED TOKEN LIMITS for complete responses
 generation_config = {
     "temperature": 0.7,
     "top_p": 0.8,
     "top_k": 10,
-    "max_output_tokens": 400,  # ~800 chars
+    "max_output_tokens": 800,  # Increased to allow longer responses
 }
 
 safety_settings = [
@@ -90,26 +90,24 @@ safety_settings = [
 # Vision-specific config
 vision_config = {
     "temperature": 0.7,
-    "max_output_tokens": 300,  # ~600 chars
+    "max_output_tokens": 500,
     "top_p": 0.8
 }
 
 # Tip/Fact specific config
 tip_config = {
     "temperature": 0.8,
-    "max_output_tokens": 200,  # ~400 chars
+    "max_output_tokens": 300,
 }
 
 fact_config = {
     "temperature": 0.9,
-    "max_output_tokens": 200,  # ~400 chars
+    "max_output_tokens": 300,
 }
 
-# TARGET RESPONSE LENGTH - 800 chars max for ALL responses
-TARGET_LENGTH = 800
-
-def trim_message(text, max_length=TARGET_LENGTH):
-    """Trim message to safe WhatsApp length"""
+# Higher limit for trimming - only used as safety net
+def trim_message(text, max_length=3000):
+    """Trim message to safe WhatsApp length (only as safety net)"""
     if not text:
         return "No response available."
     if len(text) > max_length:
@@ -373,10 +371,10 @@ def get_offline_disease_advice(disease):
         return f"ℹ️ For specific advice on {disease}, please ask the AI advisor (type *ai your question*)"
 
 # ==============================
-# IMPROVED AI ADVISOR WITH MODEL FALLBACK LOOP
+# IMPROVED AI ADVISOR WITH 150-WORD LIMIT INSTRUCTION
 # ==============================
 def ask_ai_advisor(question):
-    """AI advisor with loop to ensure complete response"""
+    """AI advisor with 100-word limit instruction"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return "🤖 AI advisor not configured. Please add API key."
     
@@ -402,20 +400,18 @@ def ask_ai_advisor(question):
                 safety_settings=safety_settings
             )
             
-            # Create prompt with clear instruction for complete response
-            prompt = f"""You are a Zimbabwe tobacco expert. Answer the following question thoroughly and completely.
+            # Create prompt with 150-word limit instruction
+            prompt = f"""You are a Zimbabwe tobacco expert. Answer the following question.
+
+IMPORTANT: Keep your response under 150 words total. Be concise but complete.
 
 Question: {question}
 
-Important Guidelines:
-1. Provide a COMPLETE answer with ALL relevant details
-2. Include specific numbers, measurements, and steps
-3. Format with bullet points for readability
-4. Do not cut off mid-sentence - finish your thought
-5. If the answer is long, organize it in clear sections
-6. Use emojis where appropriate for WhatsApp
-
-Remember: Give a comprehensive response that fully answers the question."""
+Guidelines:
+1. Include key points only
+2. Use bullet points for clarity
+3. End with a complete sentence
+4. Stay under 150 words"""
 
             # Generate response with retry logic
             max_attempts = 3
@@ -428,16 +424,11 @@ Remember: Give a comprehensive response that fully answers the question."""
                         break
                 except Exception as e:
                     debug_log(f"⚠️ Attempt {attempt + 1} failed: {e}")
-                    time.sleep(2)  # Wait before retry
+                    time.sleep(2)
                     continue
             
             if response and response.text:
                 answer = response.text.strip()
-                
-                # Check if response seems complete (ends with sentence punctuation)
-                if answer and not answer[-1] in ['.', '!', '?', ')', '"', "'"]:
-                    debug_log(f"⚠️ Response may be incomplete, but sending anyway")
-                
                 debug_log(f"✅ Success with model: {model_name} (response length: {len(answer)} chars)")
                 return answer
             else:
@@ -456,48 +447,35 @@ Remember: Give a comprehensive response that fully answers the question."""
         return "⚠️ AI service temporarily unavailable. Please try again later or use the farming guides (type *menu*)."
 
 # ==============================
-# IMPROVED AI LEAF GRADING WITH RETRY LOOP
+# AI LEAF GRADING
 # ==============================
 def grade_leaf_with_ai(image_bytes):
-    """Grade leaf using google.generativeai library with retry loop"""
+    """Grade leaf using google.generativeai library"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return None, "AI grading not configured"
     
-    # Try each model in sequence with retry loop
     for model_name in GEMINI_MODELS:
         try:
             time.sleep(1)
-            
             debug_log(f"🔄 Trying Gemini Vision with model: {model_name}")
             
-            # Create the model with vision capabilities
             model = genai.GenerativeModel(
                 model_name=model_name,
                 generation_config=vision_config,
                 safety_settings=safety_settings
             )
             
-            # Prepare image for Gemini
             image_data = base64.b64encode(image_bytes).decode('utf-8')
             
-            # Create prompt
-            prompt = """Grade this tobacco leaf thoroughly. Provide a complete analysis:
+            prompt = """Grade this tobacco leaf. Keep response under 100 words:
 
-📊 *LEAF GRADING RESULTS*
-━━━━━━━━━━━━━━━━━━
-Grade: [A/B/C/D] - [Premium/Good/Fair/Poor]
-Color: [detailed color description with notes on uniformity]
-Texture: [description of leaf texture - oily, dry, brittle, etc.]
-Size: [estimated size and completeness]
-Damage: [any spots, tears, holes, or imperfections]
-Moisture: [estimated moisture content - too dry, optimal, too moist]
-Market Value: [estimated market category and price potential]
+📊 *LEAF GRADE*
+• Grade (A/B/C/D):
+• Color:
+• Texture:
+• Damage:
+• Market Value:"""
 
-Additional Notes: [any other observations and recommendations]
-
-Be thorough and specific in your assessment."""
-
-            # Generate response with image - try up to 3 times for this model
             for attempt in range(3):
                 try:
                     response = model.generate_content([
@@ -510,11 +488,10 @@ Be thorough and specific in your assessment."""
                         debug_log(f"✅ Success with model: {model_name}")
                         return "Grade", analysis
                     else:
-                        debug_log(f"⚠️ Empty response from {model_name}, attempt {attempt+1}")
                         time.sleep(2)
                         
                 except Exception as e:
-                    debug_log(f"⚠️ Attempt {attempt+1} failed for {model_name}: {str(e)[:100]}")
+                    debug_log(f"⚠️ Attempt {attempt+1} failed: {str(e)[:100]}")
                     time.sleep(2)
                     continue
                 
@@ -536,14 +513,12 @@ def get_gemini_tip():
             "🔍 Check fields weekly for early signs of disease"
         ])
     
-    # Try models for tip generation
     for model_name in GEMINI_MODELS:
         try:
             time.sleep(0.5)
             
             current_month = datetime.now().strftime("%B")
             
-            # Determine current season in Zimbabwe
             if current_month in ["November", "December", "January", "February", "March"]:
                 season = "rainy/planting season"
             elif current_month in ["April", "May", "June", "July"]:
@@ -551,42 +526,27 @@ def get_gemini_tip():
             else:
                 season = "land preparation season"
             
-            debug_log(f"🔄 Generating tip with {model_name}")
-            
-            # Create model
             model = genai.GenerativeModel(
                 model_name=model_name,
                 generation_config=tip_config,
                 safety_settings=safety_settings
             )
             
-            # Generate tip
-            prompt = f"""Generate ONE practical farming tip for Zimbabwe tobacco farmers during {season}.
-
-The tip should:
-- Be specific and actionable
-- Include relevant details (measurements, timing, etc.)
-- Be complete (not cut off mid-sentence)
-- Start with an emoji
-- Max 500 characters
-
-Tip:"""
+            prompt = f"ONE practical farming tip for Zimbabwe tobacco farmers during {season}. 2-3 sentences. Start with emoji."
             response = model.generate_content(prompt)
             
             if response and response.text:
-                tip = response.text.strip()
-                return tip
+                return response.text.strip()
             else:
                 continue
                 
         except Exception:
             continue
     
-    # Fallback
     return random.choice([
-        "🌱 Monitor your fields daily for early disease signs. Check both upper and lower leaves for spots, discoloration, or pests.",
-        "💧 Water early morning to reduce humidity and prevent fungal growth. Avoid evening watering which can promote disease.",
-        "🔍 Check lower leaves regularly for pests and diseases - problems often start there before spreading upward."
+        "🌱 Monitor your fields daily for early disease signs.",
+        "💧 Water early morning to prevent fungal growth.",
+        "🔍 Check lower leaves regularly for pests and diseases."
     ])
 
 # ==============================
@@ -601,47 +561,31 @@ def get_gemini_fact():
             "📜 Tobacco has been cultivated for over 8,000 years"
         ])
     
-    # Try models for fact generation
     for model_name in GEMINI_MODELS:
         try:
             time.sleep(0.5)
             
-            debug_log(f"🔄 Generating fact with {model_name}")
-            
-            # Create model
             model = genai.GenerativeModel(
                 model_name=model_name,
                 generation_config=fact_config,
                 safety_settings=safety_settings
             )
             
-            # Generate fact
-            prompt = """Generate ONE interesting, factual statement about Zimbabwe tobacco farming.
-
-The fact should:
-- Be accurate and specific
-- Include interesting details or statistics
-- Be complete (not cut off)
-- Start with an emoji
-- Max 500 characters
-
-Fact:"""
+            prompt = "ONE interesting fact about Zimbabwe tobacco farming. 2-3 sentences. Start with emoji."
             response = model.generate_content(prompt)
             
             if response and response.text:
-                fact = response.text.strip()
-                return fact
+                return response.text.strip()
             else:
                 continue
                 
         except Exception:
             continue
     
-    # Fallback
     return random.choice([
-        "🌱 Zimbabwe's tobacco industry employs over 500,000 people across farming, processing, and marketing sectors.",
-        "📜 Tobacco has been cultivated in Zimbabwe for over 8,000 years, originally used for ceremonial purposes.",
-        "🌍 Zimbabwe exports premium flue-cured tobacco to over 50 countries, with China being the largest market."
+        "🌱 Zimbabwe's tobacco industry employs over 500,000 people.",
+        "📜 Tobacco has been cultivated for over 8,000 years.",
+        "🌍 Zimbabwe exports tobacco to over 50 countries."
     ])
 
 # ==============================
@@ -664,7 +608,6 @@ def send_whatsapp(to, text):
         "text": {"body": text}
     }
     try:
-        # Added timeout=35 as requested
         response = requests.post(url, json=payload, headers=headers, timeout=35)
         debug_log(f"📤 WhatsApp sent to {to}: {response.status_code}")
         return True
@@ -718,7 +661,6 @@ def log_detection(phone, name, disease, confidence):
     except Exception as e:
         debug_log(f"❌ Log error: {e}")
     
-    # Added gc.collect() after heavy task
     gc.collect()
 
 def download_image(media_id):
@@ -761,7 +703,6 @@ def call_huggingface_detection(image_bytes):
     try:
         debug_log("🔄 Calling Hugging Face ML service...")
         files = {'file': ('image.jpg', image_bytes, 'image/jpeg')}
-        # Added timeout=35 as requested
         response = requests.post(
             f"{HF_SPACE_URL}/predict",
             files=files,
@@ -773,7 +714,6 @@ def call_huggingface_detection(image_bytes):
             debug_log(f"✅ HF Response received")
             
             if result.get("success"):
-                # Check if bounding box data is available for severity estimation
                 severity = "Unknown"
                 if result.get("bbox") and result.get("leaf_area"):
                     severity = estimate_severity(result.get("bbox"), result.get("leaf_area"))
@@ -784,7 +724,7 @@ def call_huggingface_detection(image_bytes):
                     "treatment": result.get("treatment"),
                     "is_healthy": result.get("is_healthy", False),
                     "low_confidence": result.get("low_confidence", False),
-                    "severity": severity  # Add severity to result
+                    "severity": severity
                 }
             else:
                 debug_log(f"❌ HF returned error")
@@ -799,7 +739,6 @@ def call_huggingface_detection(image_bytes):
         debug_log(f"❌ HF call error: {e}")
         return None
     finally:
-        # Added gc.collect() after heavy task
         gc.collect()
 
 def get_user_history(phone, limit=5):
@@ -892,52 +831,7 @@ def send_expert_menu(phone):
     return send_whatsapp(phone, expert_menu)
 
 # ==============================
-# SPLIT-MESSAGE LOGIC FOR LONG RESPONSES
-# ==============================
-def split_long_message(text, max_length=800):
-    """Split long message into multiple parts"""
-    if len(text) <= max_length:
-        return [text]
-    
-    parts = []
-    current_part = ""
-    
-    # Split by paragraphs first
-    paragraphs = text.split('\n\n')
-    
-    for para in paragraphs:
-        if len(current_part) + len(para) + 2 <= max_length:
-            if current_part:
-                current_part += '\n\n' + para
-            else:
-                current_part = para
-        else:
-            if current_part:
-                parts.append(current_part)
-            # If paragraph itself is too long, split by sentences
-            if len(para) > max_length:
-                sentences = para.split('. ')
-                current_part = ""
-                for sent in sentences:
-                    if len(current_part) + len(sent) + 2 <= max_length:
-                        if current_part:
-                            current_part += '. ' + sent
-                        else:
-                            current_part = sent
-                    else:
-                        if current_part:
-                            parts.append(current_part + '.')
-                        current_part = sent
-            else:
-                current_part = para
-    
-    if current_part:
-        parts.append(current_part)
-    
-    return parts
-
-# ==============================
-# UPDATED MESSAGE HANDLER WITH BETTER RESPONSE HANDLING
+# FIXED MESSAGE HANDLER - WITH DELAY BEFORE MENU
 # ==============================
 def handle_message(phone, msg_type, content):
     """Main message handler with improved response handling"""
@@ -1009,7 +903,7 @@ def handle_message(phone, msg_type, content):
                 for i, h in enumerate(history[:5], 1):
                     msg += f"{i}. *{h.get('disease', 'Unknown')}* - {h.get('confidence', 0):.1f}%\n"
                     msg += f"   📅 {h.get('date', 'Unknown')}\n\n"
-                send_whatsapp(phone, trim_message(msg, 800))
+                send_whatsapp(phone, trim_message(msg, 1500))
                 stats = get_user_statistics(phone)
                 return send_dashboard_menu(phone, name, stats)
         elif cmd == "2":
@@ -1025,7 +919,7 @@ def handle_message(phone, msg_type, content):
         else:
             return send_whatsapp(phone, "❌ Please choose 1, 2, or 3 (or *0* for Main Menu).")
 
-    # AWAITING AI QUESTION - WITH SPLIT-MESSAGE LOGIC
+    # AWAITING AI QUESTION - FIXED WITH DELAY BEFORE MENU
     if state == USER_STATES["AWAITING_AI_QUESTION"] and msg_type == "text":
         if content.lower() == "cancel":
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
@@ -1037,16 +931,11 @@ def handle_message(phone, msg_type, content):
         # Get response
         result = ask_ai_advisor(content)
         
-        # Split long response into multiple messages if needed
-        parts = split_long_message(result, 800)
+        # Send the AI response (no trimming)
+        send_whatsapp_with_retry(phone, result)
         
-        for i, part in enumerate(parts):
-            if i == 0:
-                send_whatsapp_with_retry(phone, part)
-            else:
-                # Add small delay between messages
-                time.sleep(1)
-                send_whatsapp_with_retry(phone, f"(Continued...)\n\n{part}")
+        # Wait 2 seconds to ensure user sees the full response
+        time.sleep(2)
         
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         return send_main_menu(phone)
@@ -1094,23 +983,17 @@ def handle_message(phone, msg_type, content):
         
         grade, analysis = grade_leaf_with_ai(image_bytes)
         if analysis:
-            # Split long response if needed
-            parts = split_long_message(analysis, 800)
-            for i, part in enumerate(parts):
-                if i == 0:
-                    send_whatsapp_with_retry(phone, part)
-                else:
-                    time.sleep(1)
-                    send_whatsapp_with_retry(phone, f"(Continued...)\n\n{part}")
+            send_whatsapp_with_retry(phone, analysis)
         else:
             send_whatsapp(phone, "❌ Could not analyze the image. Please try again.")
         
+        time.sleep(1)
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         send_main_menu(phone)
         gc.collect()
         return
 
-    # DISEASE DETECTION - WITH SPAM PREVENTION AND SEVERITY
+    # DISEASE DETECTION - WITH SPAM PREVENTION
     if state == USER_STATES["WAITING_IMAGE"] and msg_type == "image":
         # Spam prevention - cooldown check
         current_time = time.time()
@@ -1157,18 +1040,18 @@ def handle_message(phone, msg_type, content):
         else:
             response = f"📊 *{disease} DETECTED*\n\nConfidence: {confidence:.1f}%\n{confidence_msg}"
             
-            # Add severity if available
             if severity != "Unknown":
                 response += f"\nSeverity: *{severity}*"
             
             response += f"\n\n*Treatment:*\n{result['treatment']}"
         
-        send_whatsapp(phone, trim_message(response, 800))
+        send_whatsapp(phone, response)
         
         if not result["is_healthy"] and not result["low_confidence"]:
             offline_advice = get_offline_disease_advice(disease)
-            send_whatsapp(phone, trim_message(offline_advice, 800) + "\n\nType *ai your question* for more advice")
+            send_whatsapp(phone, offline_advice + "\n\nType *ai your question* for more advice")
         
+        time.sleep(1)
         send_main_menu(phone)
         gc.collect()
         return
@@ -1234,16 +1117,10 @@ def handle_message(phone, msg_type, content):
             if question:
                 send_whatsapp(phone, f"🤔 AI Advisor is thinking...")
                 result = ask_ai_advisor(question)
+                send_whatsapp_with_retry(phone, result)
                 
-                # Split long response if needed
-                parts = split_long_message(result, 800)
-                for i, part in enumerate(parts):
-                    if i == 0:
-                        send_whatsapp_with_retry(phone, part)
-                    else:
-                        time.sleep(1)
-                        send_whatsapp_with_retry(phone, f"(Continued...)\n\n{part}")
-                
+                # Wait 2 seconds before showing menu
+                time.sleep(2)
                 return send_main_menu(phone)
             else:
                 send_whatsapp(phone, "❓ Example: *ai how to prevent black shank*")
@@ -1340,7 +1217,7 @@ if __name__ == "__main__":
     debug_log(f"🤖 Using Hugging Face Space: {HF_SPACE_URL}")
     debug_log(f"🧠 Available Gemini models: {', '.join(GEMINI_MODELS)}")
     if AI_API_KEY and AI_API_KEY != "your_api_key_here":
-        debug_log(f"✅ AI Advisor enabled with model fallback and multi-part response handling")
+        debug_log(f"✅ AI Advisor enabled with 150-word limit and 2-second delay")
     else:
         debug_log(f"ℹ️ AI Advisor disabled - set AI_API_KEY environment variable")
     app.run(host="0.0.0.0", port=port, debug=False)
