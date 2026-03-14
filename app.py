@@ -23,6 +23,10 @@ import google.generativeai as genai  # IMPORT THIS
 # ==============================
 app = Flask(__name__)
 
+def debug_log(message):
+    """Print debug with timestamp - DEFINED FIRST!"""
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+
 # Load environment variables
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
@@ -74,10 +78,6 @@ GEMINI_MODELS = [
     'gemini-pro',
     'gemini-1.0-pro'
 ]
-
-def debug_log(message):
-    """Print debug with timestamp"""
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
 
 # Helper to trim long messages for WhatsApp
 def trim_message(text, max_length=900):
