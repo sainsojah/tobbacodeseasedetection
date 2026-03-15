@@ -1,6 +1,6 @@
 """
 Tobacco AI Assistant - Render WhatsApp Bot
-
+Optimized: Multi-model inference, smart AI routing, caching, dynamic delays
 """
 import os
 import json
@@ -32,7 +32,7 @@ WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
 FIREBASE_CONFIG = os.environ.get("FIREBASE_CONFIG")
-ADMIN_PHONE = os.environ.get("ADMIN_PHONE_NUMBER")  # This will work with country code
+ADMIN_PHONE = os.environ.get("ADMIN_PHONE_NUMBER")
 HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "https://saintsouldier-tobacco-ai.hf.space")
 
 # AI API Keys
@@ -43,11 +43,11 @@ if AI_API_KEY and AI_API_KEY != "your_api_key_here":
     genai.configure(api_key=AI_API_KEY)
     debug_log("✅ Google Generative AI configured")
 
-# CORRECT MODEL NAMES - Prioritize stable models first
+# CORRECT MODEL NAMES
 GEMINI_MODELS = [
-    'models/gemini-2.5-flash',       # Newer model
-    'models/gemini-2.5-pro',         # Newer pro model
-    'models/gemini-3.1-pro-preview', # Preview model
+    'models/gemini-2.5-flash',
+    'models/gemini-2.5-pro',
+    'models/gemini-3.1-pro-preview',
     'models/gemini-3.1-flash-lite-preview',
     'models/gemini-2.0-flash',
     'models/gemini-2.0-flash-lite',
@@ -58,12 +58,76 @@ GEMINI_MODELS = [
 # Spam prevention - cooldown dictionary
 LAST_SCAN = {}
 
-# INCREASED TOKEN LIMITS for complete responses
+# ==============================
+# DISEASE ADVICE CACHE (Pre-generated to save API calls)
+# ==============================
+DISEASE_ADVICE_CACHE = {
+    "Black Shank": "💧 *Black Shank*\n• Improve soil drainage\n• Remove infected plants\n• Apply Ridomil fungicide\n• Rotate with maize next season",
+    "Black Spot": "🔴 *Black Spot*\n• Apply copper fungicide\n• Remove infected leaves\n• Improve air circulation\n• Avoid overhead watering",
+    "Early Blight": "🍂 *Early Blight*\n• Apply Mancozeb fungicide\n• Remove lower leaves\n• Space plants properly\n• Rotate crops",
+    "Late Blight": "🌧️ *Late Blight*\n• Remove plants immediately\n• Apply Ridomil Gold\n• Use disease-free transplants\n• Avoid excessive moisture",
+    "Leaf Mold": "🍃 *Leaf Mold*\n• Apply sulfur fungicide\n• Improve ventilation\n• Reduce humidity\n• Space plants wider",
+    "Leaf Spot": "📌 *Leaf Spot*\n• Apply copper fungicide\n• Remove affected leaves\n• Avoid wetting leaves\n• Improve air flow",
+    "Powdery Mildew": "⚪ *Powdery Mildew*\n• Apply sulfur spray\n• Reduce nitrogen\n• Improve air circulation\n• Water at base only",
+    "Tobacco Mosaic Virus": "⚠️ *TMV - NO CURE*\n• Remove infected plants NOW\n• Wash hands with milk/soap\n• Disinfect tools\n• Use resistant varieties next season",
+    "Spider Mites": "🕷️ *Spider Mites*\n• Apply miticide\n• Maintain humidity\n• Avoid water stress\n• Check undersides of leaves",
+    "Healthy": "🌿 *Healthy Leaf*\n• Continue good practices\n• Monitor regularly\n• Maintain balanced fertilizer\n• Keep up with watering schedule"
+}
+
+# Severity-specific advice
+SEVERITY_ADVICE = {
+    "Mild": "🟢 *Mild* - Early stage. Monitor closely and begin treatment.",
+    "Moderate": "🟡 *Moderate* - Take action now to prevent spread.",
+    "Severe": "🔴 *Severe* - Act immediately! Remove affected plants."
+}
+
+# ==============================
+# DYNAMIC DELAY SYSTEM
+# ==============================
+TASK_DELAYS = {
+    "text": 1,        # Simple text response
+    "menu": 0.5,      # Menu navigation
+    "ai": 3,          # AI text response
+    "vision": 5,      # AI vision analysis
+    "detection": 6,   # Full detection + optional AI
+    "feedback": 1,    # Feedback confirmation
+    "expert": 1       # Expert request
+}
+
+def dynamic_delay(task_type="text"):
+    """Apply appropriate delay based on task type"""
+    delay = TASK_DELAYS.get(task_type, 2)
+    debug_log(f"⏱️ {task_type} delay: {delay}s")
+    time.sleep(delay)
+
+# ==============================
+# MEMORY MANAGEMENT
+# ==============================
+def cleanup_memory(*args):
+    """Delete objects and force garbage collection"""
+    for obj in args:
+        if obj:
+            try:
+                del obj
+            except:
+                pass
+    gc.collect()
+    debug_log("🧹 Memory cleaned")
+
+# ==============================
+# CONFIGURATION
+# ==============================
 generation_config = {
     "temperature": 0.7,
     "top_p": 0.8,
     "top_k": 10,
-    "max_output_tokens": 1000,  # Increased from 800 for longer responses
+    "max_output_tokens": 600,  # Reduced for efficiency
+}
+
+vision_config = {
+    "temperature": 0.7,
+    "max_output_tokens": 400,  # Reduced for efficiency
+    "top_p": 0.8
 }
 
 safety_settings = [
@@ -85,27 +149,8 @@ safety_settings = [
     },
 ]
 
-# Vision-specific config - INCREASED for complete grading
-vision_config = {
-    "temperature": 0.7,
-    "max_output_tokens": 800,  # Increased from 500 for complete grading
-    "top_p": 0.8
-}
-
-# Tip/Fact specific config - INCREASED for complete sentences
-tip_config = {
-    "temperature": 0.8,
-    "max_output_tokens": 600,  # Increased from 300
-}
-
-fact_config = {
-    "temperature": 0.9,
-    "max_output_tokens": 600,  # Increased from 300
-}
-
-# Higher limit for trimming - only used as safety net
 def trim_message(text, max_length=3000):
-    """Trim message to safe WhatsApp length (only as safety net)"""
+    """Trim message to safe WhatsApp length"""
     if not text:
         return "No response available."
     if len(text) > max_length:
@@ -162,53 +207,62 @@ USER_STATES = {
 }
 
 # ==============================
-# DISEASE KNOWLEDGE BASE (Offline Fallback)
+# DISEASE KNOWLEDGE BASE (Full details)
 # ==============================
 DISEASE_KNOWLEDGE_BASE = {
     "Black Shank": {
         "cause": "Phytophthora fungus in waterlogged soil",
         "treatment": "Remove infected plants, apply Ridomil fungicide",
-        "prevention": "Crop rotation with maize, use resistant varieties, improve drainage"
+        "prevention": "Crop rotation with maize, use resistant varieties, improve drainage",
+        "symptoms": "Black lesions on stem, wilting, stunted growth"
     },
     "Black Spot": {
         "cause": "Fungal infection (Cercospora nicotianae)",
         "treatment": "Apply copper-based fungicides, remove infected leaves",
-        "prevention": "Improve air circulation, avoid overhead irrigation"
+        "prevention": "Improve air circulation, avoid overhead irrigation",
+        "symptoms": "Dark circular spots on leaves with yellow halos"
     },
     "Early Blight": {
         "cause": "Alternaria fungus",
         "treatment": "Apply Mancozeb or chlorothalonil, remove lower leaves",
-        "prevention": "Crop rotation, proper spacing, avoid working in wet fields"
+        "prevention": "Crop rotation, proper spacing, avoid working in wet fields",
+        "symptoms": "Target-like rings on lower leaves, yellowing"
     },
     "Late Blight": {
         "cause": "Phytophthora infestans (water mold)",
         "treatment": "Remove infected plants immediately, apply Ridomil Gold",
-        "prevention": "Avoid excessive moisture, use disease-free transplants"
+        "prevention": "Avoid excessive moisture, use disease-free transplants",
+        "symptoms": "Water-soaked lesions, white fungal growth under leaves"
     },
     "Leaf Mold": {
         "cause": "Passalora fulva fungus in high humidity",
         "treatment": "Apply sulfur-based fungicides, improve ventilation",
-        "prevention": "Reduce humidity, proper plant spacing"
+        "prevention": "Reduce humidity, proper plant spacing",
+        "symptoms": "Yellow spots on upper leaf, mold on underside"
     },
     "Leaf Spot": {
         "cause": "Various fungal pathogens",
         "treatment": "Apply copper fungicides, remove affected leaves",
-        "prevention": "Avoid overhead watering, improve air circulation"
+        "prevention": "Avoid overhead watering, improve air circulation",
+        "symptoms": "Small circular spots, leaf yellowing"
     },
     "Powdery Mildew": {
         "cause": "Erysiphe fungus",
         "treatment": "Apply sulfur or potassium bicarbonate",
-        "prevention": "Avoid high nitrogen, maintain good air flow"
+        "prevention": "Avoid high nitrogen, maintain good air flow",
+        "symptoms": "White powdery coating on leaves"
     },
     "Tobacco Mosaic Virus": {
         "cause": "TMV virus (highly contagious)",
         "treatment": "NO CURE - remove infected plants immediately",
-        "prevention": "Wash hands with milk/soap, use resistant varieties, disinfect tools"
+        "prevention": "Wash hands with milk/soap, use resistant varieties, disinfect tools",
+        "symptoms": "Mottled yellow-green pattern, leaf distortion"
     },
     "Spider Mites": {
         "cause": "Tiny arachnids (Tetranychus species)",
         "treatment": "Apply miticides or insecticidal soap",
-        "prevention": "Maintain humidity, avoid water stress"
+        "prevention": "Maintain humidity, avoid water stress",
+        "symptoms": "Stippling on leaves, fine webbing"
     }
 }
 
@@ -325,11 +379,11 @@ def get_user_statistics(phone):
 def get_confidence_message(confidence):
     """Return human-readable confidence level with emoji"""
     if confidence > 85:
-        return "✔ *High Accuracy*"
+        return "✔️ High Accuracy"
     elif confidence > 60:
-        return "⚠ *Medium Accuracy*"
+        return "⚠️ Medium Accuracy"
     else:
-        return "❗ *Low Accuracy - please retake photo*"
+        return "❓ Low Accuracy - AI will verify"
 
 # ==============================
 # SEVERITY ESTIMATION FUNCTION
@@ -349,109 +403,25 @@ def estimate_severity(disease_area, leaf_area):
         return "Severe"
 
 # ==============================
-# OFFLINE DISEASE ADVICE
+# SMART AI VISION ANALYSIS (Called only when needed)
 # ==============================
-def get_offline_disease_advice(disease):
-    """Get disease advice from local knowledge base"""
-    if disease in DISEASE_KNOWLEDGE_BASE:
-        info = DISEASE_KNOWLEDGE_BASE[disease]
-        return f"""📚 *{disease} - Quick Reference*
-
-🔍 *Cause:*
-{info['cause']}
-
-💊 *Treatment:*
-{info['treatment']}
-
-🛡️ *Prevention:*
-{info['prevention']}"""
-    else:
-        return f"ℹ️ For specific advice on {disease}, please ask the AI advisor (type *ai your question*)"
-
-# ==============================
-# IMPROVED AI ADVISOR WITH CURRENT DATE
-# ==============================
-def ask_ai_advisor(question):
-    """AI advisor with current date reference"""
+def ai_leaf_analysis(image_bytes, hf_disease=None, confidence=0):
+    """
+    AI vision analysis of leaf
+    Only called when needed based on confidence
+    """
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
-        return "🤖 AI advisor not configured. Please add API key."
+        return None
     
-    # Check if question contains a known disease name
-    disease_found = None
-    for disease in DISEASE_KNOWLEDGE_BASE.keys():
-        if disease.lower() in question.lower():
-            disease_found = disease
-            break
+    # Skip AI for high confidence with known disease
+    if confidence > 85 and hf_disease and hf_disease in DISEASE_ADVICE_CACHE:
+        debug_log(f"🤖 Skipping AI: High confidence ({confidence}%) for {hf_disease}")
+        return None
     
-    # Get current date for context
-    current_date = datetime.now().strftime("%B %d, %Y")
-    current_year = datetime.now().year
-    current_month = datetime.now().strftime("%B")
+    debug_log(f"🔬 AI Vision analyzing (confidence: {confidence}%)...")
     
-    # Try each model in sequence until one works
     for model_name in GEMINI_MODELS:
         try:
-            time.sleep(1)
-            debug_log(f"🔄 Trying Gemini model: {model_name}")
-            
-            model = genai.GenerativeModel(
-                model_name=model_name,
-                generation_config=generation_config,
-                safety_settings=safety_settings
-            )
-            
-            # Prompt with current date instruction
-            prompt = f"""You are a Zimbabwe tobacco expert. Today's date is {current_date} ({current_month} {current_year}).
-
-Answer the following question using CURRENT information (2025-{current_year}) only. DO NOT reference 2024 or older data unless specifically asked about historical trends.
-
-Question: {question}
-
-IMPORTANT GUIDELINES:
-1. Use ONLY current season data (2025-{current_year})
-2. Keep response under 200 words total
-3. Include key points only
-4. Use bullet points for clarity
-5. End with a complete sentence - DO NOT cut off mid-sentence
-
-If asked about prices, volumes, or market conditions - provide estimates based on CURRENT {current_year} season projections."""
-
-            # Generate response
-            response = model.generate_content(prompt)
-            
-            if response and response.text:
-                answer = response.text.strip()
-                debug_log(f"✅ Success with model: {model_name} (response length: {len(answer)} chars)")
-                return answer
-            else:
-                debug_log(f"⚠️ Empty response from {model_name}")
-                continue
-                
-        except Exception as e:
-            debug_log(f"❌ Error with {model_name}: {str(e)[:100]}")
-            continue
-    
-    # If all models fail, use fallback
-    debug_log(f"⚠️ All Gemini models failed, using fallback")
-    if disease_found:
-        return get_offline_disease_advice(disease_found)
-    else:
-        return f"⚠️ AI service temporarily unavailable. Please try again later or use the farming guides (type *menu*)."
-
-# ==============================
-# IMPROVED AI LEAF GRADING WITH BETTER RETRY LOGIC
-# ==============================
-def grade_leaf_with_ai(image_bytes):
-    """Grade leaf using google.generativeai library with improved retry logic"""
-    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
-        return None, "AI grading not configured"
-    
-    # Try each model in sequence
-    for model_name in GEMINI_MODELS:
-        try:
-            time.sleep(1)
-            debug_log(f"🔄 Trying Gemini Vision with model: {model_name}")
-            
             model = genai.GenerativeModel(
                 model_name=model_name,
                 generation_config=vision_config,
@@ -460,167 +430,169 @@ def grade_leaf_with_ai(image_bytes):
             
             image_data = base64.b64encode(image_bytes).decode('utf-8')
             
-            # More detailed prompt for complete grading
-            prompt = """Grade this tobacco leaf thoroughly. Provide a COMPLETE analysis with ALL fields filled:
+            # Smart prompt based on context
+            if hf_disease and confidence > 60:
+                # Verification mode
+                prompt = f"""Analyze this tobacco leaf. The model detected {hf_disease} with {confidence:.0f}% confidence.
 
-📊 *LEAF GRADE RESULTS*
-━━━━━━━━━━━━━━━━━━
-• Grade (A/B/C/D): [Choose one - A=Premium, B=Good, C=Fair, D=Poor]
-• Color: [Detailed color description with notes on uniformity]
-• Texture: [Description - oily, dry, brittle, supple, etc.]
-• Damage: [Any spots, tears, holes, or imperfections]
-• Market Value: [Premium/Good/Fair/Poor with brief explanation]
+                Respond in this exact format:
+                ✅ AI Review: [Agree/Disagree with detection]
+                🔍 Symptoms: [2-3 visible symptoms]
+                📊 Severity: [Mild/Moderate/Severe]
+                💡 Quick Tip: [One sentence advice]
 
-IMPORTANT: Fill in ALL fields completely. Do not leave anything blank. End with a complete sentence."""
+                Keep it concise for WhatsApp."""
+            else:
+                # Full analysis mode (low confidence)
+                prompt = """Analyze this tobacco leaf thoroughly.
 
-            # Try up to 3 attempts for this model with increasing timeouts
-            for attempt in range(3):
-                try:
-                    response = model.generate_content([
-                        prompt,
-                        {"mime_type": "image/jpeg", "data": image_data}
-                    ])
-                    
-                    if response and response.text:
-                        analysis = response.text.strip()
-                        
-                        # Check if response seems complete (has all sections)
-                        if len(analysis) > 100 and all(section in analysis for section in ['Grade', 'Color', 'Texture', 'Damage', 'Market']):
-                            debug_log(f"✅ Complete grading with model: {model_name}")
-                            return "Grade", analysis
-                        elif len(analysis) > 50:
-                            debug_log(f"⚠️ Partial grading from {model_name}, but sending anyway")
-                            return "Grade", analysis
-                        else:
-                            debug_log(f"⚠️ Response too short from {model_name}, attempt {attempt+1}")
-                            time.sleep(2)
-                    else:
-                        debug_log(f"⚠️ Empty response from {model_name}, attempt {attempt+1}")
-                        time.sleep(2)
-                        
-                except Exception as e:
-                    debug_log(f"⚠️ Attempt {attempt+1} failed for {model_name}: {str(e)[:100]}")
-                    time.sleep(2)
-                    continue
+                Respond in this exact format:
+                🌿 *Possible Disease:* [Your diagnosis]
+                🔍 *Symptoms Seen:* [2-3 symptoms]
+                📊 *Severity:* [Mild/Moderate/Severe]
+                💡 *Advice:* [One sentence]
+
+                Keep it concise for WhatsApp."""
+            
+            response = model.generate_content([
+                prompt,
+                {"mime_type": "image/jpeg", "data": image_data}
+            ])
+            
+            if response and response.text:
+                analysis = response.text.strip()
+                debug_log(f"✅ AI Vision complete ({len(analysis)} chars)")
+                return analysis
                 
         except Exception as e:
-            debug_log(f"❌ Error with {model_name}: {str(e)[:100]}")
+            debug_log(f"❌ AI Vision error: {str(e)[:50]}")
             continue
     
-    return None, "⚠️ Grading service temporarily unavailable. Please try again later."
+    return None
 
 # ==============================
-# IMPROVED DAILY TIP
+# SMART AI ADVISOR WITH CACHING
 # ==============================
-def get_gemini_tip():
-    """Generate a fresh daily farming tip - COMPLETE sentences"""
+def ask_ai_advisor(question):
+    """AI advisor with smart routing"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
-        return random.choice([
-            "🚜 Rotate tobacco with maize or beans to prevent soil-borne diseases. This breaks pest cycles and improves soil fertility for the next season.",
-            "💧 Water in the morning to reduce humidity and prevent fungal growth. Evening watering can leave leaves wet overnight, promoting disease.",
-            "🔍 Check fields weekly for early signs of disease. Early detection allows for quick treatment before problems spread."
-        ])
+        return "🤖 AI advisor not configured."
     
+    # Check if question is about a specific disease (use cache)
+    for disease in DISEASE_ADVICE_CACHE.keys():
+        if disease.lower() in question.lower():
+            return f"📚 *{disease}*\n\n{DISEASE_ADVICE_CACHE[disease]}\n\nType *ai more* for detailed info."
+    
+    # For general questions, use AI
     for model_name in GEMINI_MODELS:
         try:
-            time.sleep(0.5)
-            
-            current_month = datetime.now().strftime("%B")
-            current_year = datetime.now().year
-            
-            if current_month in ["November", "December", "January", "February", "March"]:
-                season = f"rainy/planting season {current_year}"
-            elif current_month in ["April", "May", "June", "July"]:
-                season = f"harvesting/curing season {current_year}"
-            else:
-                season = f"land preparation season {current_year}"
-            
             model = genai.GenerativeModel(
                 model_name=model_name,
-                generation_config=tip_config,
+                generation_config=generation_config,
                 safety_settings=safety_settings
             )
             
-            prompt = f"""ONE practical farming tip for Zimbabwe tobacco farmers during {season}. 
+            prompt = f"""You are a Zimbabwe tobacco expert. Answer concisely.
 
-Requirements:
-- 3-4 complete sentences
-- Start with an emoji
-- Include specific details
-- End with a complete sentence (no cut-offs)
-- Use {current_year} context only
+Question: {question}
 
-Tip:"""
+Keep it under 100 words. Use bullet points. End with a complete sentence."""
+            
+            response = model.generate_content(prompt)
+            
+            if response and response.text:
+                return response.text.strip()
+                
+        except Exception as e:
+            debug_log(f"❌ AI error: {str(e)[:50]}")
+            continue
+    
+    return "⚠️ Service busy. Try *menu* for guides."
+
+# ==============================
+# DAILY TIP (Cached by season)
+# ==============================
+tip_cache = {}
+def get_gemini_tip():
+    """Generate or return cached daily tip"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    if today in tip_cache:
+        return tip_cache[today]
+    
+    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
+        tip = random.choice([
+            "🌱 Rotate crops with maize to prevent soil diseases. This breaks pest cycles naturally.",
+            "💧 Water early morning to prevent fungal growth. Leaves dry before evening.",
+            "🔍 Check fields weekly for early disease signs. Early detection saves crops."
+        ])
+        tip_cache[today] = tip
+        return tip
+    
+    for model_name in GEMINI_MODELS:
+        try:
+            current_month = datetime.now().strftime("%B")
+            season = "rainy" if current_month in ["Nov","Dec","Jan","Feb","Mar"] else "dry"
+            
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config={"temperature": 0.8, "max_output_tokens": 200}
+            )
+            
+            prompt = f"ONE short tobacco tip for {season} season in Zimbabwe. 2 sentences. Start with emoji."
             response = model.generate_content(prompt)
             
             if response and response.text:
                 tip = response.text.strip()
-                # Ensure it ends with punctuation
-                if tip and tip[-1] not in ['.', '!', '?']:
-                    tip += '.'
+                tip_cache[today] = tip
                 return tip
-            else:
-                continue
                 
         except Exception:
             continue
     
-    return random.choice([
-        f"🌱 Monitor your fields daily for early disease signs this {datetime.now().year} season. Check both upper and lower leaves for spots or discoloration.",
-        f"💧 Water early morning to prevent fungal growth during {datetime.now().year} planting. This allows leaves to dry before evening.",
-        f"🔍 Check lower leaves regularly for pests and diseases in {datetime.now().year}. Problems often start there before spreading upward."
-    ])
+    tip = "🌱 Monitor fields daily for early disease signs this season."
+    tip_cache[today] = tip
+    return tip
 
 # ==============================
-# IMPROVED FUN FACT
+# FUN FACT (Cached)
 # ==============================
+fact_cache = {}
 def get_gemini_fact():
-    """Generate a fresh interesting fact - COMPLETE sentences"""
+    """Generate or return cached fact"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    if today in fact_cache:
+        return fact_cache[today]
+    
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
-        return random.choice([
-            "🌱 Tobacco is related to tomatoes and potatoes! All three belong to the Solanaceae family, which is why they share similar pests and diseases.",
-            "🍃 Zimbabwe produces world-class flue-cured tobacco known for its golden color and sweet flavor, making it highly sought after in international markets.",
-            "📜 Tobacco has been cultivated for over 8,000 years, originally used for ceremonial and medicinal purposes by indigenous peoples."
+        fact = random.choice([
+            "🌍 Zimbabwe exports tobacco to 50+ countries worldwide.",
+            "👨‍🌾 Tobacco supports 500,000+ families in Zimbabwe.",
+            "💰 Tobacco is Zimbabwe's 2nd largest forex earner."
         ])
+        fact_cache[today] = fact
+        return fact
     
     for model_name in GEMINI_MODELS:
         try:
-            time.sleep(0.5)
-            
             model = genai.GenerativeModel(
                 model_name=model_name,
-                generation_config=fact_config,
-                safety_settings=safety_settings
+                generation_config={"temperature": 0.9, "max_output_tokens": 200}
             )
             
-            prompt = f"""ONE interesting fact about Zimbabwe tobacco farming for {datetime.now().year}.
-
-Requirements:
-- 3-4 complete sentences
-- Start with an emoji
-- Include specific details or statistics
-- End with a complete sentence (no cut-offs)
-
-Fact:"""
+            prompt = "ONE short fact about Zimbabwe tobacco. 2 sentences. Start with emoji."
             response = model.generate_content(prompt)
             
             if response and response.text:
                 fact = response.text.strip()
-                # Ensure it ends with punctuation
-                if fact and fact[-1] not in ['.', '!', '?']:
-                    fact += '.'
+                fact_cache[today] = fact
                 return fact
-            else:
-                continue
                 
         except Exception:
             continue
     
-    return random.choice([
-        f"🌱 Zimbabwe's tobacco industry employs over 500,000 people in {datetime.now().year}. This includes farmers, laborers, and workers in processing and marketing sectors.",
-        "📜 Tobacco has been cultivated in Zimbabwe for over 8,000 years, originally used for ceremonial purposes by ancient communities.",
-        "🌍 Zimbabwe exports premium flue-cured tobacco to over 50 countries, with China, Belgium, and South Africa being the largest markets."
-    ])
+    fact = "🌱 Zimbabwe tobacco is world-famous for golden leaf quality."
+    fact_cache[today] = fact
+    return fact
 
 # ==============================
 # HELPER FUNCTIONS
@@ -643,13 +615,13 @@ def send_whatsapp(to, text):
     }
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=35)
-        debug_log(f"📤 WhatsApp sent to {to}: {response.status_code}")
+        debug_log(f"📤 Sent ({len(text)} chars): {response.status_code}")
         return True
     except Exception as e:
-        debug_log(f"❌ WhatsApp send error: {e}")
+        debug_log(f"❌ Send error: {e}")
         return False
 
-def send_whatsapp_with_retry(to, text, max_retries=3):
+def send_whatsapp_with_retry(to, text, max_retries=2):
     """Send WhatsApp with retry logic"""
     for attempt in range(max_retries):
         if send_whatsapp(to, text):
@@ -679,40 +651,40 @@ def save_user(phone, data):
         debug_log(f"❌ Firebase save error: {e}")
         return False
 
-def log_detection(phone, name, disease, confidence):
-    """Log detection to Firebase"""
+def log_detection(phone, name, disease, confidence, ai_review=None):
+    """Log detection to Firebase with AI review"""
     if not db:
         return
     try:
-        db.collection("detections").add({
+        data = {
             "phone": phone,
             "name": name,
             "disease": disease,
             "confidence": confidence,
             "timestamp": firestore.SERVER_TIMESTAMP
-        })
-        debug_log(f"📊 Detection logged: {disease} ({confidence:.1f}%)")
+        }
+        if ai_review:
+            data["ai_review"] = ai_review[:200]  # Store preview
+        
+        db.collection("detections").add(data)
+        debug_log(f"📊 Logged: {disease} ({confidence:.1f}%)")
     except Exception as e:
         debug_log(f"❌ Log error: {e}")
-    
-    gc.collect()
 
 def download_image(media_id):
     """Download image from WhatsApp"""
     try:
-        debug_log(f"📥 Downloading media ID: {media_id}")
+        debug_log(f"📥 Downloading: {media_id}")
         url_resp = requests.get(
             f"https://graph.facebook.com/v18.0/{media_id}",
             headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
             timeout=10
         )
         if url_resp.status_code != 200:
-            debug_log(f"❌ Failed to get media URL: {url_resp.status_code}")
             return None
         
         media_data = url_resp.json()
         media_url = media_data.get("url")
-        
         if not media_url:
             return None
         
@@ -721,21 +693,18 @@ def download_image(media_id):
             headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
             timeout=30
         )
-        
-        if img_resp.status_code == 200:
-            debug_log(f"✅ Image downloaded: {len(img_resp.content)} bytes")
-            return img_resp.content
-        else:
-            debug_log(f"❌ Failed to download image: {img_resp.status_code}")
-            return None
+        return img_resp.content if img_resp.status_code == 200 else None
     except Exception as e:
         debug_log(f"❌ Download error: {e}")
         return None
 
+# ==============================
+# IMPROVED DETECTION WITH MULTI-MODEL INFERENCE
+# ==============================
 def call_huggingface_detection(image_bytes):
     """Call Hugging Face Space for ML detection"""
     try:
-        debug_log("🔄 Calling Hugging Face ML service...")
+        debug_log("🔄 HF detection...")
         files = {'file': ('image.jpg', image_bytes, 'image/jpeg')}
         response = requests.post(
             f"{HF_SPACE_URL}/predict",
@@ -745,141 +714,174 @@ def call_huggingface_detection(image_bytes):
         
         if response.status_code == 200:
             result = response.json()
-            debug_log(f"✅ HF Response received")
-            
             if result.get("success"):
                 severity = "Unknown"
                 if result.get("bbox") and result.get("leaf_area"):
                     severity = estimate_severity(result.get("bbox"), result.get("leaf_area"))
                 
                 return {
-                    "disease": result.get("disease"),
-                    "confidence": result.get("confidence"),
-                    "treatment": result.get("treatment"),
+                    "disease": result.get("disease", "Unknown"),
+                    "confidence": result.get("confidence", 0),
+                    "treatment": result.get("treatment", ""),
                     "is_healthy": result.get("is_healthy", False),
                     "low_confidence": result.get("low_confidence", False),
-                    "severity": severity
+                    "severity": severity,
+                    "bbox": result.get("bbox")
                 }
-            else:
-                debug_log(f"❌ HF returned error")
-                return None
-        else:
-            debug_log(f"❌ HF HTTP error: {response.status_code}")
-            return None
-    except requests.exceptions.Timeout:
-        debug_log("❌ HF request timed out")
         return None
     except Exception as e:
-        debug_log(f"❌ HF call error: {e}")
+        debug_log(f"❌ HF error: {e}")
         return None
-    finally:
-        gc.collect()
 
-def get_user_history(phone, limit=5):
-    """Get user's detection history"""
-    if not db:
-        return []
-    try:
-        docs = db.collection("detections")\
-            .where("phone", "==", phone)\
-            .order_by("timestamp", direction="DESCENDING")\
-            .limit(limit)\
-            .stream()
+# ==============================
+# COMBINED DIAGNOSIS FUNCTION
+# ==============================
+def get_combined_diagnosis(image_bytes, hf_result):
+    """Combine HF detection with AI vision for final diagnosis"""
+    disease = hf_result["disease"]
+    confidence = hf_result["confidence"]
+    severity = hf_result["severity"]
+    is_healthy = hf_result["is_healthy"]
+    low_confidence = hf_result["low_confidence"]
+    
+    # Smart AI routing based on confidence
+    ai_review = None
+    disagreement = False
+    
+    if not low_confidence and not is_healthy:
+        # Only call AI for medium/low confidence or verification
+        if confidence < 85:
+            ai_review = ai_leaf_analysis(image_bytes, disease, confidence)
+            
+            # Check for disagreement (simple check)
+            if ai_review and disease.lower() not in ai_review.lower():
+                disagreement = True
+    
+    # Build combined response
+    if is_healthy:
+        response = "🌿 *HEALTHY LEAF DETECTED*\n━━━━━━━━━━━━━━━━━━\n"
+        response += f"✅ Confidence: {confidence:.0f}%\n\n"
+        response += "💚 Great job! Your plant looks healthy.\n"
+        response += "Continue good farming practices."
         
-        history = []
-        for doc in docs:
-            data = doc.to_dict()
-            if data.get("timestamp"):
-                ts = data["timestamp"]
-                if hasattr(ts, "strftime"):
-                    data["date"] = ts.strftime("%d %b %Y")
-            history.append(data)
-        return history
-    except Exception as e:
-        debug_log(f"❌ History error: {e}")
-        return []
+    elif low_confidence or confidence < 50:
+        response = "❓ *UNCLEAR DETECTION*\n━━━━━━━━━━━━━━━━━━\n"
+        response += f"⚠️ Confidence: {confidence:.0f}%\n\n"
+        if ai_review:
+            response += f"🔬 *AI Analysis:*\n{ai_review}\n\n"
+        response += "📸 Please send a clearer photo for better accuracy."
+        
+    else:
+        # Main diagnosis with both sources
+        response = f"🌿 *{disease.upper()}*\n━━━━━━━━━━━━━━━━━━\n"
+        response += f"📊 Model Confidence: {confidence:.0f}%\n"
+        
+        if severity != "Unknown":
+            response += f"{SEVERITY_ADVICE.get(severity, '')}\n"
+        
+        # Add AI review if available
+        if ai_review:
+            response += f"\n🔬 *AI Verification:*\n{ai_review}\n"
+        
+        # Add cached advice
+        if disease in DISEASE_ADVICE_CACHE:
+            response += f"\n💡 *Advice:*\n{DISEASE_ADVICE_CACHE[disease]}"
+        elif hf_result["treatment"]:
+            response += f"\n💡 *Treatment:*\n{hf_result['treatment']}"
+        
+        # Add disagreement warning
+        if disagreement:
+            response += "\n\n⚠️ *Note:* AI analysis differs from model detection. Please consult an expert."
+    
+    return response, ai_review
 
 # ==============================
 # MENU FUNCTIONS
 # ==============================
 def send_main_menu(phone):
-    """Helper function to send main menu"""
     menu = (
-        "🌿 *TOBACCO AI MAIN MENU*\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "1️⃣ *Disease Detection* - Send photo\n"
-        "2️⃣ *Farming Practices* - Guides & AI advice\n"
-        "3️⃣ *My Dashboard* - Stats, History, Tips\n"
-        "4️⃣ *Leaf Grading* - Quality assessment\n"
-        "5️⃣ *Expert Help* - Agronomist & AI\n"
-        "6️⃣ *Feedback* - Send comments\n\n"
-        "Reply with number (e.g., *1*)\n"
-        "Or type *help* for commands"
+        "🌿 *TOBACCO AI*\n"
+        "━━━━━━━━━━━━━━\n"
+        "1️⃣ Disease Detection\n"
+        "2️⃣ Farming Guides\n"
+        "3️⃣ My Dashboard\n"
+        "4️⃣ Leaf Grading\n"
+        "5️⃣ Expert Help\n"
+        "6️⃣ Feedback\n\n"
+        "Reply with number (1-6)"
     )
-    return send_whatsapp(phone, menu)
+    send_whatsapp(phone, menu)
+    dynamic_delay("menu")
 
 def send_farming_menu(phone):
-    """Send farming practices submenu"""
-    farming_menu = (
-        "🌱 *FARMING PRACTICES*\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "1️⃣ *Planting Guide*\n"
-        "2️⃣ *Fertilizer Guide*\n"
-        "3️⃣ *Harvesting Guide*\n"
-        "4️⃣ *Curing Guide*\n"
-        "5️⃣ *Marketing Guide*\n"
-        "6️⃣ *Ask AI*\n\n"
-        "Reply with number (1-6)\n"
+    menu = (
+        "🌱 *FARMING GUIDES*\n"
+        "━━━━━━━━━━━━━━\n"
+        "1️⃣ Planting\n"
+        "2️⃣ Fertilizer\n"
+        "3️⃣ Harvesting\n"
+        "4️⃣ Curing\n"
+        "5️⃣ Marketing\n"
+        "6️⃣ Ask AI\n\n"
         "0️⃣ Main Menu"
     )
-    return send_whatsapp(phone, farming_menu)
+    send_whatsapp(phone, menu)
+    dynamic_delay("menu")
 
 def send_dashboard_menu(phone, name, stats):
-    """Send dashboard menu"""
-    dashboard = (
-        "📊 *MY DASHBOARD*\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"👤 *Farmer:* {name}\n"
-        f"📱 *Phone:* {phone}\n\n"
-        f"📝 *Total Scans:* {stats['total_scans']}\n"
-        f"🦠 *Common Issue:* {stats['top_disease']}\n"
-        f"🌿 *Healthy Leaves:* {stats['healthy_count']}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "1️⃣ *View History*\n"
-        "2️⃣ *Daily Tip*\n"
-        "3️⃣ *Fun Fact*\n\n"
+    menu = (
+        f"📊 *{name}'s STATS*\n"
+        "━━━━━━━━━━━━━━\n"
+        f"📝 Scans: {stats['total_scans']}\n"
+        f"🦠 Top: {stats['top_disease']}\n"
+        f"🌿 Healthy: {stats['healthy_count']}\n"
+        "━━━━━━━━━━━━━━\n"
+        "1️⃣ History\n"
+        "2️⃣ Daily Tip\n"
+        "3️⃣ Fun Fact\n\n"
         "0️⃣ Main Menu"
     )
-    return send_whatsapp(phone, dashboard)
+    send_whatsapp(phone, menu)
+    dynamic_delay("menu")
 
 def send_expert_menu(phone):
-    """Send expert help menu"""
-    expert_menu = (
+    menu = (
         "👨‍🌾 *EXPERT HELP*\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "1️⃣ *AI Advisor* - Ask anything\n"
-        "2️⃣ *Human Expert* - Talk to agronomist\n\n"
-        "Reply with number (1 or 2)\n"
+        "━━━━━━━━━━━━━━\n"
+        "1️⃣ AI Advisor\n"
+        "2️⃣ Human Expert\n\n"
         "0️⃣ Main Menu"
     )
-    return send_whatsapp(phone, expert_menu)
+    send_whatsapp(phone, menu)
+    dynamic_delay("menu")
 
 # ==============================
-# MESSAGE HANDLER - WITH 20 SECOND DELAY
+# PROGRESS MESSAGES
+# ==============================
+def send_progress(phone, stage):
+    """Send progress updates to user"""
+    messages = {
+        "received": "📷 Image received.",
+        "detecting": "🔍 Analyzing with AI model...",
+        "vision": "🤖 AI verifying symptoms...",
+        "ready": "✅ Analysis complete!"
+    }
+    if stage in messages:
+        send_whatsapp(phone, messages[stage])
+        time.sleep(1)
+
+# ==============================
+# MESSAGE HANDLER
 # ==============================
 def handle_message(phone, msg_type, content):
-    """Main message handler with improved response handling and 20s delay"""
-    debug_log(f"📨 Handling message: type={msg_type}, phone={phone}")
+    debug_log(f"📨 Handling: {msg_type} from {phone}")
     
     user = get_user(phone)
     
     # NEW USER
     if not user:
         save_user(phone, {"state": USER_STATES["AWAITING_NAME"], "phone": phone})
-        return send_whatsapp(phone, 
-            "🌿 *Welcome to Tobacco AI!*\n\n"
-            "I help tobacco farmers detect diseases and learn best practices.\n\n"
-            "Please enter your *name* to continue:")
+        return send_whatsapp(phone, "🌿 Welcome! Please enter your *name*:")
 
     state = user.get("state", USER_STATES["ACTIVE"])
     name = user.get("name", "Farmer")
@@ -888,38 +890,29 @@ def handle_message(phone, msg_type, content):
     if state == USER_STATES["AWAITING_NAME"] and msg_type == "text":
         clean_name = content.strip().title()
         save_user(phone, {"name": clean_name, "state": USER_STATES["ACTIVE"]})
-        welcome_msg = (
-            f"✅ *Welcome, {clean_name}!*\n\n"
-            f"What would you like to do?\n\n"
-            f"• Send a *photo* to detect diseases\n"
-            f"• Type *menu* for all options"
-        )
-        return send_whatsapp(phone, welcome_msg)
+        send_whatsapp(phone, f"✅ Hi {clean_name}! Send photo to detect diseases or type *menu*")
+        dynamic_delay("text")
+        return
 
-    # EXPERT MENU HANDLER
+    # EXPERT MENU
     if state == USER_STATES["EXPERT_MENU"] and msg_type == "text":
         cmd = content.lower().strip()
-        
         if cmd == "0":
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
             return send_main_menu(phone)
         elif cmd == "1":
             save_user(phone, {"state": USER_STATES["AWAITING_AI_QUESTION"]})
-            return send_whatsapp(phone, 
-                "🤖 *AI Advisor*\n\n"
-                "Ask me anything about tobacco farming.\n\n"
-                "Type your question below (or *cancel* to go back):")
+            send_whatsapp(phone, "🤖 Ask your question (or *cancel*):")
+            dynamic_delay("text")
         elif cmd == "2":
             save_user(phone, {"state": USER_STATES["AWAITING_EXPERT"]})
-            return send_whatsapp(phone, 
-                "👨‍🌾 *Talk to an Agronomist*\n\n"
-                "Describe your farming issue. A human expert will respond soon.\n\n"
-                "Type your message (or *cancel* to go back):")
+            send_whatsapp(phone, "👨‍🌾 Describe issue (or *cancel*):")
+            dynamic_delay("text")
         else:
-            return send_whatsapp(phone, "❌ Please choose 1 or 2 (or *0* for Main Menu).")
+            send_whatsapp(phone, "❌ Choose 1, 2, or 0")
     
-    # DASHBOARD MENU HANDLER
-    if state == USER_STATES["DASHBOARD_MENU"] and msg_type == "text":
+    # DASHBOARD MENU
+    elif state == USER_STATES["DASHBOARD_MENU"] and msg_type == "text":
         cmd = content.lower().strip()
         
         if cmd == "0":
@@ -928,62 +921,52 @@ def handle_message(phone, msg_type, content):
         elif cmd == "1":
             history = get_user_history(phone)
             if not history:
-                msg = "📋 *No scan history yet.*\n\nSend a photo to start!"
-                send_whatsapp(phone, msg)
-                stats = get_user_statistics(phone)
-                return send_dashboard_menu(phone, name, stats)
+                msg = "📋 No scans yet"
             else:
-                msg = "📋 *YOUR SCAN HISTORY*\n━━━━━━━━━━━━━━━━━━\n"
-                for i, h in enumerate(history[:5], 1):
-                    msg += f"{i}. *{h.get('disease', 'Unknown')}* - {h.get('confidence', 0):.1f}%\n"
-                    msg += f"   📅 {h.get('date', 'Unknown')}\n\n"
-                send_whatsapp(phone, trim_message(msg, 1500))
-                stats = get_user_statistics(phone)
-                return send_dashboard_menu(phone, name, stats)
+                msg = "📋 *Recent*\n"
+                for h in history[:3]:
+                    msg += f"• {h.get('disease')} ({h.get('confidence',0):.0f}%)\n"
+            send_whatsapp(phone, msg)
+            dynamic_delay("text")
+            stats = get_user_statistics(phone)
+            return send_dashboard_menu(phone, name, stats)
         elif cmd == "2":
             tip = get_gemini_tip()
-            send_whatsapp(phone, f"💡 *Daily Tip*\n\n{tip}")
+            send_whatsapp(phone, f"💡 *Tip*\n{tip}")
+            dynamic_delay("text")
             stats = get_user_statistics(phone)
             return send_dashboard_menu(phone, name, stats)
         elif cmd == "3":
             fact = get_gemini_fact()
-            send_whatsapp(phone, f"🎲 *Did You Know?*\n\n{fact}")
+            send_whatsapp(phone, f"🎲 *Fact*\n{fact}")
+            dynamic_delay("text")
             stats = get_user_statistics(phone)
             return send_dashboard_menu(phone, name, stats)
         else:
-            return send_whatsapp(phone, "❌ Please choose 1, 2, or 3 (or *0* for Main Menu).")
+            send_whatsapp(phone, "❌ Choose 1-3 or 0")
 
-    # AWAITING AI QUESTION - WITH 20 SECOND DELAY
-    if state == USER_STATES["AWAITING_AI_QUESTION"] and msg_type == "text":
+    # AWAITING AI QUESTION
+    elif state == USER_STATES["AWAITING_AI_QUESTION"] and msg_type == "text":
         if content.lower() == "cancel":
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
             return send_main_menu(phone)
         
-        # Send thinking message
-        send_whatsapp(phone, f"🤔 AI Advisor is thinking...")
-        
-        # Get response
-        result = ask_ai_advisor(content)
-        
-        # Send the AI response
-        send_whatsapp_with_retry(phone, result)
-        
-        # Wait 20 seconds to ensure user sees the full response
-        debug_log(f"⏱️ Waiting 20 seconds before showing menu...")
-        time.sleep(20)
-        
+        send_whatsapp(phone, f"🤔 Thinking...")
+        answer = ask_ai_advisor(content)
+        send_whatsapp(phone, answer)
+        dynamic_delay("ai")
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         return send_main_menu(phone)
 
-    # FARMING PRACTICES SUBMENU HANDLER
-    if state == USER_STATES["FARMING_MENU"] and msg_type == "text":
+    # FARMING MENU
+    elif state == USER_STATES["FARMING_MENU"] and msg_type == "text":
         cmd = content.lower().strip()
         
         if cmd == "0":
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
             return send_main_menu(phone)
         
-        static_guides = {
+        guides = {
             "1": PLANTING_GUIDE,
             "2": FERTILIZER_GUIDE,
             "3": HARVESTING_GUIDE,
@@ -991,245 +974,191 @@ def handle_message(phone, msg_type, content):
             "5": MARKETING_GUIDE
         }
         
-        if cmd in static_guides:
-            send_whatsapp(phone, static_guides[cmd])
+        if cmd in guides:
+            send_whatsapp(phone, guides[cmd])
+            dynamic_delay("text")
             return send_farming_menu(phone)
         elif cmd == "6":
             save_user(phone, {"state": USER_STATES["AWAITING_AI_QUESTION"]})
-            return send_whatsapp(phone, 
-                "🤖 *AI Advisor*\n\n"
-                "Ask me anything about tobacco farming.\n\n"
-                "Type your question below (or *cancel* to go back):")
+            send_whatsapp(phone, "🤖 Ask your question (or *cancel*):")
+            dynamic_delay("text")
         else:
-            send_whatsapp(phone, "❌ Please choose 1-6 (or *0* for Main Menu).")
             return send_farming_menu(phone)
 
-    # LEAF GRADING - WITH 20 SECOND DELAY
-    if state == USER_STATES["WAITING_GRADE_IMAGE"] and msg_type == "image":
-        debug_log(f"📸 Processing grading image from {phone}")
-        send_whatsapp(phone, f"🔍 Analyzing leaf quality, {name}...")
+    # LEAF GRADING
+    elif state == USER_STATES["WAITING_GRADE_IMAGE"] and msg_type == "image":
+        debug_log(f"📸 Grading")
+        send_progress(phone, "received")
         
         image_bytes = download_image(content)
         if not image_bytes:
-            debug_log("❌ Download failed")
-            send_whatsapp(phone, "❌ Failed to download image. Please try again.")
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
             return send_main_menu(phone)
         
+        send_progress(phone, "detecting")
         grade, analysis = grade_leaf_with_ai(image_bytes)
-        if analysis:
-            send_whatsapp_with_retry(phone, analysis)
-        else:
-            send_whatsapp(phone, "❌ Could not analyze the image. Please try again.")
         
-        debug_log(f"⏱️ Waiting 20 seconds before showing menu...")
-        time.sleep(20)  # 20 second delay
+        if analysis:
+            send_whatsapp(phone, analysis)
+            dynamic_delay("vision")
+        else:
+            send_whatsapp(phone, "❌ Analysis failed")
+        
+        # Cleanup
+        cleanup_memory(image_bytes, grade, analysis)
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         send_main_menu(phone)
-        gc.collect()
         return
 
-    # DISEASE DETECTION - WITH SPAM PREVENTION AND 20 SECOND DELAY
-    if state == USER_STATES["WAITING_IMAGE"] and msg_type == "image":
-        # Spam prevention - cooldown check
+    # DISEASE DETECTION - IMPROVED WITH MULTI-MODEL
+    elif state == USER_STATES["WAITING_IMAGE"] and msg_type == "image":
+        # Spam prevention
         current_time = time.time()
         if phone in LAST_SCAN:
             if current_time - LAST_SCAN[phone] < 5:
-                debug_log(f"⚠️ Spam prevention: {phone} tried to send image too quickly")
-                return send_whatsapp(phone, "⏱️ Please wait 5 seconds between scans.")
+                return send_whatsapp(phone, "⏱️ Please wait 5 seconds")
         
-        # Update last scan time
         LAST_SCAN[phone] = current_time
+        debug_log(f"📸 Detection from {phone}")
         
-        debug_log(f"📸 Processing disease detection from {phone}")
-        send_whatsapp(phone, f"🔍 Downloading your image, {name}...")
+        # Progress updates
+        send_progress(phone, "received")
         
+        # Download image
         image_bytes = download_image(content)
         if not image_bytes:
-            debug_log("❌ Download failed")
-            send_whatsapp(phone, "❌ Failed to download image. Please try again.")
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
             return send_main_menu(phone)
         
-        send_whatsapp(phone, f"✅ Image downloaded! Running AI analysis...")
+        send_progress(phone, "detecting")
         
-        result = call_huggingface_detection(image_bytes)
-        save_user(phone, {"state": USER_STATES["ACTIVE"]})
+        # Step 1: HuggingFace detection
+        hf_result = call_huggingface_detection(image_bytes)
         
-        if not result:
-            debug_log("❌ Detection failed")
-            send_whatsapp(phone, "❌ AI analysis failed. Please try another photo.")
+        if not hf_result:
+            send_whatsapp(phone, "❌ Analysis failed")
+            cleanup_memory(image_bytes)
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
             return send_main_menu(phone)
         
-        disease = result["disease"]
-        confidence = result["confidence"]
-        severity = result.get("severity", "Unknown")
-        confidence_msg = get_confidence_message(confidence)
+        # Step 2: Get combined diagnosis (with optional AI)
+        send_progress(phone, "vision")
+        final_response, ai_review = get_combined_diagnosis(image_bytes, hf_result)
         
-        debug_log(f"✅ Detection result: {disease} ({confidence:.1f}%) Severity: {severity}")
-        log_detection(phone, name, disease, confidence)
+        # Step 3: Send result
+        send_whatsapp(phone, final_response)
         
-        if result["low_confidence"]:
-            response = f"⚠️ *Low Confidence ({confidence:.1f}%)*\n\n{confidence_msg}\n\nPlease upload a clearer photo."
-        elif result["is_healthy"]:
-            response = f"🎉 *Healthy Leaf Detected!*\n\nConfidence: {confidence:.1f}%\n{confidence_msg}\n\nGreat job!"
-        else:
-            response = f"📊 *{disease} DETECTED*\n\nConfidence: {confidence:.1f}%\n{confidence_msg}"
-            
-            if severity != "Unknown":
-                response += f"\nSeverity: *{severity}*"
-            
-            response += f"\n\n*Treatment:*\n{result['treatment']}"
+        # Step 4: Log detection
+        log_detection(phone, name, hf_result["disease"], hf_result["confidence"], ai_review)
         
-        send_whatsapp(phone, response)
+        # Step 5: Dynamic delay based on task complexity
+        task_type = "detection" if hf_result["confidence"] < 85 else "vision"
+        dynamic_delay(task_type)
         
-        if not result["is_healthy"] and not result["low_confidence"]:
-            offline_advice = get_offline_disease_advice(disease)
-            send_whatsapp(phone, offline_advice + "\n\nType *ai your question* for more advice")
+        # Step 6: Cleanup memory
+        cleanup_memory(image_bytes, hf_result, ai_review)
         
-        debug_log(f"⏱️ Waiting 20 seconds before showing menu...")
-        time.sleep(20)  # 20 second delay
+        save_user(phone, {"state": USER_STATES["ACTIVE"]})
         send_main_menu(phone)
-        gc.collect()
         return
 
-    # AWAITING FEEDBACK - FIXED ADMIN NOTIFICATION
-    if state == USER_STATES["AWAITING_FEEDBACK"] and msg_type == "text":
+    # AWAITING FEEDBACK
+    elif state == USER_STATES["AWAITING_FEEDBACK"] and msg_type == "text":
         if content.lower() == "cancel":
-            send_whatsapp(phone, "Feedback cancelled.")
+            send_whatsapp(phone, "Cancelled")
         else:
-            # Send feedback to admin - FIXED: Now starts a new chat with clear formatting
             if ADMIN_PHONE:
                 admin_msg = (
-                    f"📝 *NEW FEEDBACK RECEIVED*\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"👤 *From:* {name}\n"
-                    f"📱 *Phone:* {phone}\n"
-                    f"📅 *Date:* {datetime.now().strftime('%d %b %Y at %H:%M')}\n\n"
-                    f"💬 *Message:*\n{content}\n\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"Reply to this message to respond to the farmer."
+                    f"📝 *FEEDBACK*\n"
+                    f"━━━━━━━━━━\n"
+                    f"👤 {name}\n"
+                    f"📱 {phone}\n"
+                    f"📅 {datetime.now().strftime('%d %b %H:%M')}\n\n"
+                    f"💬 {content}"
                 )
-                # Send to admin - this creates a new chat thread
                 send_whatsapp(ADMIN_PHONE, admin_msg)
-                debug_log(f"📨 Feedback sent to admin: {ADMIN_PHONE}")
-            
-            # Thank the user
-            send_whatsapp(phone, "✅ Thank you! Your feedback has been sent to our team. We appreciate your input!")
+            send_whatsapp(phone, "✅ Thanks!")
         
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
-        time.sleep(2)
+        dynamic_delay("feedback")
         return send_main_menu(phone)
 
-    # AWAITING EXPERT - FIXED ADMIN NOTIFICATION
-    if state == USER_STATES["AWAITING_EXPERT"] and msg_type == "text":
+    # AWAITING EXPERT
+    elif state == USER_STATES["AWAITING_EXPERT"] and msg_type == "text":
         if content.lower() == "cancel":
-            send_whatsapp(phone, "Expert request cancelled.")
+            send_whatsapp(phone, "Cancelled")
         else:
-            # Send expert request to admin - FIXED: Now starts a new chat with clear formatting
             if ADMIN_PHONE:
                 admin_msg = (
-                    f"🚨 *URGENT: EXPERT REQUEST*\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"👤 *Farmer:* {name}\n"
-                    f"📱 *Phone:* {phone}\n"
-                    f"📅 *Date:* {datetime.now().strftime('%d %b %Y at %H:%M')}\n\n"
-                    f"💬 *Issue Description:*\n{content}\n\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"PLEASE RESPOND TO THIS FARMER ASAP.\n"
-                    f"Reply to this message to contact them."
+                    f"🚨 *EXPERT*\n"
+                    f"━━━━━━━━\n"
+                    f"👤 {name}\n"
+                    f"📱 {phone}\n"
+                    f"📅 {datetime.now().strftime('%d %b %H:%M')}\n\n"
+                    f"💬 {content}"
                 )
-                # Send to admin - this creates a new chat thread
                 send_whatsapp(ADMIN_PHONE, admin_msg)
-                debug_log(f"📨 Expert request sent to admin: {ADMIN_PHONE}")
-            
-            # Acknowledge the user
-            send_whatsapp(phone, "👨‍🌾 Your request has been sent to our expert team. They will contact you within 24-48 hours. Thank you for your patience!")
+            send_whatsapp(phone, "✅ Expert will respond")
         
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
-        time.sleep(2)
+        dynamic_delay("expert")
         return send_main_menu(phone)
 
-    # TEXT COMMANDS - FIXED AI COMMAND WITH 20 SECOND DELAY
-    if msg_type == "text":
+    # TEXT COMMANDS
+    elif msg_type == "text":
         cmd = content.lower().strip()
         
-        if cmd in ["menu", "0", "main"]:
+        if cmd in ["menu", "0"]:
             return send_main_menu(phone)
-        elif cmd in ["1", "detect"]:
+        elif cmd == "1":
             save_user(phone, {"state": USER_STATES["WAITING_IMAGE"]})
-            send_whatsapp(phone, 
-                "📸 *Disease Detection*\n\n"
-                "Send a clear photo of the tobacco leaf.\n\n"
-                "Tips: Good lighting, close-up, steady camera")
-        elif cmd in ["2", "farming"]:
+            send_whatsapp(phone, "📸 Send clear photo of leaf")
+        elif cmd == "2":
             save_user(phone, {"state": USER_STATES["FARMING_MENU"]})
             return send_farming_menu(phone)
-        elif cmd in ["3", "dashboard"]:
+        elif cmd == "3":
             stats = get_user_statistics(phone)
             save_user(phone, {"state": USER_STATES["DASHBOARD_MENU"]})
             return send_dashboard_menu(phone, name, stats)
-        elif cmd in ["4", "grade"]:
+        elif cmd == "4":
             save_user(phone, {"state": USER_STATES["WAITING_GRADE_IMAGE"]})
-            send_whatsapp(phone, 
-                "🏷️ *LEAF QUALITY GRADING*\n\n"
-                "Send a clear photo of your cured leaf.\n\n"
-                "I'll analyze: grade, color, damage\n\n"
-                "Tips: Good lighting, flat surface")
-        elif cmd in ["5", "expert"]:
+            send_whatsapp(phone, "🏷️ Send photo of cured leaf")
+        elif cmd == "5":
             save_user(phone, {"state": USER_STATES["EXPERT_MENU"]})
             return send_expert_menu(phone)
-        elif cmd in ["6", "feedback"]:
+        elif cmd == "6":
             save_user(phone, {"state": USER_STATES["AWAITING_FEEDBACK"]})
-            send_whatsapp(phone, 
-                "📝 *Send Feedback*\n\n"
-                "Type your message below (or *cancel*):")
+            send_whatsapp(phone, "📝 Type feedback (or *cancel*):")
         elif cmd.startswith("ai "):
             question = cmd[3:].strip()
             if question:
-                send_whatsapp(phone, f"🤔 AI Advisor is thinking...")
-                result = ask_ai_advisor(question)
-                send_whatsapp_with_retry(phone, result)
-                
-                # Wait 20 seconds before showing menu
-                debug_log(f"⏱️ Waiting 20 seconds before showing menu...")
-                time.sleep(20)
+                send_whatsapp(phone, f"🤔 Thinking...")
+                answer = ask_ai_advisor(question)
+                send_whatsapp(phone, answer)
+                dynamic_delay("ai")
                 return send_main_menu(phone)
-            else:
-                send_whatsapp(phone, "❓ Example: *ai how to prevent black shank*")
         elif cmd == "help":
             help_text = (
-                "📚 *QUICK HELP*\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                "• *menu* - Main menu\n"
-                "• *1* - Disease detection\n"
-                "• *2* - Farming practices\n"
-                "• *3* - Dashboard\n"
-                "• *4* - Leaf grading\n"
-                "• *5* - Expert help\n"
-                "• *6* - Feedback\n"
-                "• *ai [question]* - Ask AI"
+                "📚 *COMMANDS*\n"
+                "• menu - Main menu\n"
+                "• 1-6 - Options\n"
+                "• ai [question] - Ask AI"
             )
             send_whatsapp(phone, help_text)
         else:
-            send_whatsapp(phone, 
-                "❓ Command not recognized.\n\n"
-                "Type *menu* to see options")
+            send_whatsapp(phone, "Type *menu* for options")
 
 # ==============================
 # FLASK ROUTES
 # ==============================
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    """Main webhook endpoint"""
     if request.method == "GET":
         verify_token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
         
         if verify_token == VERIFY_TOKEN:
-            debug_log("✅ Webhook verified")
             return challenge, 200
-        debug_log("❌ Webhook verification failed")
         return "Forbidden", 403
     
     try:
@@ -1239,7 +1168,7 @@ def webhook():
         value = changes.get("value", {})
         
         if "statuses" in value:
-            return jsonify({"status": "ignored"}), 200
+            return jsonify({"status": "ok"}), 200
         
         messages = value.get("messages", [])
         if not messages:
@@ -1254,11 +1183,9 @@ def webhook():
         elif msg_type == "image":
             content = msg.get("image", {}).get("id", "")
         else:
-            return jsonify({"status": "ignored"}), 200
+            return jsonify({"status": "ok"}), 200
         
-        if msg_type in ["text", "image"]:
-            handle_message(from_number, msg_type, content)
-        
+        handle_message(from_number, msg_type, content)
         return jsonify({"status": "ok"}), 200
         
     except Exception as e:
@@ -1267,34 +1194,28 @@ def webhook():
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Health check endpoint"""
     return jsonify({
         "status": "healthy",
         "firebase": db is not None,
-        "huggingface_url": HF_SPACE_URL,
-        "ai_provider": "gemini" if AI_API_KEY else "disabled",
-        "current_year": datetime.now().year,
-        "admin_configured": bool(ADMIN_PHONE),
+        "ai_configured": bool(AI_API_KEY),
+        "admin": bool(ADMIN_PHONE),
+        "cache_size": f"Tips:{len(tip_cache)} Facts:{len(fact_cache)}",
         "timestamp": datetime.now().isoformat()
     }), 200
 
 @app.route("/", methods=["GET"])
 def home():
-    """Root endpoint"""
-    return "🌿 Tobacco AI Assistant is running!"
+    return "🌿 Tobacco AI is running!"
 
 # ==============================
 # START THE APP
 # ==============================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    debug_log(f"🚀 Starting Tobacco AI Assistant on port {port}")
-    debug_log(f"🤖 Using Hugging Face Space: {HF_SPACE_URL}")
-    debug_log(f"🧠 Available Gemini models: {', '.join(GEMINI_MODELS)}")
-    debug_log(f"📱 Admin phone: {ADMIN_PHONE if ADMIN_PHONE else 'Not configured'}")
-    debug_log(f"📅 Current year: {datetime.now().year}")
-    if AI_API_KEY and AI_API_KEY != "your_api_key_here":
-        debug_log(f"✅ AI Advisor enabled with CURRENT YEAR focus and 20-second delay")
-    else:
-        debug_log(f"ℹ️ AI Advisor disabled - set AI_API_KEY environment variable")
+    debug_log(f"🚀 Starting on port {port}")
+    debug_log(f"📱 Admin: {'✅' if ADMIN_PHONE else '❌'}")
+    debug_log(f"🤖 AI: {'✅' if AI_API_KEY else '❌'}")
+    debug_log(f"💾 Cache: Tips & Facts enabled")
+    debug_log(f"🧠 Multi-model inference: ENABLED")
+    debug_log(f"⚡ Smart AI routing: ENABLED")
     app.run(host="0.0.0.0", port=port, debug=False)
