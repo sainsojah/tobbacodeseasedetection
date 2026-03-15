@@ -59,19 +59,19 @@ GEMINI_MODELS = [
 
 # Spam prevention - cooldown dictionary with timestamp
 LAST_SCAN = {}
-COOLDOWN_SECONDS = 10  # Increased to 10 seconds
+COOLDOWN_SECONDS = 20  
 
 # Configuration
 generation_config = {
     "temperature": 0.7,
     "top_p": 0.8,
     "top_k": 10,
-    "max_output_tokens": 600,
+    "max_output_tokens": 800,
 }
 
 vision_config = {
     "temperature": 0.7,
-    "max_output_tokens": 400,
+    "max_output_tokens": 800,
     "top_p": 0.8
 }
 
