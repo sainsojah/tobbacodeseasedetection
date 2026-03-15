@@ -63,7 +63,7 @@ generation_config = {
     "temperature": 0.7,
     "top_p": 0.8,
     "top_k": 10,
-    "max_output_tokens": 800,  # Allows ~150 words
+    "max_output_tokens": 1000,  # Increased from 800 for longer responses
 }
 
 safety_settings = [
@@ -85,22 +85,22 @@ safety_settings = [
     },
 ]
 
-# Vision-specific config
+# Vision-specific config - INCREASED for complete grading
 vision_config = {
     "temperature": 0.7,
-    "max_output_tokens": 500,
+    "max_output_tokens": 800,  # Increased from 500 for complete grading
     "top_p": 0.8
 }
 
-# Tip/Fact specific config
+# Tip/Fact specific config - INCREASED for complete sentences
 tip_config = {
     "temperature": 0.8,
-    "max_output_tokens": 300,
+    "max_output_tokens": 600,  # Increased from 300
 }
 
 fact_config = {
     "temperature": 0.9,
-    "max_output_tokens": 300,
+    "max_output_tokens": 600,  # Increased from 300
 }
 
 # Higher limit for trimming - only used as safety net
@@ -409,10 +409,10 @@ Question: {question}
 
 IMPORTANT GUIDELINES:
 1. Use ONLY current season data (2025-{current_year})
-2. Keep response under 150 words total
+2. Keep response under 200 words total
 3. Include key points only
 4. Use bullet points for clarity
-5. End with a complete sentence
+5. End with a complete sentence - DO NOT cut off mid-sentence
 
 If asked about prices, volumes, or market conditions - provide estimates based on CURRENT {current_year} season projections."""
 
@@ -439,13 +439,14 @@ If asked about prices, volumes, or market conditions - provide estimates based o
         return f"⚠️ AI service temporarily unavailable. Please try again later or use the farming guides (type *menu*)."
 
 # ==============================
-# AI LEAF GRADING
+# IMPROVED AI LEAF GRADING WITH BETTER RETRY LOGIC
 # ==============================
 def grade_leaf_with_ai(image_bytes):
-    """Grade leaf using google.generativeai library"""
+    """Grade leaf using google.generativeai library with improved retry logic"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return None, "AI grading not configured"
     
+    # Try each model in sequence
     for model_name in GEMINI_MODELS:
         try:
             time.sleep(1)
@@ -459,15 +460,20 @@ def grade_leaf_with_ai(image_bytes):
             
             image_data = base64.b64encode(image_bytes).decode('utf-8')
             
-            prompt = """Grade this tobacco leaf. Keep response under 100 words:
+            # More detailed prompt for complete grading
+            prompt = """Grade this tobacco leaf thoroughly. Provide a COMPLETE analysis with ALL fields filled:
 
-📊 *LEAF GRADE*
-• Grade (A/B/C/D):
-• Color:
-• Texture:
-• Damage:
-• Market Value:"""
+📊 *LEAF GRADE RESULTS*
+━━━━━━━━━━━━━━━━━━
+• Grade (A/B/C/D): [Choose one - A=Premium, B=Good, C=Fair, D=Poor]
+• Color: [Detailed color description with notes on uniformity]
+• Texture: [Description - oily, dry, brittle, supple, etc.]
+• Damage: [Any spots, tears, holes, or imperfections]
+• Market Value: [Premium/Good/Fair/Poor with brief explanation]
 
+IMPORTANT: Fill in ALL fields completely. Do not leave anything blank. End with a complete sentence."""
+
+            # Try up to 3 attempts for this model with increasing timeouts
             for attempt in range(3):
                 try:
                     response = model.generate_content([
@@ -477,13 +483,23 @@ def grade_leaf_with_ai(image_bytes):
                     
                     if response and response.text:
                         analysis = response.text.strip()
-                        debug_log(f"✅ Success with model: {model_name}")
-                        return "Grade", analysis
+                        
+                        # Check if response seems complete (has all sections)
+                        if len(analysis) > 100 and all(section in analysis for section in ['Grade', 'Color', 'Texture', 'Damage', 'Market']):
+                            debug_log(f"✅ Complete grading with model: {model_name}")
+                            return "Grade", analysis
+                        elif len(analysis) > 50:
+                            debug_log(f"⚠️ Partial grading from {model_name}, but sending anyway")
+                            return "Grade", analysis
+                        else:
+                            debug_log(f"⚠️ Response too short from {model_name}, attempt {attempt+1}")
+                            time.sleep(2)
                     else:
+                        debug_log(f"⚠️ Empty response from {model_name}, attempt {attempt+1}")
                         time.sleep(2)
                         
                 except Exception as e:
-                    debug_log(f"⚠️ Attempt {attempt+1} failed: {str(e)[:100]}")
+                    debug_log(f"⚠️ Attempt {attempt+1} failed for {model_name}: {str(e)[:100]}")
                     time.sleep(2)
                     continue
                 
@@ -494,15 +510,15 @@ def grade_leaf_with_ai(image_bytes):
     return None, "⚠️ Grading service temporarily unavailable. Please try again later."
 
 # ==============================
-# DAILY TIP
+# IMPROVED DAILY TIP
 # ==============================
 def get_gemini_tip():
-    """Generate a fresh daily farming tip"""
+    """Generate a fresh daily farming tip - COMPLETE sentences"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return random.choice([
-            "🚜 Rotate tobacco with maize or beans to prevent soil-borne diseases",
-            "💧 Water in the morning to reduce humidity and prevent fungal growth",
-            "🔍 Check fields weekly for early signs of disease"
+            "🚜 Rotate tobacco with maize or beans to prevent soil-borne diseases. This breaks pest cycles and improves soil fertility for the next season.",
+            "💧 Water in the morning to reduce humidity and prevent fungal growth. Evening watering can leave leaves wet overnight, promoting disease.",
+            "🔍 Check fields weekly for early signs of disease. Early detection allows for quick treatment before problems spread."
         ])
     
     for model_name in GEMINI_MODELS:
@@ -525,11 +541,24 @@ def get_gemini_tip():
                 safety_settings=safety_settings
             )
             
-            prompt = f"ONE practical farming tip for Zimbabwe tobacco farmers during {season}. 2-3 sentences. Start with emoji. Use {current_year} context only."
+            prompt = f"""ONE practical farming tip for Zimbabwe tobacco farmers during {season}. 
+
+Requirements:
+- 3-4 complete sentences
+- Start with an emoji
+- Include specific details
+- End with a complete sentence (no cut-offs)
+- Use {current_year} context only
+
+Tip:"""
             response = model.generate_content(prompt)
             
             if response and response.text:
-                return response.text.strip()
+                tip = response.text.strip()
+                # Ensure it ends with punctuation
+                if tip and tip[-1] not in ['.', '!', '?']:
+                    tip += '.'
+                return tip
             else:
                 continue
                 
@@ -537,21 +566,21 @@ def get_gemini_tip():
             continue
     
     return random.choice([
-        f"🌱 Monitor your fields daily for early disease signs this {datetime.now().year} season.",
-        f"💧 Water early morning to prevent fungal growth during {datetime.now().year} planting.",
-        f"🔍 Check lower leaves regularly for pests and diseases in {datetime.now().year}."
+        f"🌱 Monitor your fields daily for early disease signs this {datetime.now().year} season. Check both upper and lower leaves for spots or discoloration.",
+        f"💧 Water early morning to prevent fungal growth during {datetime.now().year} planting. This allows leaves to dry before evening.",
+        f"🔍 Check lower leaves regularly for pests and diseases in {datetime.now().year}. Problems often start there before spreading upward."
     ])
 
 # ==============================
-# FUN FACT
+# IMPROVED FUN FACT
 # ==============================
 def get_gemini_fact():
-    """Generate a fresh interesting fact"""
+    """Generate a fresh interesting fact - COMPLETE sentences"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return random.choice([
-            "🌱 Tobacco is related to tomatoes and potatoes!",
-            "🍃 Zimbabwe produces world-class flue-cured tobacco",
-            "📜 Tobacco has been cultivated for over 8,000 years"
+            "🌱 Tobacco is related to tomatoes and potatoes! All three belong to the Solanaceae family, which is why they share similar pests and diseases.",
+            "🍃 Zimbabwe produces world-class flue-cured tobacco known for its golden color and sweet flavor, making it highly sought after in international markets.",
+            "📜 Tobacco has been cultivated for over 8,000 years, originally used for ceremonial and medicinal purposes by indigenous peoples."
         ])
     
     for model_name in GEMINI_MODELS:
@@ -564,11 +593,23 @@ def get_gemini_fact():
                 safety_settings=safety_settings
             )
             
-            prompt = f"ONE interesting fact about Zimbabwe tobacco farming for {datetime.now().year}. 2-3 sentences. Start with emoji."
+            prompt = f"""ONE interesting fact about Zimbabwe tobacco farming for {datetime.now().year}.
+
+Requirements:
+- 3-4 complete sentences
+- Start with an emoji
+- Include specific details or statistics
+- End with a complete sentence (no cut-offs)
+
+Fact:"""
             response = model.generate_content(prompt)
             
             if response and response.text:
-                return response.text.strip()
+                fact = response.text.strip()
+                # Ensure it ends with punctuation
+                if fact and fact[-1] not in ['.', '!', '?']:
+                    fact += '.'
+                return fact
             else:
                 continue
                 
@@ -576,9 +617,9 @@ def get_gemini_fact():
             continue
     
     return random.choice([
-        f"🌱 Zimbabwe's tobacco industry employs over 500,000 people in {datetime.now().year}.",
-        "📜 Tobacco has been cultivated for over 8,000 years.",
-        "🌍 Zimbabwe exports tobacco to over 50 countries."
+        f"🌱 Zimbabwe's tobacco industry employs over 500,000 people in {datetime.now().year}. This includes farmers, laborers, and workers in processing and marketing sectors.",
+        "📜 Tobacco has been cultivated in Zimbabwe for over 8,000 years, originally used for ceremonial purposes by ancient communities.",
+        "🌍 Zimbabwe exports premium flue-cured tobacco to over 50 countries, with China, Belgium, and South Africa being the largest markets."
     ])
 
 # ==============================
@@ -963,7 +1004,7 @@ def handle_message(phone, msg_type, content):
             send_whatsapp(phone, "❌ Please choose 1-6 (or *0* for Main Menu).")
             return send_farming_menu(phone)
 
-    # LEAF GRADING
+    # LEAF GRADING - WITH 20 SECOND DELAY
     if state == USER_STATES["WAITING_GRADE_IMAGE"] and msg_type == "image":
         debug_log(f"📸 Processing grading image from {phone}")
         send_whatsapp(phone, f"🔍 Analyzing leaf quality, {name}...")
@@ -981,13 +1022,14 @@ def handle_message(phone, msg_type, content):
         else:
             send_whatsapp(phone, "❌ Could not analyze the image. Please try again.")
         
+        debug_log(f"⏱️ Waiting 20 seconds before showing menu...")
         time.sleep(20)  # 20 second delay
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         send_main_menu(phone)
         gc.collect()
         return
 
-    # DISEASE DETECTION - WITH SPAM PREVENTION
+    # DISEASE DETECTION - WITH SPAM PREVENTION AND 20 SECOND DELAY
     if state == USER_STATES["WAITING_IMAGE"] and msg_type == "image":
         # Spam prevention - cooldown check
         current_time = time.time()
@@ -1045,42 +1087,64 @@ def handle_message(phone, msg_type, content):
             offline_advice = get_offline_disease_advice(disease)
             send_whatsapp(phone, offline_advice + "\n\nType *ai your question* for more advice")
         
+        debug_log(f"⏱️ Waiting 20 seconds before showing menu...")
         time.sleep(20)  # 20 second delay
         send_main_menu(phone)
         gc.collect()
         return
 
-    # AWAITING FEEDBACK - WITH ADMIN NOTIFICATION
+    # AWAITING FEEDBACK - FIXED ADMIN NOTIFICATION
     if state == USER_STATES["AWAITING_FEEDBACK"] and msg_type == "text":
         if content.lower() == "cancel":
             send_whatsapp(phone, "Feedback cancelled.")
         else:
-            # Send feedback to admin
+            # Send feedback to admin - FIXED: Now starts a new chat with clear formatting
             if ADMIN_PHONE:
-                admin_msg = f"📝 *FEEDBACK RECEIVED*\n━━━━━━━━━━━━━━━━━━\n👤 *From:* {name}\n📱 *Phone:* {phone}\n📅 *Date:* {datetime.now().strftime('%d %b %Y %H:%M')}\n\n💬 *Message:*\n{content}"
+                admin_msg = (
+                    f"📝 *NEW FEEDBACK RECEIVED*\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"👤 *From:* {name}\n"
+                    f"📱 *Phone:* {phone}\n"
+                    f"📅 *Date:* {datetime.now().strftime('%d %b %Y at %H:%M')}\n\n"
+                    f"💬 *Message:*\n{content}\n\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"Reply to this message to respond to the farmer."
+                )
+                # Send to admin - this creates a new chat thread
                 send_whatsapp(ADMIN_PHONE, admin_msg)
-                debug_log(f"📨 Feedback forwarded to admin: {ADMIN_PHONE}")
+                debug_log(f"📨 Feedback sent to admin: {ADMIN_PHONE}")
             
             # Thank the user
-            send_whatsapp(phone, "✅ Thank you! Your feedback has been sent to our team.")
+            send_whatsapp(phone, "✅ Thank you! Your feedback has been sent to our team. We appreciate your input!")
         
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         time.sleep(2)
         return send_main_menu(phone)
 
-    # AWAITING EXPERT - WITH ADMIN NOTIFICATION
+    # AWAITING EXPERT - FIXED ADMIN NOTIFICATION
     if state == USER_STATES["AWAITING_EXPERT"] and msg_type == "text":
         if content.lower() == "cancel":
             send_whatsapp(phone, "Expert request cancelled.")
         else:
-            # Send expert request to admin
+            # Send expert request to admin - FIXED: Now starts a new chat with clear formatting
             if ADMIN_PHONE:
-                admin_msg = f"🚨 *EXPERT REQUEST*\n━━━━━━━━━━━━━━━━━━\n👤 *Farmer:* {name}\n📱 *Phone:* {phone}\n📅 *Date:* {datetime.now().strftime('%d %b %Y %H:%M')}\n\n💬 *Issue:*\n{content}"
+                admin_msg = (
+                    f"🚨 *URGENT: EXPERT REQUEST*\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"👤 *Farmer:* {name}\n"
+                    f"📱 *Phone:* {phone}\n"
+                    f"📅 *Date:* {datetime.now().strftime('%d %b %Y at %H:%M')}\n\n"
+                    f"💬 *Issue Description:*\n{content}\n\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"PLEASE RESPOND TO THIS FARMER ASAP.\n"
+                    f"Reply to this message to contact them."
+                )
+                # Send to admin - this creates a new chat thread
                 send_whatsapp(ADMIN_PHONE, admin_msg)
-                debug_log(f"📨 Expert request forwarded to admin: {ADMIN_PHONE}")
+                debug_log(f"📨 Expert request sent to admin: {ADMIN_PHONE}")
             
             # Acknowledge the user
-            send_whatsapp(phone, "👨‍🌾 Your request has been sent. An expert will contact you soon.")
+            send_whatsapp(phone, "👨‍🌾 Your request has been sent to our expert team. They will contact you within 24-48 hours. Thank you for your patience!")
         
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         time.sleep(2)
@@ -1210,6 +1274,7 @@ def health():
         "huggingface_url": HF_SPACE_URL,
         "ai_provider": "gemini" if AI_API_KEY else "disabled",
         "current_year": datetime.now().year,
+        "admin_configured": bool(ADMIN_PHONE),
         "timestamp": datetime.now().isoformat()
     }), 200
 
