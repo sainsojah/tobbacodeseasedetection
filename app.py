@@ -1,5 +1,5 @@
 """
-Tobacco AI Assistant - Simplified Two-Message Version
+Tobacco AI Assistant - Two-Message Version (HF First, Then AI)
 """
 import os
 import json
@@ -7,6 +7,7 @@ import requests
 import time
 import base64
 import io
+import random
 from threading import Thread
 from flask import Flask, request, jsonify
 from datetime import datetime
@@ -47,14 +48,24 @@ vision_config = {"temperature": 0.7, "max_output_tokens": 300, "top_p": 0.8}
 safety = [{"category": f"HARM_CATEGORY_{c}", "threshold": "BLOCK_MEDIUM_AND_ABOVE"} 
           for c in ["HARASSMENT", "HATE_SPEECH", "SEXUALLY_EXPLICIT", "DANGEROUS_CONTENT"]]
 
-# Disease advice
+# Disease advice - Professional format
 DISEASE_ADVICE = {
-    "Black Shank": "💧 Improve drainage, remove infected plants, apply Ridomil",
-    "Black Spot": "🔴 Apply copper fungicide, remove infected leaves",
-    "Early Blight": "🍂 Apply Mancozeb, remove lower leaves, rotate crops",
-    "Late Blight": "🌧️ Remove plants immediately, apply Ridomil Gold",
-    "Tobacco Mosaic Virus": "⚠️ NO CURE - remove infected plants, wash hands",
-    "Healthy": "🌿 Great job! Continue good practices"
+    "Black Shank": "💧 *Black Shank*\n• Improve soil drainage immediately\n• Remove and destroy infected plants\n• Apply Ridomil fungicide\n• Rotate with maize next season",
+    "Black Spot": "🔴 *Black Spot*\n• Apply copper-based fungicide\n• Remove all infected leaves\n• Improve air circulation\n• Avoid overhead watering",
+    "Early Blight": "🍂 *Early Blight*\n• Apply Mancozeb fungicide\n• Remove lower leaves\n• Space plants properly\n• Practice crop rotation",
+    "Late Blight": "🌧️ *Late Blight*\n• Remove infected plants IMMEDIATELY\n• Apply Ridomil Gold\n• Use disease-free transplants\n• Avoid excessive moisture",
+    "Tobacco Mosaic Virus": "⚠️ *TMV - NO CURE*\n• Remove infected plants NOW\n• Wash hands with milk/soap\n• Disinfect all tools\n• Use resistant varieties next season",
+    "Leaf Spot": "📌 *Leaf Spot*\n• Apply copper fungicide\n• Remove affected leaves\n• Avoid wetting leaves\n• Improve air circulation",
+    "Powdery Mildew": "⚪ *Powdery Mildew*\n• Apply sulfur spray\n• Reduce nitrogen fertilizer\n• Improve air flow\n• Water at base only",
+    "Spider Mites": "🕷️ *Spider Mites*\n• Apply miticide\n• Maintain humidity\n• Avoid water stress\n• Check leaf undersides",
+    "Healthy": "🌿 *Healthy Leaf*\n• Continue good practices\n• Monitor regularly\n• Maintain balanced fertilizer\n• Keep up with watering schedule"
+}
+
+# Severity advice
+SEVERITY_ADVICE = {
+    "Mild": "🟢 *Mild* - Early stage. Monitor closely and begin treatment.",
+    "Moderate": "🟡 *Moderate* - Take action now to prevent spread.",
+    "Severe": "🔴 *Severe* - Act immediately! Remove affected plants."
 }
 
 # Firebase
@@ -65,7 +76,8 @@ if FIREBASE_CONFIG:
         firebase_admin.initialize_app(cred)
         db = firestore.client()
         debug_log("✅ Firebase connected")
-    except: pass
+    except Exception as e:
+        debug_log(f"❌ Firebase error: {e}")
 
 # User states
 STATES = {
@@ -76,16 +88,95 @@ STATES = {
     "DASHBOARD_MENU": "dashboard_menu"
 }
 
-# Guides
+# Full professional guides
+PLANTING_GUIDE = """🌱 *PLANTING GUIDE*
+━━━━━━━━━━━━━━━━━━
+• Bed size: 1m wide x 10m long
+• Plant population: 15,000 plants/ha
+• Spacing: 1.1-1.2m between ridges
+• Transplant: 6-8 weeks after sowing
+• Water immediately after planting
+• Gap filling within 7-10 days"""
+
+FERTILIZER_GUIDE = """🧪 *FERTILIZER GUIDE*
+━━━━━━━━━━━━━━━━━━
+• Basal: Compound L (5:14:7) 400-600 kg/ha
+• Top dressing 1: Ammonium Nitrate 150-200 kg/ha
+• Top dressing 2: Potassium Nitrate 100-150 kg/ha
+• Apply when soil is moist
+• Never place fertilizer directly under plant
+• Test soil pH (target 5.5-6.5)"""
+
+HARVESTING_GUIDE = """🌾 *HARVESTING GUIDE*
+━━━━━━━━━━━━━━━━━━
+• Harvest from bottom upward (priming)
+• 2-3 leaves per harvest, 4-6 primings total
+• Priming 1 (Sand leaves): 60-65 days
+• Priming 2-3 (Cutters): Best quality
+• Priming 4-5 (Leaf): Upper middle
+• Priming 6 (Tips): Highest nicotine
+
+Ripeness indicators:
+• Color: Light green to yellow-green
+• Texture: Slightly sticky
+• Midrib: Snaps cleanly
+• Tips: Curved down"""
+
+CURING_GUIDE = """🔥 *CURING GUIDE*
+━━━━━━━━━━━━━━━━━━
+Yellowing (32-38°C, 48hrs, 85-90% humidity)
+• Leaves turn yellow, chlorophyll breaks down
+
+Leaf drying (38-52°C, 48hrs, 70-80% humidity)
+• Lamina dries, color sets
+
+Midrib drying (52-60°C, 24hrs, 50-60% humidity)
+• Stems become brittle
+
+Killing out (60-71°C, 6hrs, 30-40% humidity)
+• Sterilize, fix final color"""
+
+MARKETING_GUIDE = f"""💰 *MARKETING {datetime.now().year}*
+━━━━━━━━━━━━━━━━━━
+• Opening: March {datetime.now().year}
+• Biometric ID REQUIRED
+• Register before February {datetime.now().year}
+• Grades: A (Premium), B (Good), C (Fair), D (Low)
+• Payment within 24 hours
+• Documents: ID, TIMB registration, grower number"""
+
 GUIDES = {
-    "1": "🌱 *PLANTING*\n• Spacing: 1.1-1.2m\n• Population: 15,000 plants/ha\n• Transplant: 6-8 weeks",
-    "2": "🧪 *FERTILIZER*\n• Basal: Compound L 400-600 kg/ha\n• Top dress: Ammonium Nitrate 150-200 kg/ha",
-    "3": "🌾 *HARVEST*\n• Harvest bottom up\n• 2-3 leaves per harvest\n• Priming 2-3 = Best quality",
-    "4": "🔥 *CURING*\n• Yellowing: 32-38°C, 48hrs\n• Leaf drying: 38-52°C\n• Killing out: 60-71°C",
-    "5": f"💰 *MARKETING {datetime.now().year}*\n• Opens: March {datetime.now().year}\n• Biometric ID required"
+    "1": PLANTING_GUIDE,
+    "2": FERTILIZER_GUIDE,
+    "3": HARVESTING_GUIDE,
+    "4": CURING_GUIDE,
+    "5": MARKETING_GUIDE
 }
 
-# Helpers
+# Tips and facts
+TIPS = [
+    "🚜 Rotate tobacco with maize or beans to prevent soil-borne diseases. This breaks pest cycles naturally.",
+    "💧 Water in the morning to reduce humidity and prevent fungal growth. Leaves dry before evening.",
+    "🔍 Check fields weekly for early signs of disease. Early detection saves crops.",
+    "🧪 Test soil pH before fertilizing. Tobacco needs pH 5.5-6.5 for optimal growth.",
+    "🌿 Remove infected leaves immediately to prevent disease spread.",
+    "🌱 Plant after good rains, not before - prevents damping off in seedlings.",
+    "🔥 Monitor curing temperatures closely. Keep at 32-38°C for yellowing phase."
+]
+
+FACTS = [
+    "🌍 Zimbabwe exports premium flue-cured tobacco to over 50 countries worldwide.",
+    "👨‍🌾 Tobacco farming supports over 500,000 Zimbabwean families directly and indirectly.",
+    "💰 Tobacco is Zimbabwe's 2nd largest foreign currency earner after gold.",
+    "🌱 Tobacco is related to tomatoes and potatoes - all in the Solanaceae family!",
+    "🔥 Curing turns tobacco leaves from green to gold in 6-7 days through careful temperature control.",
+    "📜 Tobacco has been cultivated in Zimbabwe for over 100 years commercially.",
+    "🌿 Zimbabwe's tobacco is known globally for its golden color and sweet flavor."
+]
+
+# ==============================
+# HELPER FUNCTIONS
+# ==============================
 def send_whatsapp(to, text):
     if not text: return False
     try:
@@ -95,7 +186,9 @@ def send_whatsapp(to, text):
                         timeout=15)
         debug_log(f"📤 Sent: {r.status_code}")
         return True
-    except: return False
+    except Exception as e:
+        debug_log(f"❌ Send error: {e}")
+        return False
 
 def get_user(phone):
     if not db: return None
@@ -111,11 +204,13 @@ def save_user(phone, data):
         return True
     except: return False
 
-def log_detection(phone, name, disease, confidence):
+def log_detection(phone, name, disease, confidence, severity=None):
     if not db: return
     try:
-        db.collection("detections").add({"phone": phone, "name": name, "disease": disease, 
-                                         "confidence": confidence, "timestamp": firestore.SERVER_TIMESTAMP})
+        data = {"phone": phone, "name": name, "disease": disease, "confidence": confidence, 
+                "timestamp": firestore.SERVER_TIMESTAMP}
+        if severity: data["severity"] = severity
+        db.collection("detections").add(data)
         debug_log(f"📊 Logged: {disease}")
     except: pass
 
@@ -156,7 +251,9 @@ def get_stats(phone):
         return {"scans": scans, "top": top, "healthy": healthy}
     except: return {"scans": 0, "top": "None", "healthy": 0}
 
-# Detection functions
+# ==============================
+# DETECTION FUNCTIONS
+# ==============================
 def detect_hf(image_bytes):
     try:
         debug_log("🔍 HF detection...")
@@ -164,14 +261,22 @@ def detect_hf(image_bytes):
         if r.status_code == 200:
             res = r.json()
             if res.get("success"):
+                # Estimate severity
+                conf = res.get("confidence", 0)
+                if conf > 85: severity = "Moderate"
+                elif conf > 60: severity = "Mild"
+                else: severity = "Unknown"
+                
                 return {
                     "disease": res.get("disease", "Unknown"),
-                    "confidence": res.get("confidence", 0),
+                    "confidence": conf,
                     "treatment": res.get("treatment", ""),
                     "is_healthy": res.get("is_healthy", False),
-                    "low_confidence": res.get("low_confidence", False)
+                    "low_confidence": res.get("low_confidence", False),
+                    "severity": severity
                 }
-    except: pass
+    except Exception as e:
+        debug_log(f"❌ HF error: {e}")
     return None
 
 def analyze_ai(image_bytes):
@@ -180,13 +285,21 @@ def analyze_ai(image_bytes):
         try:
             m = genai.GenerativeModel(model, generation_config=vision_config, safety_settings=safety)
             img_data = base64.b64encode(image_bytes).decode('utf-8')
-            prompt = "Analyze this tobacco leaf. Give: 1) Symptoms (2-3) 2) Possible disease 3) One short advice. Keep it brief."
+            prompt = """Analyze this tobacco leaf. Provide:
+1. Visible symptoms (2-3 points)
+2. Possible disease name
+3. Severity level (Mild/Moderate/Severe)
+4. One short actionable advice
+
+Keep it concise and professional."""
             resp = m.generate_content([prompt, {"mime_type": "image/jpeg", "data": img_data}])
             if resp and resp.text: return resp.text.strip()
         except: continue
     return None
 
-# Background processor - sends TWO messages
+# ==============================
+# BACKGROUND PROCESSOR - TWO MESSAGES
+# ==============================
 def process_image(phone, name, img_bytes):
     # Step 1: HF Detection
     debug_log(f"🔍 HF for {phone}")
@@ -199,59 +312,134 @@ def process_image(phone, name, img_bytes):
     # Send first message (detection result)
     disease = hf["disease"]
     conf = hf["confidence"]
+    severity = hf.get("severity", "Unknown")
     
     if hf["low_confidence"] or conf < 50:
-        msg1 = f"❓ *UNCLEAR DETECTION*\n⚠️ Confidence: {conf:.0f}%\n\n📸 Please send a clearer photo."
+        msg1 = (
+            f"❓ *UNCLEAR DETECTION*\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ Confidence: {conf:.0f}%\n\n"
+            f"📸 Please send a clearer photo with:\n"
+            f"• Good lighting\n"
+            f"• Close-up of the leaf\n"
+            f"• In focus"
+        )
     elif hf["is_healthy"]:
-        msg1 = f"🌿 *HEALTHY LEAF*\n✅ Confidence: {conf:.0f}%\n\n💚 Your plant looks healthy!"
+        msg1 = (
+            f"🌿 *HEALTHY LEAF DETECTED*\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"✅ Confidence: {conf:.0f}%\n\n"
+            f"💚 Great job, {name}! Your plant looks healthy.\n\n"
+            f"Continue good farming practices:\n"
+            f"• Regular monitoring\n"
+            f"• Balanced fertilizer\n"
+            f"• Proper watering"
+        )
     else:
-        advice = DISEASE_ADVICE.get(disease, "Monitor closely")
-        msg1 = f"🌿 *{disease}*\n📊 Confidence: {conf:.0f}%\n\n💡 *Advice:* {advice}"
+        msg1 = (
+            f"🌿 *{disease.upper()} DETECTED*\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Confidence: {conf:.0f}%\n"
+        )
+        if severity != "Unknown":
+            msg1 += f"\n{SEVERITY_ADVICE.get(severity, '')}\n"
+        if disease in DISEASE_ADVICE:
+            msg1 += f"\n💡 *Advice:*\n{DISEASE_ADVICE[disease]}"
+        elif hf["treatment"]:
+            msg1 += f"\n💡 *Treatment:*\n{hf['treatment']}"
     
     send_whatsapp(phone, msg1)
-    log_detection(phone, name, disease, conf)
+    log_detection(phone, name, disease, conf, severity)
     
-    # Step 2: AI Analysis (if confidence < 85% and not healthy)
-    if conf < 85 and not hf["is_healthy"]:
+    # Step 2: AI Analysis (only if not healthy and confidence < 85%)
+    if not hf["is_healthy"] and conf < 85:
         debug_log(f"🤖 AI for {phone}")
         send_whatsapp(phone, f"🔬 AI analyzing symptoms...")
         ai = analyze_ai(img_bytes)
         if ai:
-            send_whatsapp(phone, f"🔬 *AI ANALYSIS*\n{ai}")
+            msg2 = f"🔬 *AI VERIFICATION*\n━━━━━━━━━━━━━━━━━━\n{ai}"
+            send_whatsapp(phone, msg2)
     
     time.sleep(2)
     send_main_menu(phone)
 
-# Menu functions
+# ==============================
+# MENU FUNCTIONS
+# ==============================
 def send_main_menu(phone):
-    send_whatsapp(phone, 
-        "🌿 *TOBACCO AI MAIN MENU*\n━━━━━━━━━━━━━━━━━━\n"
+    menu = (
+        "🌿 *TOBACCO AI MAIN MENU*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
         "1️⃣ *Disease Detection* - Send photo\n"
         "2️⃣ *Farming Practices* - Guides & AI advice\n"
-        "3️⃣ *My Dashboard* - Stats & Tips\n"
+        "3️⃣ *My Dashboard* - Stats, History, Tips\n"
         "4️⃣ *Leaf Grading* - Quality assessment\n"
         "5️⃣ *Expert Help* - Agronomist & AI\n"
         "6️⃣ *Feedback* - Send comments\n\n"
-        "Reply with number (e.g., *1*)")
+        "Reply with number (e.g., *1*)\n"
+        "Or type *help* for commands"
+    )
+    send_whatsapp(phone, menu)
 
 def send_farming_menu(phone):
-    send_whatsapp(phone,
-        "🌱 *FARMING PRACTICES*\n━━━━━━━━━━━━━━━━━━\n"
-        "1️⃣ Planting Guide\n2️⃣ Fertilizer Guide\n3️⃣ Harvesting Guide\n"
-        "4️⃣ Curing Guide\n5️⃣ Marketing Guide\n6️⃣ Ask AI\n\n0️⃣ Main Menu")
+    menu = (
+        "🌱 *FARMING PRACTICES*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "1️⃣ *Planting Guide*\n"
+        "2️⃣ *Fertilizer Guide*\n"
+        "3️⃣ *Harvesting Guide*\n"
+        "4️⃣ *Curing Guide*\n"
+        "5️⃣ *Marketing Guide*\n"
+        "6️⃣ *Ask AI*\n\n"
+        "0️⃣ Main Menu"
+    )
+    send_whatsapp(phone, menu)
 
 def send_dashboard(phone, name, stats):
-    send_whatsapp(phone,
-        f"📊 *{name}'s DASHBOARD*\n━━━━━━━━━━━━━━━━━━\n"
-        f"📝 Scans: {stats['scans']}\n🦠 Common: {stats['top']}\n🌿 Healthy: {stats['healthy']}\n"
-        f"━━━━━━━━━━━━━━━━━━\n1️⃣ History\n2️⃣ Daily Tip\n3️⃣ Fun Fact\n\n0️⃣ Main Menu")
+    dashboard = (
+        "📊 *MY DASHBOARD*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"👤 *Farmer:* {name}\n"
+        f"📱 *Phone:* {phone}\n\n"
+        f"📝 *Total Scans:* {stats['scans']}\n"
+        f"🦠 *Common Issue:* {stats['top']}\n"
+        f"🌿 *Healthy Leaves:* {stats['healthy']}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "1️⃣ *View History*\n"
+        "2️⃣ *Daily Tip*\n"
+        "3️⃣ *Fun Fact*\n\n"
+        "0️⃣ Main Menu"
+    )
+    send_whatsapp(phone, dashboard)
 
 def send_expert_menu(phone):
-    send_whatsapp(phone,
-        "👨‍🌾 *EXPERT HELP*\n━━━━━━━━━━━━━━━━━━\n"
-        "1️⃣ AI Advisor\n2️⃣ Human Expert\n\n0️⃣ Main Menu")
+    menu = (
+        "👨‍🌾 *EXPERT HELP*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "1️⃣ *AI Advisor* - Ask anything\n"
+        "2️⃣ *Human Expert* - Talk to agronomist\n\n"
+        "0️⃣ Main Menu"
+    )
+    send_whatsapp(phone, menu)
 
-# Message handler
+def get_user_history(phone, limit=5):
+    if not db: return []
+    try:
+        docs = db.collection("detections").where("phone", "==", phone).order_by("timestamp", direction="DESCENDING").limit(limit).stream()
+        history = []
+        for doc in docs:
+            data = doc.to_dict()
+            if data.get("timestamp"):
+                ts = data["timestamp"]
+                if hasattr(ts, "strftime"):
+                    data["date"] = ts.strftime("%d %b %Y")
+            history.append(data)
+        return history
+    except: return []
+
+# ==============================
+# MESSAGE HANDLER
+# ==============================
 def handle_message(phone, type, content):
     debug_log(f"📨 {type} from {phone}")
     
@@ -260,113 +448,209 @@ def handle_message(phone, type, content):
     # New user
     if not user:
         save_user(phone, {"state": STATES["AWAITING_NAME"], "phone": phone})
-        return send_whatsapp(phone, "🌿 Welcome! Please enter your *name*:")
+        return send_whatsapp(phone, "🌿 *Welcome to Tobacco AI!*\n\nI help tobacco farmers detect diseases and learn best practices.\n\nPlease enter your *name* to continue:")
 
     state = user.get("state", STATES["ACTIVE"])
     name = user.get("name", "Farmer")
 
     # Awaiting name
     if state == STATES["AWAITING_NAME"] and type == "text":
-        save_user(phone, {"name": content.strip().title(), "state": STATES["ACTIVE"]})
-        return send_whatsapp(phone, f"✅ Hi {content.strip().title()}! Send photo or type *menu*")
+        clean_name = content.strip().title()
+        save_user(phone, {"name": clean_name, "state": STATES["ACTIVE"]})
+        welcome = f"✅ *Welcome, {clean_name}!*\n\nWhat would you like to do?\n\n• Send a *photo* to detect diseases\n• Type *menu* for all options"
+        return send_whatsapp(phone, welcome)
 
-    # Menu handlers
+    # Expert menu
     if state == STATES["EXPERT_MENU"] and type == "text":
         cmd = content.lower().strip()
-        if cmd == "0": save_user(phone, {"state": STATES["ACTIVE"]}); return send_main_menu(phone)
-        elif cmd == "1": save_user(phone, {"state": STATES["AWAITING_AI"]}); return send_whatsapp(phone, "🤖 Ask your question (or *cancel*):")
-        elif cmd == "2": save_user(phone, {"state": STATES["AWAITING_EXPERT"]}); return send_whatsapp(phone, "👨‍🌾 Describe issue (or *cancel*):")
-        else: return send_whatsapp(phone, "❌ Choose 1, 2, or 0")
+        if cmd == "0":
+            save_user(phone, {"state": STATES["ACTIVE"]})
+            return send_main_menu(phone)
+        elif cmd == "1":
+            save_user(phone, {"state": STATES["AWAITING_AI"]})
+            return send_whatsapp(phone, "🤖 *AI Advisor*\n\nAsk me anything about tobacco farming.\n\nType your question below (or *cancel* to go back):")
+        elif cmd == "2":
+            save_user(phone, {"state": STATES["AWAITING_EXPERT"]})
+            return send_whatsapp(phone, "👨‍🌾 *Talk to an Agronomist*\n\nDescribe your farming issue. A human expert will respond soon.\n\nType your message (or *cancel* to go back):")
+        else:
+            return send_whatsapp(phone, "❌ Please choose 1 or 2 (or *0* for Main Menu).")
 
+    # Dashboard menu
     if state == STATES["DASHBOARD_MENU"] and type == "text":
         cmd = content.lower().strip()
-        if cmd == "0": save_user(phone, {"state": STATES["ACTIVE"]}); return send_main_menu(phone)
-        elif cmd == "1": send_whatsapp(phone, "📋 History feature coming soon!")
-        elif cmd == "2": send_whatsapp(phone, f"💡 *Tip*\n{random.choice(['🚜 Rotate crops', '💧 Water early morning', '🔍 Check fields weekly'])}")
-        elif cmd == "3": send_whatsapp(phone, f"🎲 *Fact*\n{random.choice(['🌍 Exports to 50+ countries', '👨‍🌾 Supports 500k families', '💰 2nd largest forex earner'])}")
-        else: return send_whatsapp(phone, "❌ Choose 1-3 or 0")
-        stats = get_stats(phone)
-        return send_dashboard(phone, name, stats)
+        if cmd == "0":
+            save_user(phone, {"state": STATES["ACTIVE"]})
+            return send_main_menu(phone)
+        elif cmd == "1":
+            history = get_user_history(phone)
+            if not history:
+                msg = "📋 *No scan history yet.*\n\nSend a photo to start!"
+            else:
+                msg = "📋 *YOUR SCAN HISTORY*\n━━━━━━━━━━━━━━━━━━\n"
+                for i, h in enumerate(history[:5], 1):
+                    msg += f"{i}. *{h.get('disease', 'Unknown')}* - {h.get('confidence', 0):.1f}%\n"
+                    if h.get('date'): msg += f"   📅 {h.get('date')}\n"
+            send_whatsapp(phone, msg)
+            stats = get_stats(phone)
+            return send_dashboard(phone, name, stats)
+        elif cmd == "2":
+            tip = random.choice(TIPS)
+            send_whatsapp(phone, f"💡 *Daily Tip*\n\n{tip}")
+            stats = get_stats(phone)
+            return send_dashboard(phone, name, stats)
+        elif cmd == "3":
+            fact = random.choice(FACTS)
+            send_whatsapp(phone, f"🎲 *Did You Know?*\n\n{fact}")
+            stats = get_stats(phone)
+            return send_dashboard(phone, name, stats)
+        else:
+            return send_whatsapp(phone, "❌ Please choose 1, 2, or 3 (or *0* for Main Menu).")
 
+    # Awaiting AI question
     if state == STATES["AWAITING_AI"] and type == "text":
-        if content.lower() == "cancel": save_user(phone, {"state": STATES["ACTIVE"]}); return send_main_menu(phone)
-        send_whatsapp(phone, f"🤔 Thinking...")
-        send_whatsapp(phone, f"AI advisor coming soon!")
+        if content.lower() == "cancel":
+            save_user(phone, {"state": STATES["ACTIVE"]})
+            return send_main_menu(phone)
+        send_whatsapp(phone, f"🤔 AI Advisor is thinking...")
+        # Simple response for now
+        send_whatsapp(phone, f"📚 For farming advice, please check the *Farming Practices* menu (option 2).\n\nYou can also type *ai your question* for specific queries.")
         save_user(phone, {"state": STATES["ACTIVE"]})
+        time.sleep(2)
         return send_main_menu(phone)
 
+    # Farming menu
     if state == STATES["FARMING_MENU"] and type == "text":
         cmd = content.lower().strip()
-        if cmd == "0": save_user(phone, {"state": STATES["ACTIVE"]}); return send_main_menu(phone)
-        elif cmd in GUIDES: send_whatsapp(phone, GUIDES[cmd]); return send_farming_menu(phone)
-        elif cmd == "6": save_user(phone, {"state": STATES["AWAITING_AI"]}); return send_whatsapp(phone, "🤖 Ask your question (or *cancel*):")
-        else: return send_farming_menu(phone)
+        if cmd == "0":
+            save_user(phone, {"state": STATES["ACTIVE"]})
+            return send_main_menu(phone)
+        elif cmd in GUIDES:
+            send_whatsapp(phone, GUIDES[cmd])
+            return send_farming_menu(phone)
+        elif cmd == "6":
+            save_user(phone, {"state": STATES["AWAITING_AI"]})
+            return send_whatsapp(phone, "🤖 *AI Advisor*\n\nAsk me anything about tobacco farming.\n\nType your question below (or *cancel* to go back):")
+        else:
+            send_whatsapp(phone, "❌ Please choose 1-6 (or *0* for Main Menu).")
+            return send_farming_menu(phone)
 
+    # Leaf grading (simplified for now)
     if state == STATES["WAITING_GRADE"] and type == "image":
-        send_whatsapp(phone, f"🔍 Analyzing...")
+        send_whatsapp(phone, f"🔍 Analyzing leaf quality, {name}...")
         img = download_image(content)
-        if not img: send_whatsapp(phone, "❌ Download failed")
-        else: send_whatsapp(phone, "📊 Grading coming soon!")
+        if not img:
+            send_whatsapp(phone, "❌ Failed to download image.")
+        else:
+            send_whatsapp(phone, "📊 *Leaf Grading*\n\nThis feature is being upgraded. Please use Disease Detection for now.")
         save_user(phone, {"state": STATES["ACTIVE"]})
-        time.sleep(1)
+        time.sleep(2)
         return send_main_menu(phone)
 
-    # Disease detection - main feature
+    # DISEASE DETECTION - MAIN FEATURE
     if state == STATES["WAITING_IMAGE"] and type == "image":
         # Cooldown
         now = time.time()
         if phone in LAST_SCAN and now - LAST_SCAN[phone] < COOLDOWN:
             wait = int(COOLDOWN - (now - LAST_SCAN[phone]))
-            return send_whatsapp(phone, f"⏱️ Please wait {wait}s")
+            return send_whatsapp(phone, f"⏱️ Please wait {wait} seconds between scans.")
         LAST_SCAN[phone] = now
         
-        send_whatsapp(phone, f"📷 Processing...")
+        send_whatsapp(phone, f"📷 Processing your image, {name}...")
         img = download_image(content)
         if not img:
-            send_whatsapp(phone, "❌ Download failed")
+            send_whatsapp(phone, "❌ Failed to download image. Please try again.")
             save_user(phone, {"state": STATES["ACTIVE"]})
             return send_main_menu(phone)
         
-        # Process in background
+        # Process in background - THIS SENDS TWO MESSAGES (HF first, then AI)
         Thread(target=process_image, args=(phone, name, img), daemon=True).start()
+        
+        # User will receive:
+        # 1. "🔍 Analyzing with AI model..." (from process_image)
+        # 2. HF detection result (after ~20s)
+        # 3. AI analysis (after ~25s, if confidence < 85%)
+        
         save_user(phone, {"state": STATES["ACTIVE"]})
         return
 
     # Feedback
     if state == STATES["AWAITING_FEEDBACK"] and type == "text":
-        if content.lower() == "cancel": send_whatsapp(phone, "Cancelled")
+        if content.lower() == "cancel":
+            send_whatsapp(phone, "Feedback cancelled.")
         else:
-            if ADMIN_PHONE: send_whatsapp(ADMIN_PHONE, f"📝 *Feedback* {phone}\n{content}")
-            send_whatsapp(phone, "✅ Thanks!")
+            if ADMIN_PHONE:
+                admin_msg = f"📝 *FEEDBACK RECEIVED*\n━━━━━━━━━━━━━━━━━━\n👤 *From:* {name}\n📱 *Phone:* {phone}\n📅 *Date:* {datetime.now().strftime('%d %b %Y %H:%M')}\n\n💬 *Message:*\n{content}"
+                send_whatsapp(ADMIN_PHONE, admin_msg)
+            send_whatsapp(phone, "✅ Thank you! Your feedback has been sent to our team.")
         save_user(phone, {"state": STATES["ACTIVE"]})
+        time.sleep(2)
         return send_main_menu(phone)
 
     # Expert request
     if state == STATES["AWAITING_EXPERT"] and type == "text":
-        if content.lower() == "cancel": send_whatsapp(phone, "Cancelled")
+        if content.lower() == "cancel":
+            send_whatsapp(phone, "Expert request cancelled.")
         else:
-            if ADMIN_PHONE: send_whatsapp(ADMIN_PHONE, f"🚨 *Expert* {phone}\n{content}")
-            send_whatsapp(phone, "✅ Expert will respond")
+            if ADMIN_PHONE:
+                admin_msg = f"🚨 *EXPERT REQUEST*\n━━━━━━━━━━━━━━━━━━\n👤 *Farmer:* {name}\n📱 *Phone:* {phone}\n📅 *Date:* {datetime.now().strftime('%d %b %Y %H:%M')}\n\n💬 *Issue:*\n{content}"
+                send_whatsapp(ADMIN_PHONE, admin_msg)
+            send_whatsapp(phone, "👨‍🌾 Your request has been sent. An expert will contact you soon.")
         save_user(phone, {"state": STATES["ACTIVE"]})
+        time.sleep(2)
         return send_main_menu(phone)
 
     # Text commands
     if type == "text":
         cmd = content.lower().strip()
-        if cmd in ["menu", "0"]: return send_main_menu(phone)
-        elif cmd == "1": save_user(phone, {"state": STATES["WAITING_IMAGE"]}); send_whatsapp(phone, "📸 Send clear photo of leaf")
-        elif cmd == "2": save_user(phone, {"state": STATES["FARMING_MENU"]}); return send_farming_menu(phone)
-        elif cmd == "3": stats = get_stats(phone); save_user(phone, {"state": STATES["DASHBOARD_MENU"]}); return send_dashboard(phone, name, stats)
-        elif cmd == "4": save_user(phone, {"state": STATES["WAITING_GRADE"]}); send_whatsapp(phone, "🏷️ Send photo of cured leaf")
-        elif cmd == "5": save_user(phone, {"state": STATES["EXPERT_MENU"]}); return send_expert_menu(phone)
-        elif cmd == "6": save_user(phone, {"state": STATES["AWAITING_FEEDBACK"]}); send_whatsapp(phone, "📝 Type feedback (or *cancel*):")
+        
+        if cmd in ["menu", "0", "main"]:
+            return send_main_menu(phone)
+        elif cmd in ["1", "detect"]:
+            save_user(phone, {"state": STATES["WAITING_IMAGE"]})
+            send_whatsapp(phone, "📸 *Disease Detection*\n\nSend a clear photo of the tobacco leaf.\n\nTips: Good lighting, close-up, steady camera")
+        elif cmd in ["2", "farming"]:
+            save_user(phone, {"state": STATES["FARMING_MENU"]})
+            return send_farming_menu(phone)
+        elif cmd in ["3", "dashboard"]:
+            stats = get_stats(phone)
+            save_user(phone, {"state": STATES["DASHBOARD_MENU"]})
+            return send_dashboard(phone, name, stats)
+        elif cmd in ["4", "grade"]:
+            save_user(phone, {"state": STATES["WAITING_GRADE"]})
+            send_whatsapp(phone, "🏷️ *LEAF QUALITY GRADING*\n\nSend a clear photo of your cured leaf.\n\nTips: Good lighting, flat surface")
+        elif cmd in ["5", "expert"]:
+            save_user(phone, {"state": STATES["EXPERT_MENU"]})
+            return send_expert_menu(phone)
+        elif cmd in ["6", "feedback"]:
+            save_user(phone, {"state": STATES["AWAITING_FEEDBACK"]})
+            send_whatsapp(phone, "📝 *Send Feedback*\n\nType your message below (or *cancel*):")
         elif cmd.startswith("ai "):
-            q = cmd[3:].strip()
-            if q: send_whatsapp(phone, f"🤔 Thinking..."); send_whatsapp(phone, f"AI advisor coming soon!"); time.sleep(1); return send_main_menu(phone)
-        elif cmd == "help": send_whatsapp(phone, "📚 Commands: menu, 1-6, ai [question]")
-        else: send_whatsapp(phone, "Type *menu* for options")
+            question = cmd[3:].strip()
+            if question:
+                send_whatsapp(phone, f"🤔 AI Advisor is thinking...")
+                send_whatsapp(phone, f"📚 For farming advice, please check the *Farming Practices* menu (option 2).")
+                time.sleep(2)
+                return send_main_menu(phone)
+        elif cmd == "help":
+            help_text = (
+                "📚 *QUICK HELP*\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "• *menu* - Main menu\n"
+                "• *1* - Disease detection\n"
+                "• *2* - Farming practices\n"
+                "• *3* - Dashboard\n"
+                "• *4* - Leaf grading\n"
+                "• *5* - Expert help\n"
+                "• *6* - Feedback\n"
+                "• *ai [question]* - Ask AI"
+            )
+            send_whatsapp(phone, help_text)
+        else:
+            send_whatsapp(phone, "❓ Command not recognized.\n\nType *menu* to see options")
 
-# Flask routes
+# ==============================
+# FLASK ROUTES
+# ==============================
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
@@ -376,15 +660,27 @@ def webhook():
     
     try:
         data = request.json
-        msg = data.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {}).get("messages", [{}])[0]
-        if not msg: return jsonify({"status": "ok"}), 200
+        entry = data.get("entry", [{}])[0]
+        changes = entry.get("changes", [{}])[0]
+        value = changes.get("value", {})
         
+        if "statuses" in value:
+            return jsonify({"status": "ok"}), 200
+        
+        messages = value.get("messages", [])
+        if not messages:
+            return jsonify({"status": "ok"}), 200
+        
+        msg = messages[0]
         from_num = msg.get("from")
         msg_type = msg.get("type")
         
-        if msg_type == "text": content = msg.get("text", {}).get("body", "")
-        elif msg_type == "image": content = msg.get("image", {}).get("id", "")
-        else: return jsonify({"status": "ok"}), 200
+        if msg_type == "text":
+            content = msg.get("text", {}).get("body", "")
+        elif msg_type == "image":
+            content = msg.get("image", {}).get("id", "")
+        else:
+            return jsonify({"status": "ok"}), 200
         
         handle_message(from_num, msg_type, content)
         return jsonify({"status": "ok"}), 200
