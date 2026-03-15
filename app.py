@@ -72,13 +72,12 @@ task_queue = Queue()
 MAX_QUEUE_SIZE = 20
 
 # ==============================
-# PERSISTENT HTTP SESSIONS (Reused connections = faster)
+# PERSISTENT HTTP SESSIONS
 # ==============================
 def create_persistent_session():
     """Create persistent HTTP session with connection pooling"""
     session = requests.Session()
     
-    # Configure connection pooling
     adapter = HTTPAdapter(
         pool_connections=20,
         pool_maxsize=20,
@@ -164,7 +163,7 @@ def trim_message(text, max_length=WHATSAPP_SAFE_LIMIT):
     return text
 
 # ==============================
-# ASYNC DELAY (Non-blocking)
+# ASYNC DELAY
 # ==============================
 async def async_delay(seconds):
     """Non-blocking delay"""
@@ -175,21 +174,18 @@ def sync_delay(seconds):
     time.sleep(seconds)
 
 # ==============================
-# IMAGE COMPRESSION (Reduce size = faster)
+# IMAGE COMPRESSION
 # ==============================
 def compress_image(image_bytes, max_size=768):
     """Compress image to reduce size and speed up processing"""
     try:
         img = Image.open(io.BytesIO(image_bytes))
         
-        # Convert to RGB if necessary
         if img.mode in ('RGBA', 'P'):
             img = img.convert('RGB')
         
-        # Calculate new size while maintaining aspect ratio
         img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
         
-        # Save compressed image
         buffer = io.BytesIO()
         img.save(buffer, format="JPEG", quality=85, optimize=True)
         
@@ -199,7 +195,7 @@ def compress_image(image_bytes, max_size=768):
         return compressed
     except Exception as e:
         debug_log(f"⚠️ Compression failed: {e}")
-        return image_bytes  # Return original if compression fails
+        return image_bytes
 
 # ==============================
 # FIREBASE CONNECTION
@@ -365,12 +361,10 @@ def get_user_statistics(phone):
         }
     
     try:
-        # Get disease detections
         disease_docs = db.collection("detections")\
             .where("phone", "==", phone)\
             .stream()
         
-        # Get leaf grades
         grade_docs = db.collection("leaf_grades")\
             .where("phone", "==", phone)\
             .stream()
@@ -381,7 +375,6 @@ def get_user_statistics(phone):
         healthy_count = 0
         grade_values = []
         
-        # Process disease detections
         for doc in disease_docs:
             data = doc.to_dict()
             total_scans += 1
@@ -392,7 +385,6 @@ def get_user_statistics(phone):
             else:
                 disease_counts[disease] = disease_counts.get(disease, 0) + 1
         
-        # Process leaf grades
         grade_map = {"A": 4, "B": 3, "C": 2, "D": 1}
         for doc in grade_docs:
             data = doc.to_dict()
@@ -401,7 +393,6 @@ def get_user_statistics(phone):
             if grade and grade in grade_map:
                 grade_values.append(grade_map[grade])
         
-        # Calculate average grade
         avg_grade = "N/A"
         if grade_values:
             avg_score = sum(grade_values) / len(grade_values)
@@ -414,7 +405,6 @@ def get_user_statistics(phone):
             else:
                 avg_grade = "D"
         
-        # Find most common disease
         top_disease = "None"
         if disease_counts:
             top_disease = max(disease_counts, key=disease_counts.get)
@@ -466,6 +456,26 @@ def estimate_severity(disease_area, leaf_area):
         return "Severe"
 
 # ==============================
+# OFFLINE DISEASE ADVICE
+# ==============================
+def get_offline_disease_advice(disease):
+    """Get disease advice from local knowledge base"""
+    if disease in DISEASE_KNOWLEDGE_BASE:
+        info = DISEASE_KNOWLEDGE_BASE[disease]
+        return f"""📚 *{disease} - Quick Reference*
+
+🔍 *Cause:*
+{info['cause']}
+
+💊 *Treatment:*
+{info['treatment']}
+
+🛡️ *Prevention:*
+{info['prevention']}"""
+    else:
+        return f"ℹ️ Ask *ai {disease}* for advice"
+
+# ==============================
 # AI ADVISOR WITH MODEL FALLBACK
 # ==============================
 def ask_ai_advisor(question):
@@ -473,12 +483,10 @@ def ask_ai_advisor(question):
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return "🤖 AI advisor not configured"
     
-    # Check cache first
     for disease in DISEASE_ADVICE_CACHE.keys():
         if disease.lower() in question.lower():
             return f"📚 *{disease}*\n\n{DISEASE_ADVICE_CACHE[disease]}"
     
-    # Try each model
     for model_name in GEMINI_MODELS:
         try:
             debug_log(f"🔄 Trying: {model_name}")
@@ -545,7 +553,6 @@ Market: [Premium/Good/Fair/Poor]"""
             if response and response.text:
                 analysis = response.text.strip()
                 
-                # Extract grade
                 grade = "Unknown"
                 for line in analysis.split('\n'):
                     if line.lower().startswith('grade:'):
@@ -634,7 +641,7 @@ def get_gemini_fact():
     return fact
 
 # ==============================
-# HUGGINGFACE DETECTION (Using persistent session)
+# HUGGINGFACE DETECTION
 # ==============================
 def call_huggingface_detection(image_bytes):
     """Call Hugging Face Space with persistent session and 30s timeout"""
@@ -642,11 +649,10 @@ def call_huggingface_detection(image_bytes):
         debug_log("🔄 HF detection starting...")
         files = {'file': ('image.jpg', image_bytes, 'image/jpeg')}
         
-        # Use persistent session with 30s timeout
         response = hf_session.post(
             f"{HF_SPACE_URL}/predict",
             files=files,
-            timeout=30  # HF needs ~20s, giving 30s buffer
+            timeout=30
         )
         
         if response.status_code == 200:
@@ -683,14 +689,13 @@ def call_huggingface_detection(image_bytes):
         return None
 
 # ==============================
-# AI VISION ANALYSIS (Parallel capable)
+# AI VISION ANALYSIS
 # ==============================
 def ai_vision_analysis(image_bytes, hf_disease=None, confidence=0):
     """AI vision analysis for verification"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return None
     
-    # Skip AI for high confidence
     if confidence > 85 and hf_disease and hf_disease in DISEASE_ADVICE_CACHE:
         debug_log(f"🤖 Skipping AI: High confidence ({confidence}%)")
         return None
@@ -745,112 +750,13 @@ Respond in this exact format:
 def process_detection_parallel(image_bytes):
     """Run HF detection and AI vision in parallel"""
     
-    # Submit both tasks to thread pool
     future_hf = executor.submit(call_huggingface_detection, image_bytes)
     future_ai = executor.submit(ai_vision_analysis, image_bytes)
     
-    # Wait for both with 30s timeout
     hf_result = future_hf.result(timeout=30)
-    ai_result = future_ai.result(timeout=25)  # AI slightly shorter timeout
+    ai_result = future_ai.result(timeout=25)
     
     return hf_result, ai_result
-
-# ==============================
-# BACKGROUND WORKER
-# ==============================
-def background_worker():
-    """Background worker to process tasks from queue"""
-    debug_log("👷 Background worker started")
-    
-    while True:
-        try:
-            # Get task from queue
-            task = task_queue.get()
-            
-            phone = task["phone"]
-            name = task["name"]
-            image_bytes = task["image"]
-            
-            debug_log(f"👷 Processing task for {phone}")
-            
-            # Send progress update
-            send_whatsapp(phone, f"🤖 AI verifying symptoms...")
-            
-            # Run parallel processing
-            hf_result, ai_result = process_detection_parallel(image_bytes)
-            
-            if not hf_result:
-                send_whatsapp(phone, "❌ Analysis failed. Please try another photo.")
-            else:
-                # Build response
-                disease = hf_result["disease"]
-                confidence = hf_result["confidence"]
-                severity = hf_result.get("severity", "Unknown")
-                is_healthy = hf_result["is_healthy"]
-                low_confidence = hf_result["low_confidence"]
-                
-                if low_confidence or confidence < 50 or disease == "Unknown":
-                    response = (
-                        f"❓ *UNCLEAR DETECTION*\n"
-                        f"━━━━━━━━━━━━━━━━━━\n"
-                        f"⚠️ Confidence: {confidence:.0f}%\n\n"
-                        f"📸 Please send a clearer photo with:\n"
-                        f"• Good lighting\n"
-                        f"• Close-up of the leaf\n"
-                        f"• In focus\n\n"
-                        f"Type *menu* for other options."
-                    )
-                elif is_healthy:
-                    response = (
-                        f"🌿 *HEALTHY LEAF DETECTED*\n"
-                        f"━━━━━━━━━━━━━━━━━━\n"
-                        f"✅ Confidence: {confidence:.0f}%\n\n"
-                        f"💚 Great job, {name}! Your plant looks healthy.\n\n"
-                        f"Continue good farming practices:\n"
-                        f"• Regular monitoring\n"
-                        f"• Balanced fertilizer\n"
-                        f"• Proper watering"
-                    )
-                else:
-                    response = (
-                        f"🌿 *{disease.upper()} DETECTED*\n"
-                        f"━━━━━━━━━━━━━━━━━━\n"
-                        f"📊 Confidence: {confidence:.0f}%\n"
-                        f"{get_confidence_message(confidence)}\n"
-                    )
-                    
-                    if severity != "Unknown":
-                        response += f"\n{SEVERITY_ADVICE.get(severity, '')}\n"
-                    
-                    # Add AI verification if available
-                    if ai_result:
-                        response += f"\n🔬 *AI Verification:*\n{ai_result}\n"
-                    
-                    # Add treatment advice
-                    if disease in DISEASE_ADVICE_CACHE:
-                        response += f"\n💡 *Advice:*\n{DISEASE_ADVICE_CACHE[disease]}"
-                    elif hf_result["treatment"]:
-                        response += f"\n💡 *Treatment:*\n{hf_result['treatment']}"
-                
-                # Send result
-                send_whatsapp(phone, response)
-                
-                # Log to Firebase
-                log_detection(phone, name, disease, confidence, severity)
-            
-            # Send main menu after delay
-            sync_delay(3)
-            send_main_menu(phone)
-            
-            # Cleanup
-            cleanup_memory(image_bytes, hf_result, ai_result)
-            
-            # Mark task as done
-            task_queue.task_done()
-            
-        except Exception as e:
-            debug_log(f"❌ Worker error: {e}")
-            task_queue.task_done()
 
 # ==============================
 # LOG DETECTION TO FIREBASE
@@ -877,7 +783,7 @@ def log_detection(phone, name, disease, confidence, severity=None):
         debug_log(f"❌ Log error: {e}")
 
 # ==============================
-# SEND WHATSAPP (Using persistent session)
+# SEND WHATSAPP
 # ==============================
 def send_whatsapp(to, text):
     """Send WhatsApp message with persistent session"""
@@ -899,7 +805,6 @@ def send_whatsapp(to, text):
     }
     
     try:
-        # Use persistent session
         response = whatsapp_session.post(url, json=payload, headers=headers, timeout=15)
         debug_log(f"📤 Sent {len(safe_text)} chars: {response.status_code}")
         return True
@@ -948,7 +853,6 @@ def download_image(media_id):
     try:
         debug_log(f"📥 Downloading: {media_id}")
         
-        # Get media URL
         url_resp = whatsapp_session.get(
             f"https://graph.facebook.com/v18.0/{media_id}",
             headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
@@ -962,7 +866,6 @@ def download_image(media_id):
         if not media_url:
             return None
         
-        # Download image
         img_resp = whatsapp_session.get(
             media_url,
             headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
@@ -973,7 +876,6 @@ def download_image(media_id):
             image_bytes = img_resp.content
             debug_log(f"✅ Downloaded: {len(image_bytes)} bytes")
             
-            # Compress image for faster processing
             compressed = compress_image(image_bytes)
             return compressed
             
@@ -1000,7 +902,6 @@ def cleanup_memory(*args):
 # MENU FUNCTIONS
 # ==============================
 def send_main_menu(phone):
-    """Full interactive main menu with descriptions"""
     menu = (
         "🌿 *TOBACCO AI MAIN MENU*\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -1016,7 +917,6 @@ def send_main_menu(phone):
     return send_whatsapp(phone, menu)
 
 def send_farming_menu(phone):
-    """Farming practices submenu"""
     menu = (
         "🌱 *FARMING PRACTICES*\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -1032,7 +932,6 @@ def send_farming_menu(phone):
     return send_whatsapp(phone, menu)
 
 def send_dashboard_menu(phone, name, stats):
-    """Dashboard with stats including grading"""
     dashboard = (
         "📊 *MY DASHBOARD*\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -1052,7 +951,6 @@ def send_dashboard_menu(phone, name, stats):
     return send_whatsapp(phone, dashboard)
 
 def send_expert_menu(phone):
-    """Expert help menu"""
     menu = (
         "👨‍🌾 *EXPERT HELP*\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -1069,7 +967,6 @@ def get_user_history(phone, limit=5):
         return []
     
     try:
-        # Get both collections
         disease_docs = db.collection("detections")\
             .where("phone", "==", phone)\
             .order_by("timestamp", direction="DESCENDING")\
@@ -1084,7 +981,6 @@ def get_user_history(phone, limit=5):
         
         history = []
         
-        # Process disease detections
         for doc in disease_docs:
             data = doc.to_dict()
             if data.get("timestamp"):
@@ -1094,7 +990,6 @@ def get_user_history(phone, limit=5):
             data["record_type"] = "disease"
             history.append(data)
         
-        # Process leaf grades
         for doc in grade_docs:
             data = doc.to_dict()
             if data.get("timestamp"):
@@ -1104,13 +999,109 @@ def get_user_history(phone, limit=5):
             data["record_type"] = "grade"
             history.append(data)
         
-        # Sort by timestamp (newest first)
         history.sort(key=lambda x: x.get("timestamp", 0) if hasattr(x.get("timestamp"), "timestamp") else 0, reverse=True)
         
         return history[:limit]
     except Exception as e:
         debug_log(f"❌ History error: {e}")
         return []
+
+# ==============================
+# BACKGROUND WORKER FUNCTION
+# ==============================
+def background_worker():
+    """Background worker to process tasks from queue"""
+    debug_log("👷 Background worker started")
+    
+    while True:
+        try:
+            task = task_queue.get()
+            
+            phone = task["phone"]
+            name = task["name"]
+            image_bytes = task["image"]
+            
+            debug_log(f"👷 Processing task for {phone} - Queue size: {task_queue.qsize()}")
+            
+            send_whatsapp(phone, f"🤖 AI verifying symptoms...")
+            
+            hf_result, ai_result = process_detection_parallel(image_bytes)
+            
+            if not hf_result:
+                send_whatsapp(phone, "❌ Analysis failed. Please try another photo.")
+            else:
+                disease = hf_result["disease"]
+                confidence = hf_result["confidence"]
+                severity = hf_result.get("severity", "Unknown")
+                is_healthy = hf_result["is_healthy"]
+                low_confidence = hf_result["low_confidence"]
+                
+                if low_confidence or confidence < 50 or disease == "Unknown":
+                    response = (
+                        f"❓ *UNCLEAR DETECTION*\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"⚠️ Confidence: {confidence:.0f}%\n\n"
+                        f"📸 Please send a clearer photo with:\n"
+                        f"• Good lighting\n"
+                        f"• Close-up of the leaf\n"
+                        f"• In focus\n\n"
+                        f"Type *menu* for other options."
+                    )
+                elif is_healthy:
+                    response = (
+                        f"🌿 *HEALTHY LEAF DETECTED*\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"✅ Confidence: {confidence:.0f}%\n\n"
+                        f"💚 Great job, {name}! Your plant looks healthy.\n\n"
+                        f"Continue good farming practices:\n"
+                        f"• Regular monitoring\n"
+                        f"• Balanced fertilizer\n"
+                        f"• Proper watering"
+                    )
+                else:
+                    response = (
+                        f"🌿 *{disease.upper()} DETECTED*\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"📊 Confidence: {confidence:.0f}%\n"
+                        f"{get_confidence_message(confidence)}\n"
+                    )
+                    
+                    if severity != "Unknown":
+                        response += f"\n{SEVERITY_ADVICE.get(severity, '')}\n"
+                    
+                    if ai_result:
+                        response += f"\n🔬 *AI Verification:*\n{ai_result}\n"
+                    
+                    if disease in DISEASE_ADVICE_CACHE:
+                        response += f"\n💡 *Advice:*\n{DISEASE_ADVICE_CACHE[disease]}"
+                    elif hf_result["treatment"]:
+                        response += f"\n💡 *Treatment:*\n{hf_result['treatment']}"
+                
+                send_whatsapp(phone, response)
+                log_detection(phone, name, disease, confidence, severity)
+            
+            sync_delay(3)
+            send_main_menu(phone)
+            
+            cleanup_memory(image_bytes, hf_result, ai_result)
+            task_queue.task_done()
+            
+        except Exception as e:
+            debug_log(f"❌ Worker error: {e}")
+            import traceback
+            traceback.print_exc()
+            task_queue.task_done()
+
+# ==============================
+# START WORKERS FUNCTION
+# ==============================
+def start_workers():
+    """Start multiple background workers"""
+    worker_count = 3
+    for i in range(worker_count):
+        worker_thread = Thread(target=background_worker, daemon=True)
+        worker_thread.start()
+        debug_log(f"👷 Worker {i+1} started with thread ID: {worker_thread.ident}")
 
 # ==============================
 # MESSAGE HANDLER
@@ -1120,7 +1111,6 @@ def handle_message(phone, msg_type, content):
     
     user = get_user(phone)
     
-    # NEW USER
     if not user:
         save_user(phone, {"state": USER_STATES["AWAITING_NAME"], "phone": phone})
         return send_whatsapp(phone, 
@@ -1131,7 +1121,6 @@ def handle_message(phone, msg_type, content):
     state = user.get("state", USER_STATES["ACTIVE"])
     name = user.get("name", "Farmer")
 
-    # AWAITING NAME
     if state == USER_STATES["AWAITING_NAME"] and msg_type == "text":
         clean_name = content.strip().title()
         save_user(phone, {"name": clean_name, "state": USER_STATES["ACTIVE"]})
@@ -1143,7 +1132,6 @@ def handle_message(phone, msg_type, content):
         )
         return send_whatsapp(phone, welcome_msg)
 
-    # EXPERT MENU HANDLER
     if state == USER_STATES["EXPERT_MENU"] and msg_type == "text":
         cmd = content.lower().strip()
         
@@ -1165,7 +1153,6 @@ def handle_message(phone, msg_type, content):
         else:
             return send_whatsapp(phone, "❌ Please choose 1 or 2 (or *0* for Main Menu).")
     
-    # DASHBOARD MENU HANDLER
     if state == USER_STATES["DASHBOARD_MENU"] and msg_type == "text":
         cmd = content.lower().strip()
         
@@ -1202,7 +1189,6 @@ def handle_message(phone, msg_type, content):
         else:
             return send_whatsapp(phone, "❌ Please choose 1, 2, or 3 (or *0* for Main Menu).")
 
-    # AWAITING AI QUESTION
     if state == USER_STATES["AWAITING_AI_QUESTION"] and msg_type == "text":
         if content.lower() == "cancel":
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
@@ -1215,7 +1201,6 @@ def handle_message(phone, msg_type, content):
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         return send_main_menu(phone)
 
-    # FARMING PRACTICES SUBMENU HANDLER
     if state == USER_STATES["FARMING_MENU"] and msg_type == "text":
         cmd = content.lower().strip()
         
@@ -1244,7 +1229,6 @@ def handle_message(phone, msg_type, content):
             send_whatsapp(phone, "❌ Please choose 1-6 (or *0* for Main Menu).")
             return send_farming_menu(phone)
 
-    # LEAF GRADING
     if state == USER_STATES["WAITING_GRADE_IMAGE"] and msg_type == "image":
         debug_log(f"📸 Processing grading")
         send_whatsapp(phone, f"🔍 Analyzing leaf quality, {name}...")
@@ -1255,17 +1239,12 @@ def handle_message(phone, msg_type, content):
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
             return send_main_menu(phone)
         
-        # Get AI grading
         grade, analysis, grade_letter = grade_leaf_with_ai(image_bytes)
         
-        # Format response
         response = f"📊 *LEAF GRADING RESULTS*\n━━━━━━━━━━━━━━━━━━\n"
         response += analysis
         
-        # Log to Firebase
         log_leaf_grade(phone, name, grade_letter, analysis)
-        
-        # Send result
         send_whatsapp(phone, response)
         
         cleanup_memory(image_bytes)
@@ -1274,10 +1253,8 @@ def handle_message(phone, msg_type, content):
         send_main_menu(phone)
         return
 
-    # DISEASE DETECTION - NOW USING BACKGROUND QUEUE
     if state == USER_STATES["WAITING_IMAGE"] and msg_type == "image":
         
-        # Cooldown check
         current_time = time.time()
         if phone in LAST_SCAN:
             time_since_last = current_time - LAST_SCAN[phone]
@@ -1289,11 +1266,9 @@ def handle_message(phone, msg_type, content):
         
         debug_log(f"📸 Detection from {phone}")
         
-        # Check queue size
         if task_queue.qsize() > MAX_QUEUE_SIZE:
             return send_whatsapp(phone, "⚠️ Server is busy. Please try again in a few minutes.")
         
-        # Download image
         send_whatsapp(phone, f"📷 Processing your image, {name}...")
         image_bytes = download_image(content)
         
@@ -1302,21 +1277,17 @@ def handle_message(phone, msg_type, content):
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
             return send_main_menu(phone)
         
-        # Add to queue for background processing
         task_queue.put({
             "phone": phone,
             "name": name,
             "image": image_bytes
         })
         
-        # Confirm to user
         send_whatsapp(phone, f"🔍 Analyzing with AI model...")
         
-        # No need to wait - worker will handle
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         return
 
-    # AWAITING FEEDBACK
     if state == USER_STATES["AWAITING_FEEDBACK"] and msg_type == "text":
         if content.lower() == "cancel":
             send_whatsapp(phone, "Feedback cancelled.")
@@ -1337,7 +1308,6 @@ def handle_message(phone, msg_type, content):
         sync_delay(2)
         return send_main_menu(phone)
 
-    # AWAITING EXPERT
     if state == USER_STATES["AWAITING_EXPERT"] and msg_type == "text":
         if content.lower() == "cancel":
             send_whatsapp(phone, "Expert request cancelled.")
@@ -1358,7 +1328,6 @@ def handle_message(phone, msg_type, content):
         sync_delay(2)
         return send_main_menu(phone)
 
-    # TEXT COMMANDS
     if msg_type == "text":
         cmd = content.lower().strip()
         
@@ -1418,17 +1387,6 @@ def handle_message(phone, msg_type, content):
             send_whatsapp(phone, 
                 "❓ Command not recognized.\n\n"
                 "Type *menu* to see options")
-
-# ==============================
-# START BACKGROUND WORKERS
-# ==============================
-def start_workers():
-    """Start multiple background workers"""
-    worker_count = 3  # Process 3 images simultaneously
-    for i in range(worker_count):
-        worker_thread = Thread(target=background_worker, daemon=True)
-        worker_thread.start()
-        debug_log(f"👷 Worker {i+1} started")
 
 # ==============================
 # FLASK ROUTES
@@ -1499,7 +1457,7 @@ def home():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     
-    # Start background workers
+    # START WORKERS HERE
     start_workers()
     
     debug_log(f"🚀 Starting Tobacco AI Assistant on port {port}")
@@ -1509,5 +1467,4 @@ if __name__ == "__main__":
     debug_log(f"⏱️ Cooldown: {COOLDOWN_SECONDS}s")
     debug_log(f"👷 Workers: 3 parallel processors")
     debug_log(f"📊 Firebase Collections: users, detections, leaf_grades")
-    debug_log(f"⚡ Parallel processing: ENABLED (30s timeout)")
     app.run(host="0.0.0.0", port=port, debug=False)
