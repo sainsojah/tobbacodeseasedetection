@@ -1,6 +1,6 @@
 """
 Tobacco AI Assistant - Render WhatsApp Bot
-Fixed: Complete responses with proper waiting for ALL AI interactions
+
 """
 import os
 import json
@@ -32,7 +32,7 @@ WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
 FIREBASE_CONFIG = os.environ.get("FIREBASE_CONFIG")
-ADMIN_PHONE = os.environ.get("ADMIN_PHONE_NUMBER")
+ADMIN_PHONE = os.environ.get("ADMIN_PHONE_NUMBER")  # This will work with country code
 HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "https://saintsouldier-tobacco-ai.hf.space")
 
 # AI API Keys
@@ -262,11 +262,11 @@ Midrib drying (52-60°C, 24hrs, 50-60% humidity)
 Killing out (60-71°C, 6hrs, 30-40% humidity)
 • Sterilize, fix final color"""
 
-MARKETING_GUIDE = """💰 *MARKETING 2026*
+MARKETING_GUIDE = f"""💰 *MARKETING {datetime.now().year}*
 ━━━━━━━━━━━━━━━━━━
-• Opening: March 2026
+• Opening: March {datetime.now().year}
 • Biometric ID REQUIRED
-• Register before February 2026
+• Register before February {datetime.now().year}
 • Grades: A (Premium), B (Good), C (Fair), D (Low)
 • Payment within 24 hours
 • Documents: ID, TIMB registration, grower number"""
@@ -369,10 +369,10 @@ def get_offline_disease_advice(disease):
         return f"ℹ️ For specific advice on {disease}, please ask the AI advisor (type *ai your question*)"
 
 # ==============================
-# IMPROVED AI ADVISOR WITH WORD LIMIT
+# IMPROVED AI ADVISOR WITH CURRENT DATE
 # ==============================
 def ask_ai_advisor(question):
-    """AI advisor with word limit instruction"""
+    """AI advisor with current date reference"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return "🤖 AI advisor not configured. Please add API key."
     
@@ -382,6 +382,11 @@ def ask_ai_advisor(question):
         if disease.lower() in question.lower():
             disease_found = disease
             break
+    
+    # Get current date for context
+    current_date = datetime.now().strftime("%B %d, %Y")
+    current_year = datetime.now().year
+    current_month = datetime.now().strftime("%B")
     
     # Try each model in sequence until one works
     for model_name in GEMINI_MODELS:
@@ -395,18 +400,21 @@ def ask_ai_advisor(question):
                 safety_settings=safety_settings
             )
             
-            # Prompt with 150-word limit instruction
-            prompt = f"""You are a Zimbabwe tobacco expert. Answer the following question.
+            # Prompt with current date instruction
+            prompt = f"""You are a Zimbabwe tobacco expert. Today's date is {current_date} ({current_month} {current_year}).
 
-IMPORTANT: Keep your response under 150 words total. Be concise but complete.
+Answer the following question using CURRENT information (2025-{current_year}) only. DO NOT reference 2024 or older data unless specifically asked about historical trends.
 
 Question: {question}
 
-Guidelines:
-1. Include key points only
-2. Use bullet points for clarity
-3. End with a complete sentence
-4. Stay under 150 words"""
+IMPORTANT GUIDELINES:
+1. Use ONLY current season data (2025-{current_year})
+2. Keep response under 150 words total
+3. Include key points only
+4. Use bullet points for clarity
+5. End with a complete sentence
+
+If asked about prices, volumes, or market conditions - provide estimates based on CURRENT {current_year} season projections."""
 
             # Generate response
             response = model.generate_content(prompt)
@@ -428,7 +436,7 @@ Guidelines:
     if disease_found:
         return get_offline_disease_advice(disease_found)
     else:
-        return "⚠️ AI service temporarily unavailable. Please try again later or use the farming guides (type *menu*)."
+        return f"⚠️ AI service temporarily unavailable. Please try again later or use the farming guides (type *menu*)."
 
 # ==============================
 # AI LEAF GRADING
@@ -502,13 +510,14 @@ def get_gemini_tip():
             time.sleep(0.5)
             
             current_month = datetime.now().strftime("%B")
+            current_year = datetime.now().year
             
             if current_month in ["November", "December", "January", "February", "March"]:
-                season = "rainy/planting season"
+                season = f"rainy/planting season {current_year}"
             elif current_month in ["April", "May", "June", "July"]:
-                season = "harvesting/curing season"
+                season = f"harvesting/curing season {current_year}"
             else:
-                season = "land preparation season"
+                season = f"land preparation season {current_year}"
             
             model = genai.GenerativeModel(
                 model_name=model_name,
@@ -516,7 +525,7 @@ def get_gemini_tip():
                 safety_settings=safety_settings
             )
             
-            prompt = f"ONE practical farming tip for Zimbabwe tobacco farmers during {season}. 2-3 sentences. Start with emoji."
+            prompt = f"ONE practical farming tip for Zimbabwe tobacco farmers during {season}. 2-3 sentences. Start with emoji. Use {current_year} context only."
             response = model.generate_content(prompt)
             
             if response and response.text:
@@ -528,9 +537,9 @@ def get_gemini_tip():
             continue
     
     return random.choice([
-        "🌱 Monitor your fields daily for early disease signs.",
-        "💧 Water early morning to prevent fungal growth.",
-        "🔍 Check lower leaves regularly for pests and diseases."
+        f"🌱 Monitor your fields daily for early disease signs this {datetime.now().year} season.",
+        f"💧 Water early morning to prevent fungal growth during {datetime.now().year} planting.",
+        f"🔍 Check lower leaves regularly for pests and diseases in {datetime.now().year}."
     ])
 
 # ==============================
@@ -555,7 +564,7 @@ def get_gemini_fact():
                 safety_settings=safety_settings
             )
             
-            prompt = "ONE interesting fact about Zimbabwe tobacco farming. 2-3 sentences. Start with emoji."
+            prompt = f"ONE interesting fact about Zimbabwe tobacco farming for {datetime.now().year}. 2-3 sentences. Start with emoji."
             response = model.generate_content(prompt)
             
             if response and response.text:
@@ -567,7 +576,7 @@ def get_gemini_fact():
             continue
     
     return random.choice([
-        "🌱 Zimbabwe's tobacco industry employs over 500,000 people.",
+        f"🌱 Zimbabwe's tobacco industry employs over 500,000 people in {datetime.now().year}.",
         "📜 Tobacco has been cultivated for over 8,000 years.",
         "🌍 Zimbabwe exports tobacco to over 50 countries."
     ])
@@ -815,10 +824,10 @@ def send_expert_menu(phone):
     return send_whatsapp(phone, expert_menu)
 
 # ==============================
-# FIXED MESSAGE HANDLER - BOTH AI PATHS WORKING
+# MESSAGE HANDLER - WITH 20 SECOND DELAY
 # ==============================
 def handle_message(phone, msg_type, content):
-    """Main message handler with improved response handling"""
+    """Main message handler with improved response handling and 20s delay"""
     debug_log(f"📨 Handling message: type={msg_type}, phone={phone}")
     
     user = get_user(phone)
@@ -903,7 +912,7 @@ def handle_message(phone, msg_type, content):
         else:
             return send_whatsapp(phone, "❌ Please choose 1, 2, or 3 (or *0* for Main Menu).")
 
-    # AWAITING AI QUESTION - FIXED WITH DELAY
+    # AWAITING AI QUESTION - WITH 20 SECOND DELAY
     if state == USER_STATES["AWAITING_AI_QUESTION"] and msg_type == "text":
         if content.lower() == "cancel":
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
@@ -918,8 +927,9 @@ def handle_message(phone, msg_type, content):
         # Send the AI response
         send_whatsapp_with_retry(phone, result)
         
-        # Wait 2 seconds to ensure user sees the full response
-        time.sleep(2)
+        # Wait 20 seconds to ensure user sees the full response
+        debug_log(f"⏱️ Waiting 20 seconds before showing menu...")
+        time.sleep(20)
         
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         return send_main_menu(phone)
@@ -971,7 +981,7 @@ def handle_message(phone, msg_type, content):
         else:
             send_whatsapp(phone, "❌ Could not analyze the image. Please try again.")
         
-        time.sleep(1)
+        time.sleep(20)  # 20 second delay
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         send_main_menu(phone)
         gc.collect()
@@ -1035,34 +1045,48 @@ def handle_message(phone, msg_type, content):
             offline_advice = get_offline_disease_advice(disease)
             send_whatsapp(phone, offline_advice + "\n\nType *ai your question* for more advice")
         
-        time.sleep(1)
+        time.sleep(20)  # 20 second delay
         send_main_menu(phone)
         gc.collect()
         return
 
-    # AWAITING FEEDBACK
+    # AWAITING FEEDBACK - WITH ADMIN NOTIFICATION
     if state == USER_STATES["AWAITING_FEEDBACK"] and msg_type == "text":
         if content.lower() == "cancel":
             send_whatsapp(phone, "Feedback cancelled.")
         else:
+            # Send feedback to admin
             if ADMIN_PHONE:
-                send_whatsapp(ADMIN_PHONE, f"📝 *Feedback from {name}*\n{phone}\n\n{content}")
-            send_whatsapp(phone, "✅ Thank you! Your feedback has been sent.")
+                admin_msg = f"📝 *FEEDBACK RECEIVED*\n━━━━━━━━━━━━━━━━━━\n👤 *From:* {name}\n📱 *Phone:* {phone}\n📅 *Date:* {datetime.now().strftime('%d %b %Y %H:%M')}\n\n💬 *Message:*\n{content}"
+                send_whatsapp(ADMIN_PHONE, admin_msg)
+                debug_log(f"📨 Feedback forwarded to admin: {ADMIN_PHONE}")
+            
+            # Thank the user
+            send_whatsapp(phone, "✅ Thank you! Your feedback has been sent to our team.")
+        
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
+        time.sleep(2)
         return send_main_menu(phone)
 
-    # AWAITING EXPERT
+    # AWAITING EXPERT - WITH ADMIN NOTIFICATION
     if state == USER_STATES["AWAITING_EXPERT"] and msg_type == "text":
         if content.lower() == "cancel":
             send_whatsapp(phone, "Expert request cancelled.")
         else:
+            # Send expert request to admin
             if ADMIN_PHONE:
-                send_whatsapp(ADMIN_PHONE, f"🚨 *EXPERT REQUEST from {name}*\n{phone}\n\n{content}")
+                admin_msg = f"🚨 *EXPERT REQUEST*\n━━━━━━━━━━━━━━━━━━\n👤 *Farmer:* {name}\n📱 *Phone:* {phone}\n📅 *Date:* {datetime.now().strftime('%d %b %Y %H:%M')}\n\n💬 *Issue:*\n{content}"
+                send_whatsapp(ADMIN_PHONE, admin_msg)
+                debug_log(f"📨 Expert request forwarded to admin: {ADMIN_PHONE}")
+            
+            # Acknowledge the user
             send_whatsapp(phone, "👨‍🌾 Your request has been sent. An expert will contact you soon.")
+        
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
+        time.sleep(2)
         return send_main_menu(phone)
 
-    # TEXT COMMANDS - FIXED AI COMMAND WITH DELAY
+    # TEXT COMMANDS - FIXED AI COMMAND WITH 20 SECOND DELAY
     if msg_type == "text":
         cmd = content.lower().strip()
         
@@ -1103,8 +1127,9 @@ def handle_message(phone, msg_type, content):
                 result = ask_ai_advisor(question)
                 send_whatsapp_with_retry(phone, result)
                 
-                # Wait 2 seconds before showing menu
-                time.sleep(2)
+                # Wait 20 seconds before showing menu
+                debug_log(f"⏱️ Waiting 20 seconds before showing menu...")
+                time.sleep(20)
                 return send_main_menu(phone)
             else:
                 send_whatsapp(phone, "❓ Example: *ai how to prevent black shank*")
@@ -1184,6 +1209,7 @@ def health():
         "firebase": db is not None,
         "huggingface_url": HF_SPACE_URL,
         "ai_provider": "gemini" if AI_API_KEY else "disabled",
+        "current_year": datetime.now().year,
         "timestamp": datetime.now().isoformat()
     }), 200
 
@@ -1200,8 +1226,10 @@ if __name__ == "__main__":
     debug_log(f"🚀 Starting Tobacco AI Assistant on port {port}")
     debug_log(f"🤖 Using Hugging Face Space: {HF_SPACE_URL}")
     debug_log(f"🧠 Available Gemini models: {', '.join(GEMINI_MODELS)}")
+    debug_log(f"📱 Admin phone: {ADMIN_PHONE if ADMIN_PHONE else 'Not configured'}")
+    debug_log(f"📅 Current year: {datetime.now().year}")
     if AI_API_KEY and AI_API_KEY != "your_api_key_here":
-        debug_log(f"✅ AI Advisor enabled with 150-word limit and 2-second delay for ALL responses")
+        debug_log(f"✅ AI Advisor enabled with CURRENT YEAR focus and 20-second delay")
     else:
         debug_log(f"ℹ️ AI Advisor disabled - set AI_API_KEY environment variable")
     app.run(host="0.0.0.0", port=port, debug=False)
