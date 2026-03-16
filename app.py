@@ -159,7 +159,9 @@ USER_STATES = {
     "WAITING_GRADE_IMAGE": "waiting_grade_image",
     "EXPERT_MENU": "expert_menu",
     "DASHBOARD_MENU": "dashboard_menu",
-    "WAITING_AI_VISION": "waiting_ai_vision"  # New state for AI vision option
+    "WAITING_AI_VISION": "waiting_ai_vision",
+    "WAITING_AI_VISION_DISEASE": "waiting_ai_vision_disease",  # ADD THIS
+    "WAITING_AI_VISION_CURING": "waiting_ai_vision_curing"     # ADD THIS
 }
 
 # ==============================
