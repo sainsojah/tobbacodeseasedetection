@@ -1,4 +1,4 @@
-
+# -*- coding: utf-8 -*-
 Tobacco AI Assistant - Render WhatsApp Bot
 Fixed: Complete responses, admin feedback working, increased token limits
 """
