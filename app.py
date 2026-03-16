@@ -158,7 +158,8 @@ USER_STATES = {
     "FARMING_MENU": "farming_menu",
     "WAITING_GRADE_IMAGE": "waiting_grade_image",
     "EXPERT_MENU": "expert_menu",
-    "DASHBOARD_MENU": "dashboard_menu"
+    "DASHBOARD_MENU": "dashboard_menu",
+    "WAITING_AI_VISION": "waiting_ai_vision"  # New state for AI vision option
 }
 
 # ==============================
@@ -437,6 +438,110 @@ If asked about prices, volumes, or market conditions - provide estimates based o
         return get_offline_disease_advice(disease_found)
     else:
         return f"⚠️ AI service temporarily unavailable. Please try again later or use the farming guides (type *menu*)."
+
+# ==============================
+# NEW: AI VISION FOR DISEASE DETECTION
+# ==============================
+def ai_vision_disease_detection(image_bytes):
+    """Use AI vision to detect diseases in tobacco leaf"""
+    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
+        return None, "AI vision not configured"
+    
+    for model_name in GEMINI_MODELS:
+        try:
+            time.sleep(1)
+            debug_log(f"🔄 AI Vision Disease Detection with model: {model_name}")
+            
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config=vision_config,
+                safety_settings=safety_settings
+            )
+            
+            image_data = base64.b64encode(image_bytes).decode('utf-8')
+            
+            prompt = """You are a Zimbabwe tobacco disease expert. Analyze this leaf image and provide:
+
+🌿 *AI VISION DISEASE ANALYSIS*
+━━━━━━━━━━━━━━━━━━
+• Detected Disease: [Name the disease you observe]
+• Confidence Level: [High/Medium/Low]
+• Visible Symptoms: [List 2-3 symptoms you see]
+• Severity: [Mild/Moderate/Severe]
+• Recommended Action: [One sentence advice]
+
+Be specific and accurate. If you cannot identify any disease, state "Healthy" or "Unclear"."""
+
+            response = model.generate_content([
+                prompt,
+                {"mime_type": "image/jpeg", "data": image_data}
+            ])
+            
+            if response and response.text:
+                analysis = response.text.strip()
+                debug_log(f"✅ AI Vision Disease Detection complete")
+                return "disease", analysis
+            else:
+                debug_log(f"⚠️ Empty response from {model_name}")
+                continue
+                
+        except Exception as e:
+            debug_log(f"❌ Error with {model_name}: {str(e)[:100]}")
+            continue
+    
+    return None, "⚠️ AI Vision service unavailable. Please try again later."
+
+# ==============================
+# NEW: AI VISION FOR CURING MONITORING
+# ==============================
+def ai_vision_curing_monitoring(image_bytes):
+    """Use AI vision to monitor tobacco curing progress"""
+    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
+        return None, "AI vision not configured"
+    
+    for model_name in GEMINI_MODELS:
+        try:
+            time.sleep(1)
+            debug_log(f"🔄 AI Vision Curing Monitoring with model: {model_name}")
+            
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config=vision_config,
+                safety_settings=safety_settings
+            )
+            
+            image_data = base64.b64encode(image_bytes).decode('utf-8')
+            
+            prompt = """You are a Zimbabwe tobacco curing expert. Analyze this leaf image and assess the curing progress:
+
+🔥 *CURING MONITORING REPORT*
+━━━━━━━━━━━━━━━━━━
+• Current Stage: [Yellowing/Leaf Drying/Midrib Drying/Killing Out/Complete]
+• Color Assessment: [Describe the color - e.g., "Golden yellow, uniform"]
+• Moisture Level: [Too wet/Optimal/Too dry]
+• Quality Indicators: [Any signs of over-curing, under-curing, or damage]
+• Recommendations: [What to do next in the curing process]
+
+Provide practical advice for the farmer based on what you see."""
+
+            response = model.generate_content([
+                prompt,
+                {"mime_type": "image/jpeg", "data": image_data}
+            ])
+            
+            if response and response.text:
+                analysis = response.text.strip()
+                debug_log(f"✅ AI Vision Curing Monitoring complete")
+                return "curing", analysis
+            else:
+                debug_log(f"⚠️ Empty response from {model_name}")
+                continue
+                
+        except Exception as e:
+            debug_log(f"❌ Error with {model_name}: {str(e)[:100]}")
+            continue
+    
+    return None, "⚠️ AI Vision service unavailable. Please try again later."
 
 # ==============================
 # IMPROVED AI LEAF GRADING WITH BETTER RETRY LOGIC
@@ -811,7 +916,7 @@ def send_main_menu(phone):
         "2️⃣ *Farming Practices* - Guides & AI advice\n"
         "3️⃣ *My Dashboard* - Stats, History, Tips\n"
         "4️⃣ *Leaf Grading* - Quality assessment\n"
-        "5️⃣ *Expert Help* - Agronomist & AI\n"
+        "5️⃣ *AI Vision Options* - Disease/Curing\n"  # Updated menu option
         "6️⃣ *Feedback* - Send comments\n\n"
         "Reply with number (e.g., *1*)\n"
         "Or type *help* for commands"
@@ -829,7 +934,6 @@ def send_farming_menu(phone):
         "4️⃣ *Curing Guide*\n"
         "5️⃣ *Marketing Guide*\n"
         "6️⃣ *Ask AI*\n\n"
-        "Reply with number (1-6)\n"
         "0️⃣ Main Menu"
     )
     return send_whatsapp(phone, farming_menu)
@@ -859,13 +963,26 @@ def send_expert_menu(phone):
         "━━━━━━━━━━━━━━━━━━\n"
         "1️⃣ *AI Advisor* - Ask anything\n"
         "2️⃣ *Human Expert* - Talk to agronomist\n\n"
-        "Reply with number (1 or 2)\n"
         "0️⃣ Main Menu"
     )
     return send_whatsapp(phone, expert_menu)
 
 # ==============================
-# MESSAGE HANDLER - WITH 20 SECOND DELAY
+# NEW: AI VISION OPTIONS MENU
+# ==============================
+def send_ai_vision_menu(phone):
+    """Send AI vision options menu"""
+    menu = (
+        "🔬 *AI VISION OPTIONS*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "1️⃣ *Disease Detection* - AI analyzes leaf for diseases\n"
+        "2️⃣ *Curing Monitor* - Check curing progress\n\n"
+        "0️⃣ Main Menu"
+    )
+    return send_whatsapp(phone, menu)
+
+# ==============================
+# MESSAGE HANDLER - WITH UPDATES
 # ==============================
 def handle_message(phone, msg_type, content):
     """Main message handler with improved response handling and 20s delay"""
@@ -1069,7 +1186,12 @@ def handle_message(phone, msg_type, content):
         debug_log(f"✅ Detection result: {disease} ({confidence:.1f}%) Severity: {severity}")
         log_detection(phone, name, disease, confidence)
         
-        if result["low_confidence"]:
+        # IMPROVEMENT: If confidence < 50%, recommend AI Vision
+        if confidence < 50:
+            response = f"⚠️ *Low Confidence ({confidence:.1f}%)*\n\n{confidence_msg}\n\n"
+            response += "🔬 *Recommendation:* Try our AI Vision for a more detailed analysis.\n"
+            response += "Type *5* then *1* from the main menu for AI Vision disease detection."
+        elif result["low_confidence"]:
             response = f"⚠️ *Low Confidence ({confidence:.1f}%)*\n\n{confidence_msg}\n\nPlease upload a clearer photo."
         elif result["is_healthy"]:
             response = f"🎉 *Healthy Leaf Detected!*\n\nConfidence: {confidence:.1f}%\n{confidence_msg}\n\nGreat job!"
@@ -1083,12 +1205,95 @@ def handle_message(phone, msg_type, content):
         
         send_whatsapp(phone, response)
         
-        if not result["is_healthy"] and not result["low_confidence"]:
+        if not result["is_healthy"] and not result["low_confidence"] and confidence >= 50:
             offline_advice = get_offline_disease_advice(disease)
             send_whatsapp(phone, offline_advice + "\n\nType *ai your question* for more advice")
         
         debug_log(f"⏱️ Waiting 20 seconds before showing menu...")
         time.sleep(20)  # 20 second delay
+        send_main_menu(phone)
+        gc.collect()
+        return
+
+    # NEW: AI VISION OPTIONS MENU HANDLER
+    if state == USER_STATES["EXPERT_MENU"] and msg_type == "text" and content == "5":
+        save_user(phone, {"state": USER_STATES["ACTIVE"]})
+        return send_ai_vision_menu(phone)
+
+    # NEW: AI VISION SUBMENU HANDLER
+    if state == USER_STATES["ACTIVE"] and msg_type == "text" and content == "5":
+        save_user(phone, {"state": USER_STATES["WAITING_AI_VISION"]})
+        return send_ai_vision_menu(phone)
+    
+    if state == USER_STATES["WAITING_AI_VISION"] and msg_type == "text":
+        cmd = content.lower().strip()
+        
+        if cmd == "0":
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            return send_main_menu(phone)
+        elif cmd == "1":
+            save_user(phone, {"state": USER_STATES["WAITING_AI_VISION_DISEASE"]})
+            return send_whatsapp(phone, 
+                "🔬 *AI Vision Disease Detection*\n\n"
+                "Send a clear photo of the tobacco leaf.\n\n"
+                "I'll analyze it with AI vision for disease identification.")
+        elif cmd == "2":
+            save_user(phone, {"state": USER_STATES["WAITING_AI_VISION_CURING"]})
+            return send_whatsapp(phone, 
+                "🔥 *Curing Monitor*\n\n"
+                "Send a clear photo of your leaf during curing.\n\n"
+                "I'll assess the curing stage and provide recommendations.")
+        else:
+            return send_whatsapp(phone, "❌ Please choose 1, 2, or 0")
+
+    # NEW: AI VISION DISEASE DETECTION
+    if state == USER_STATES["WAITING_AI_VISION_DISEASE"] and msg_type == "image":
+        debug_log(f"📸 Processing AI Vision Disease Detection from {phone}")
+        send_whatsapp(phone, f"🔬 Analyzing with AI Vision, {name}...")
+        
+        image_bytes = download_image(content)
+        if not image_bytes:
+            debug_log("❌ Download failed")
+            send_whatsapp(phone, "❌ Failed to download image. Please try again.")
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            return send_main_menu(phone)
+        
+        result_type, analysis = ai_vision_disease_detection(image_bytes)
+        
+        if analysis:
+            send_whatsapp_with_retry(phone, analysis)
+        else:
+            send_whatsapp(phone, "❌ Could not analyze the image. Please try again.")
+        
+        debug_log(f"⏱️ Waiting 10 seconds before showing menu...")
+        time.sleep(10)
+        save_user(phone, {"state": USER_STATES["ACTIVE"]})
+        send_main_menu(phone)
+        gc.collect()
+        return
+
+    # NEW: AI VISION CURING MONITORING
+    if state == USER_STATES["WAITING_AI_VISION_CURING"] and msg_type == "image":
+        debug_log(f"📸 Processing AI Vision Curing Monitoring from {phone}")
+        send_whatsapp(phone, f"🔥 Analyzing curing progress, {name}...")
+        
+        image_bytes = download_image(content)
+        if not image_bytes:
+            debug_log("❌ Download failed")
+            send_whatsapp(phone, "❌ Failed to download image. Please try again.")
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            return send_main_menu(phone)
+        
+        result_type, analysis = ai_vision_curing_monitoring(image_bytes)
+        
+        if analysis:
+            send_whatsapp_with_retry(phone, analysis)
+        else:
+            send_whatsapp(phone, "❌ Could not analyze the image. Please try again.")
+        
+        debug_log(f"⏱️ Waiting 10 seconds before showing menu...")
+        time.sleep(10)
+        save_user(phone, {"state": USER_STATES["ACTIVE"]})
         send_main_menu(phone)
         gc.collect()
         return
@@ -1176,9 +1381,9 @@ def handle_message(phone, msg_type, content):
                 "Send a clear photo of your cured leaf.\n\n"
                 "I'll analyze: grade, color, damage\n\n"
                 "Tips: Good lighting, flat surface")
-        elif cmd in ["5", "expert"]:
-            save_user(phone, {"state": USER_STATES["EXPERT_MENU"]})
-            return send_expert_menu(phone)
+        elif cmd in ["5", "vision"]:
+            save_user(phone, {"state": USER_STATES["WAITING_AI_VISION"]})
+            return send_ai_vision_menu(phone)
         elif cmd in ["6", "feedback"]:
             save_user(phone, {"state": USER_STATES["AWAITING_FEEDBACK"]})
             send_whatsapp(phone, 
@@ -1206,7 +1411,7 @@ def handle_message(phone, msg_type, content):
                 "• *2* - Farming practices\n"
                 "• *3* - Dashboard\n"
                 "• *4* - Leaf grading\n"
-                "• *5* - Expert help\n"
+                "• *5* - AI Vision options\n"
                 "• *6* - Feedback\n"
                 "• *ai [question]* - Ask AI"
             )
