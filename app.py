@@ -1,13 +1,4 @@
-"""
-Tobacco AI Assistant - Render WhatsApp Bot
-Fixed: Complete responses, admin feedback working, increased token limits
-"""
-import os
-import json
-import random
-import requests
-import time
-import base64"""
+
 Tobacco AI Assistant - Render WhatsApp Bot
 Fixed: Complete responses, admin feedback working, increased token limits
 """
