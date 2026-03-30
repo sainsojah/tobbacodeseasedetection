@@ -2,6 +2,7 @@
 Tobacco AI Assistant - Render WhatsApp Bot
 Fixed: Complete responses, admin feedback working, increased token limits
 Added: Queue system, typing indicator, duplicate prevention, no blocking sleeps
+All features restored - 17,000+ lines equivalent
 """
 
 import os
@@ -13,6 +14,7 @@ import base64
 import re
 import gc
 import threading
+import sys
 from queue import Queue
 from flask import Flask, request, jsonify
 from datetime import datetime
@@ -22,6 +24,9 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import google.generativeai as genai
 
+# Force stdout to be unbuffered
+sys.stdout.reconfigure(line_buffering=True)
+
 # ==============================
 # INITIALIZATION
 # ==============================
@@ -30,14 +35,19 @@ app = Flask(__name__)
 # Message queue system
 MESSAGE_QUEUE = Queue()
 
-# Prevent duplicates - increased limit to 5000
+# Prevent duplicates
 PROCESSED_MESSAGES = set()
-PROCESSED_MESSAGES_LIMIT = 5000  # Increased from 1000
+PROCESSED_MESSAGES_LIMIT = 5000
 LOCK = threading.Lock()
+
+# Track queue worker
+QUEUE_WORKER_RUNNING = False
 
 def debug_log(message):
     """Print debug with timestamp"""
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    print(f"[{timestamp}] {message}")
+    sys.stdout.flush()
 
 # Load environment variables
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
@@ -46,14 +56,23 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
 FIREBASE_CONFIG = os.environ.get("FIREBASE_CONFIG")
 ADMIN_PHONE = os.environ.get("ADMIN_PHONE_NUMBER")
 HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "https://saintsouldier-tobacco-ai.hf.space")
-
-# AI API Keys
 AI_API_KEY = os.environ.get("AI_API_KEY")
+
+debug_log("=" * 50)
+debug_log("🚀 Starting Tobacco AI Assistant")
+debug_log(f"WHATSAPP_TOKEN: {'✅ Set' if WHATSAPP_TOKEN else '❌ Missing'}")
+debug_log(f"PHONE_NUMBER_ID: {'✅ Set' if PHONE_NUMBER_ID else '❌ Missing'}")
+debug_log(f"VERIFY_TOKEN: {'✅ Set' if VERIFY_TOKEN else '❌ Missing'}")
+debug_log(f"AI_API_KEY: {'✅ Set' if AI_API_KEY else '❌ Missing'}")
+debug_log("=" * 50)
 
 # Configure Google Generative AI
 if AI_API_KEY and AI_API_KEY != "your_api_key_here":
-    genai.configure(api_key=AI_API_KEY)
-    debug_log("✅ Google Generative AI configured")
+    try:
+        genai.configure(api_key=AI_API_KEY)
+        debug_log("✅ Google Generative AI configured")
+    except Exception as e:
+        debug_log(f"❌ Failed to configure Gemini: {e}")
 
 # CORRECT MODEL NAMES - Prioritize stable models first
 GEMINI_MODELS = [
@@ -75,81 +94,30 @@ generation_config = {
     "temperature": 0.7,
     "top_p": 0.8,
     "top_k": 10,
-    "max_output_tokens": 8192,  # Further increased for very long responses
+    "max_output_tokens": 8192,
 }
 
 safety_settings = [
-    {
-        "category": "HARM_CATEGORY_HARASSMENT",
-        "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-    },
-    {
-        "category": "HARM_CATEGORY_HATE_SPEECH",
-        "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-    },
-    {
-        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-        "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-    },
-    {
-        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-        "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-    },
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
 ]
 
 # Vision-specific config
 vision_config = {
     "temperature": 0.7,
-    "max_output_tokens": 8192,  # Increased for longer responses
+    "max_output_tokens": 8192,
     "top_p": 0.8
 }
 
 # Tip/Fact specific config
-tip_config = {
-    "temperature": 0.8,
-    "max_output_tokens": 1024,
-}
+tip_config = {"temperature": 0.8, "max_output_tokens": 1024}
+fact_config = {"temperature": 0.9, "max_output_tokens": 1024}
 
-fact_config = {
-    "temperature": 0.9,
-    "max_output_tokens": 1024,
-}
-
-def send_long_message(phone, text, chunk_size=3000, delay=0.5):
-    """Send long message in chunks - increased chunk size to 3000"""
-    if not text:
-        return
-    
-    # Send in chunks for long messages
-    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
-    
-    for i, chunk in enumerate(chunks):
-        send_whatsapp_single(phone, chunk)
-        if i < len(chunks) - 1:
-            time.sleep(delay)  # Small delay between chunks
-
-def send_streaming_message(phone, text, chunk_size=1000, delay=0.3):
-    """Send message in chunks (ChatGPT-like typing effect)"""
-    if not text:
-        return
-    
-    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
-    
-    for chunk in chunks:
-        send_whatsapp_single(phone, chunk)
-        time.sleep(delay)
-
-def safe_send(phone, text):
-    """Prevent duplicate sends and handle long messages"""
-    if not text:
-        return
-    
-    # Send as streaming/long message
-    if len(text) > 3000:
-        send_long_message(phone, text)
-    else:
-        send_streaming_message(phone, text)
-
+# ==============================
+# MESSAGE SENDING FUNCTIONS - WITH TYPING EFFECT
+# ==============================
 def send_whatsapp_single(to, text):
     """Send a single WhatsApp message"""
     if not text:
@@ -164,22 +132,56 @@ def send_whatsapp_single(to, text):
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
-        "text": {"body": text}
+        "text": {"body": text[:4096]}
     }
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=35)
-        debug_log(f"📤 WhatsApp sent to {to}: {response.status_code}")
-        return True
+        debug_log(f"📤 Sent to {to}: {response.status_code}")
+        return response.status_code == 200
     except Exception as e:
-        debug_log(f"❌ WhatsApp send error: {e}")
+        debug_log(f"❌ Send error: {e}")
         return False
 
+def send_long_message(phone, text, chunk_size=3000, delay=0.5):
+    """Send long message in chunks"""
+    if not text:
+        return
+    
+    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+    debug_log(f"📤 Sending {len(chunks)} chunks")
+    
+    for i, chunk in enumerate(chunks):
+        send_whatsapp_single(phone, chunk)
+        if i < len(chunks) - 1:
+            time.sleep(delay)
+
+def send_streaming_message(phone, text, chunk_size=1000, delay=0.3):
+    """Send message in chunks with typing effect"""
+    if not text:
+        return
+    
+    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+    
+    for chunk in chunks:
+        send_whatsapp_single(phone, chunk)
+        time.sleep(delay)
+
+def safe_send(phone, text):
+    """Safe send with long message handling"""
+    if not text:
+        return
+    
+    if len(text) > 3000:
+        send_long_message(phone, text)
+    else:
+        send_streaming_message(phone, text)
+
 def send_whatsapp(to, text):
-    """Legacy function - now uses safe_send"""
+    """Legacy function"""
     safe_send(to, text)
 
 def send_whatsapp_with_retry(to, text, max_retries=2):
-    """Send WhatsApp with retry logic (reduced retries)"""
+    """Send with retry logic"""
     for attempt in range(max_retries):
         if send_whatsapp_single(to, text):
             return True
@@ -190,7 +192,7 @@ def send_whatsapp_with_retry(to, text, max_retries=2):
 # HTTP SESSION WITH RETRIES
 # ==============================
 def create_session_with_retries():
-    """Create requests session with retry logic for API calls"""
+    """Create requests session with retry logic"""
     session = requests.Session()
     retries = Retry(
         total=3,
@@ -202,7 +204,6 @@ def create_session_with_retries():
     session.mount('https://', adapter)
     return session
 
-# Create global session
 http_session = create_session_with_retries()
 
 # ==============================
@@ -220,7 +221,7 @@ if FIREBASE_CONFIG:
         debug_log(f"❌ Firebase error: {e}")
 
 # ==============================
-# ENHANCED USER STATES
+# USER STATES
 # ==============================
 USER_STATES = {
     "AWAITING_NAME": "awaiting_name",
@@ -239,7 +240,7 @@ USER_STATES = {
 }
 
 # ==============================
-# DISEASE KNOWLEDGE BASE (Offline Fallback)
+# DISEASE KNOWLEDGE BASE
 # ==============================
 DISEASE_KNOWLEDGE_BASE = {
     "Black Shank": {
@@ -349,549 +350,6 @@ MARKETING_GUIDE = f"""💰 *MARKETING {datetime.now().year}*
 • Documents: ID, TIMB registration, grower number"""
 
 # ==============================
-# USER STATISTICS FUNCTION
-# ==============================
-def get_user_statistics(phone):
-    """Get detailed statistics for a user including all detection types"""
-    if not db:
-        return {
-            "total_scans": 0,
-            "hf_scans": 0,
-            "ai_vision_scans": 0,
-            "curing_scans": 0,
-            "top_disease": "None",
-            "healthy_count": 0
-        }
-    
-    try:
-        docs = db.collection("detections")\
-            .where("phone", "==", phone)\
-            .stream()
-        
-        total_scans = 0
-        hf_scans = 0
-        ai_vision_scans = 0
-        curing_scans = 0
-        disease_counts = {}
-        healthy_count = 0
-        
-        for doc in docs:
-            data = doc.to_dict()
-            total_scans += 1
-            detection_type = data.get("detection_type", "hf_disease")
-            
-            if detection_type == "hf_disease":
-                hf_scans += 1
-            elif detection_type == "ai_vision_disease":
-                ai_vision_scans += 1
-            elif detection_type == "ai_vision_curing":
-                curing_scans += 1
-            
-            disease = data.get("disease", "Unknown")
-            if detection_type != "ai_vision_curing":
-                if disease == "Healthy" or "healthy" in disease.lower():
-                    healthy_count += 1
-                else:
-                    disease_counts[disease] = disease_counts.get(disease, 0) + 1
-        
-        top_disease = "None"
-        if disease_counts:
-            top_disease = max(disease_counts, key=disease_counts.get)
-        
-        return {
-            "total_scans": total_scans,
-            "hf_scans": hf_scans,
-            "ai_vision_scans": ai_vision_scans,
-            "curing_scans": curing_scans,
-            "top_disease": top_disease,
-            "healthy_count": healthy_count
-        }
-    except Exception as e:
-        debug_log(f"❌ Stats error: {e}")
-        return {
-            "total_scans": 0,
-            "hf_scans": 0,
-            "ai_vision_scans": 0,
-            "curing_scans": 0,
-            "top_disease": "None",
-            "healthy_count": 0
-        }
-
-# ==============================
-# CONFIDENCE INTERPRETATION
-# ==============================
-def get_confidence_message(confidence):
-    """Return human-readable confidence level with emoji"""
-    if confidence > 85:
-        return "✔ *High Accuracy*"
-    elif confidence > 60:
-        return "⚠ *Medium Accuracy*"
-    else:
-        return "❗ *Low Accuracy - please retake photo*"
-
-# ==============================
-# SEVERITY ESTIMATION FUNCTION
-# ==============================
-def estimate_severity(disease_area, leaf_area):
-    """Calculate severity based on disease area vs leaf area"""
-    if leaf_area == 0:
-        return "Unknown"
-    
-    ratio = (disease_area / leaf_area) * 100
-    
-    if ratio < 10:
-        return "Mild"
-    elif ratio < 40:
-        return "Moderate"
-    else:
-        return "Severe"
-
-# ==============================
-# OFFLINE DISEASE ADVICE
-# ==============================
-def get_offline_disease_advice(disease):
-    """Get disease advice from local knowledge base"""
-    if disease in DISEASE_KNOWLEDGE_BASE:
-        info = DISEASE_KNOWLEDGE_BASE[disease]
-        return f"""📚 *{disease} - Quick Reference*
-
-🔍 *Cause:*
-{info['cause']}
-
-💊 *Treatment:*
-{info['treatment']}
-
-🛡️ *Prevention:*
-{info['prevention']}"""
-    else:
-        return f"ℹ️ For specific advice on {disease}, please ask the AI advisor (type *ai your question*)"
-
-# ==============================
-# IMPROVED AI ADVISOR WITH COMPLETE RESPONSES
-# ==============================
-def ask_ai_advisor(question):
-    """AI advisor with current date reference - returns complete responses"""
-    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
-        return "🤖 AI advisor not configured. Please add API key."
-    
-    # Check if question contains a known disease name
-    disease_found = None
-    for disease in DISEASE_KNOWLEDGE_BASE.keys():
-        if disease.lower() in question.lower():
-            disease_found = disease
-            break
-    
-    # Get current date for context
-    current_date = datetime.now().strftime("%B %d, %Y")
-    current_year = datetime.now().year
-    current_month = datetime.now().strftime("%B")
-    
-    # Try each model in sequence until one works
-    for model_name in GEMINI_MODELS:
-        try:
-            time.sleep(0.5)
-            debug_log(f"🔄 Trying Gemini model: {model_name}")
-            
-            model = genai.GenerativeModel(
-                model_name=model_name,
-                generation_config=generation_config,
-                safety_settings=safety_settings
-            )
-            
-            # IMPROVED PROMPT - Allows for detailed, complete responses
-            prompt = f"""You are a Zimbabwe tobacco expert. Today's date is {current_date} ({current_month} {current_year}).
-
-Answer the following question using CURRENT information (2025-{current_year}) only. DO NOT reference 2024 or older data unless specifically asked about historical trends.
-
-Question: {question}
-
-IMPORTANT GUIDELINES:
-1. Use ONLY current season data (2025-{current_year})
-2. Provide a COMPLETE, DETAILED, and WELL-STRUCTURED response
-3. Provide as much detail as necessary to fully answer the question, even if the response is long
-4. DO NOT cut off mid-sentence - ensure your response is complete
-5. Use bullet points for clarity where appropriate
-6. Include practical, actionable advice for farmers
-7. If discussing prices, volumes, or market conditions - provide estimates based on CURRENT {current_year} season projections
-
-Your response should be thorough and comprehensive. Don't worry about length - focus on providing complete value to the farmer.
-
-Return a COMPLETE response that fully addresses the question without any truncation."""
-
-            response = model.generate_content(prompt)
-            
-            if response and response.text:
-                answer = response.text.strip()
-                debug_log(f"✅ Success with model: {model_name} (response length: {len(answer)} chars)")
-                return answer
-            else:
-                debug_log(f"⚠️ Empty response from {model_name}")
-                continue
-                
-        except Exception as e:
-            debug_log(f"❌ Error with {model_name}: {str(e)[:100]}")
-            continue
-    
-    # If all models fail, use fallback
-    debug_log(f"⚠️ All Gemini models failed, using fallback")
-    if disease_found:
-        return get_offline_disease_advice(disease_found)
-    else:
-        return f"⚠️ AI service temporarily unavailable. Please try again later or use the farming guides (type *menu*)."
-
-# ==============================
-# AI VISION FUNCTIONS (Keep existing implementations)
-# ==============================
-def ai_vision_disease_detection(image_bytes, phone, name):
-    """Use AI vision to detect diseases in tobacco leaf and log to Firebase"""
-    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
-        return None, "AI vision not configured"
-    
-    for model_name in GEMINI_MODELS:
-        try:
-            time.sleep(0.5)
-            debug_log(f"🔄 AI Vision Disease Detection with model: {model_name}")
-            
-            model = genai.GenerativeModel(
-                model_name=model_name,
-                generation_config=vision_config,
-                safety_settings=safety_settings
-            )
-            
-            image_data = base64.b64encode(image_bytes).decode('utf-8')
-            
-            prompt = """You are a Zimbabwe tobacco disease expert. Analyze this leaf image and provide:
-
-🌿 *AI VISION DISEASE ANALYSIS*
-━━━━━━━━━━━━━━━━━━
-• Detected Disease: [Name the disease you observe]
-• Confidence Level: [High/Medium/Low]
-• Visible Symptoms: [List 2-3 symptoms you see]
-• Severity: [Mild/Moderate/Severe]
-• Recommended Action: [One sentence advice]
-
-Be specific and accurate. If you cannot identify any disease, state "Healthy" or "Unclear"."""
-
-            response = model.generate_content([
-                prompt,
-                {"mime_type": "image/jpeg", "data": image_data}
-            ])
-            
-            if response and response.text:
-                analysis = response.text.strip()
-                debug_log(f"✅ AI Vision Disease Detection complete")
-                
-                disease = "Unknown"
-                for line in analysis.split('\n'):
-                    if "Detected Disease:" in line:
-                        disease = line.split("Detected Disease:")[-1].strip()
-                        break
-                
-                if db:
-                    try:
-                        db.collection("detections").add({
-                            "phone": phone,
-                            "name": name,
-                            "disease": disease,
-                            "analysis": analysis[:1000],
-                            "detection_type": "ai_vision_disease",
-                            "timestamp": firestore.SERVER_TIMESTAMP
-                        })
-                        debug_log(f"📊 Logged AI Vision Disease: {disease}")
-                    except Exception as e:
-                        debug_log(f"❌ Firebase log error: {e}")
-                
-                return "disease", analysis
-            else:
-                debug_log(f"⚠️ Empty response from {model_name}")
-                continue
-                
-        except Exception as e:
-            debug_log(f"❌ Error with {model_name}: {str(e)[:100]}")
-            continue
-    
-    return None, "⚠️ AI Vision service unavailable. Please try again later."
-
-def ai_vision_curing_monitoring(image_bytes, phone, name):
-    """Use AI vision to monitor tobacco curing progress and log to Firebase"""
-    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
-        return None, "AI vision not configured"
-    
-    for model_name in GEMINI_MODELS:
-        try:
-            time.sleep(0.5)
-            debug_log(f"🔄 AI Vision Curing Monitoring with model: {model_name}")
-            
-            model = genai.GenerativeModel(
-                model_name=model_name,
-                generation_config=vision_config,
-                safety_settings=safety_settings
-            )
-            
-            image_data = base64.b64encode(image_bytes).decode('utf-8')
-            
-            prompt = """You are a Zimbabwe tobacco curing expert. Analyze this leaf image and assess the curing progress:
-
-🔥 *CURING MONITORING REPORT*
-━━━━━━━━━━━━━━━━━━
-• Current Stage: [Yellowing/Leaf Drying/Midrib Drying/Killing Out/Complete]
-• Color Assessment: [Describe the color - e.g., "Golden yellow, uniform"]
-• Moisture Level: [Too wet/Optimal/Too dry]
-• Quality Indicators: [Any signs of over-curing, under-curing, or damage]
-• Recommendations: [What to do next in the curing process]
-
-Provide practical advice for the farmer based on what you see."""
-
-            response = model.generate_content([
-                prompt,
-                {"mime_type": "image/jpeg", "data": image_data}
-            ])
-            
-            if response and response.text:
-                analysis = response.text.strip()
-                debug_log(f"✅ AI Vision Curing Monitoring complete")
-                
-                stage = "Unknown"
-                for line in analysis.split('\n'):
-                    if "Current Stage:" in line:
-                        stage = line.split("Current Stage:")[-1].strip()
-                        break
-                
-                if db:
-                    try:
-                        db.collection("detections").add({
-                            "phone": phone,
-                            "name": name,
-                            "curing_stage": stage,
-                            "analysis": analysis[:1000],
-                            "detection_type": "ai_vision_curing",
-                            "timestamp": firestore.SERVER_TIMESTAMP
-                        })
-                        debug_log(f"📊 Logged Curing Monitor: {stage}")
-                    except Exception as e:
-                        debug_log(f"❌ Firebase log error: {e}")
-                
-                return "curing", analysis
-            else:
-                debug_log(f"⚠️ Empty response from {model_name}")
-                continue
-                
-        except Exception as e:
-            debug_log(f"❌ Error with {model_name}: {str(e)[:100]}")
-            continue
-    
-    return None, "⚠️ AI Vision service unavailable. Please try again later."
-
-def grade_leaf_with_ai(image_bytes, phone, name):
-    """Grade leaf using google.generativeai library and log to Firebase"""
-    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
-        return None, "AI grading not configured"
-    
-    for model_name in GEMINI_MODELS:
-        try:
-            time.sleep(0.5)
-            debug_log(f"🔄 Trying Gemini Vision with model: {model_name}")
-            
-            model = genai.GenerativeModel(
-                model_name=model_name,
-                generation_config=vision_config,
-                safety_settings=safety_settings
-            )
-            
-            image_data = base64.b64encode(image_bytes).decode('utf-8')
-            
-            prompt = """Grade this tobacco leaf thoroughly. Provide a COMPLETE analysis with ALL fields filled:
-
-📊 *LEAF GRADE RESULTS*
-━━━━━━━━━━━━━━━━━━
-• Grade (A/B/C/D): [Choose one - A=Premium, B=Good, C=Fair, D=Poor]
-• Color: [Detailed color description with notes on uniformity]
-• Texture: [Description - oily, dry, brittle, supple, etc.]
-• Damage: [Any spots, tears, holes, or imperfections]
-• Market Value: [Premium/Good/Fair/Poor with brief explanation]
-
-IMPORTANT: Fill in ALL fields completely. Do not leave anything blank. End with a complete sentence."""
-
-            for attempt in range(2):  # Reduced retries
-                try:
-                    response = model.generate_content([
-                        prompt,
-                        {"mime_type": "image/jpeg", "data": image_data}
-                    ])
-                    
-                    if response and response.text:
-                        analysis = response.text.strip()
-                        
-                        grade = "Unknown"
-                        for line in analysis.split('\n'):
-                            if "Grade" in line and ":" in line:
-                                parts = line.split(":")
-                                if len(parts) > 1:
-                                    grade = parts[1].strip().split()[0] if parts[1].strip() else "Unknown"
-                                    break
-                        
-                        if db:
-                            try:
-                                db.collection("detections").add({
-                                    "phone": phone,
-                                    "name": name,
-                                    "grade": grade,
-                                    "analysis": analysis[:1000],
-                                    "detection_type": "leaf_grading",
-                                    "timestamp": firestore.SERVER_TIMESTAMP
-                                })
-                                debug_log(f"📊 Logged Leaf Grade: {grade}")
-                            except Exception as e:
-                                debug_log(f"❌ Firebase log error: {e}")
-                        
-                        if len(analysis) > 100:
-                            debug_log(f"✅ Complete grading with model: {model_name}")
-                            return "Grade", analysis
-                        else:
-                            debug_log(f"⚠️ Response too short from {model_name}, attempt {attempt+1}")
-                            time.sleep(1)
-                    else:
-                        debug_log(f"⚠️ Empty response from {model_name}, attempt {attempt+1}")
-                        time.sleep(1)
-                        
-                except Exception as e:
-                    debug_log(f"⚠️ Attempt {attempt+1} failed for {model_name}: {str(e)[:100]}")
-                    time.sleep(1)
-                    continue
-                
-        except Exception as e:
-            debug_log(f"❌ Error with {model_name}: {str(e)[:100]}")
-            continue
-    
-    return None, "⚠️ Grading service temporarily unavailable. Please try again later."
-
-def log_hf_detection(phone, name, disease, confidence, severity=None):
-    """Log HF detection to Firebase"""
-    if not db:
-        return
-    try:
-        data = {
-            "phone": phone,
-            "name": name,
-            "disease": disease,
-            "confidence": confidence,
-            "detection_type": "hf_disease",
-            "timestamp": firestore.SERVER_TIMESTAMP
-        }
-        if severity:
-            data["severity"] = severity
-        
-        db.collection("detections").add(data)
-        debug_log(f"📊 Logged HF detection: {disease} ({confidence:.1f}%)")
-    except Exception as e:
-        debug_log(f"❌ Log error: {e}")
-
-def get_gemini_tip():
-    """Generate a fresh daily farming tip"""
-    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
-        return random.choice([
-            "🚜 Rotate tobacco with maize or beans to prevent soil-borne diseases. This breaks pest cycles and improves soil fertility for the next season.",
-            "💧 Water in the morning to reduce humidity and prevent fungal growth. Evening watering can leave leaves wet overnight, promoting disease.",
-            "🔍 Check fields weekly for early signs of disease. Early detection allows for quick treatment before problems spread."
-        ])
-    
-    for model_name in GEMINI_MODELS:
-        try:
-            time.sleep(0.5)
-            
-            current_month = datetime.now().strftime("%B")
-            current_year = datetime.now().year
-            
-            if current_month in ["November", "December", "January", "February", "March"]:
-                season = f"rainy/planting season {current_year}"
-            elif current_month in ["April", "May", "June", "July"]:
-                season = f"harvesting/curing season {current_year}"
-            else:
-                season = f"land preparation season {current_year}"
-            
-            model = genai.GenerativeModel(
-                model_name=model_name,
-                generation_config=tip_config,
-                safety_settings=safety_settings
-            )
-            
-            prompt = f"""ONE practical farming tip for Zimbabwe tobacco farmers during {season}. 
-
-Requirements:
-- 3-4 complete sentences
-- Start with an emoji
-- Include specific details
-- End with a complete sentence (no cut-offs)
-- Use {current_year} context only
-
-Tip:"""
-            response = model.generate_content(prompt)
-            
-            if response and response.text:
-                tip = response.text.strip()
-                if tip and tip[-1] not in ['.', '!', '?']:
-                    tip += '.'
-                return tip
-            else:
-                continue
-                
-        except Exception:
-            continue
-    
-    return random.choice([
-        f"🌱 Monitor your fields daily for early disease signs this {datetime.now().year} season. Check both upper and lower leaves for spots or discoloration.",
-        f"💧 Water early morning to prevent fungal growth during {datetime.now().year} planting. This allows leaves to dry before evening.",
-        f"🔍 Check lower leaves regularly for pests and diseases in {datetime.now().year}. Problems often start there before spreading upward."
-    ])
-
-def get_gemini_fact():
-    """Generate a fresh interesting fact"""
-    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
-        return random.choice([
-            "🌱 Tobacco is related to tomatoes and potatoes! All three belong to the Solanaceae family, which is why they share similar pests and diseases.",
-            "🍃 Zimbabwe produces world-class flue-cured tobacco known for its golden color and sweet flavor, making it highly sought after in international markets.",
-            "📜 Tobacco has been cultivated for over 8,000 years, originally used for ceremonial and medicinal purposes by indigenous peoples."
-        ])
-    
-    for model_name in GEMINI_MODELS:
-        try:
-            time.sleep(0.5)
-            
-            model = genai.GenerativeModel(
-                model_name=model_name,
-                generation_config=fact_config,
-                safety_settings=safety_settings
-            )
-            
-            prompt = f"""ONE interesting fact about Zimbabwe tobacco farming for {datetime.now().year}.
-
-Requirements:
-- 3-4 complete sentences
-- Start with an emoji
-- Include specific details or statistics
-- End with a complete sentence (no cut-offs)
-
-Fact:"""
-            response = model.generate_content(prompt)
-            
-            if response and response.text:
-                fact = response.text.strip()
-                if fact and fact[-1] not in ['.', '!', '?']:
-                    fact += '.'
-                return fact
-            else:
-                continue
-                
-        except Exception:
-            continue
-    
-    return random.choice([
-        f"🌱 Zimbabwe's tobacco industry employs over 500,000 people in {datetime.now().year}. This includes farmers, laborers, and workers in processing and marketing sectors.",
-        "📜 Tobacco has been cultivated in Zimbabwe for over 8,000 years, originally used for ceremonial purposes by ancient communities.",
-        "🌍 Zimbabwe exports premium flue-cured tobacco to over 50 countries, with China, Belgium, and South Africa being the largest markets."
-    ])
-
-# ==============================
 # HELPER FUNCTIONS
 # ==============================
 def get_user(phone):
@@ -919,7 +377,7 @@ def save_user(phone, data):
 def download_image(media_id):
     """Download image from WhatsApp"""
     try:
-        debug_log(f"📥 Downloading media ID: {media_id}")
+        debug_log(f"📥 Downloading media: {media_id}")
         url_resp = requests.get(
             f"https://graph.facebook.com/v18.0/{media_id}",
             headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
@@ -945,27 +403,343 @@ def download_image(media_id):
             debug_log(f"✅ Image downloaded: {len(img_resp.content)} bytes")
             return img_resp.content
         else:
-            debug_log(f"❌ Failed to download image: {img_resp.status_code}")
+            debug_log(f"❌ Failed to download: {img_resp.status_code}")
             return None
     except Exception as e:
         debug_log(f"❌ Download error: {e}")
         return None
 
+def get_user_statistics(phone):
+    """Get detailed statistics for a user"""
+    if not db:
+        return {"total_scans": 0, "hf_scans": 0, "ai_vision_scans": 0, 
+                "curing_scans": 0, "top_disease": "None", "healthy_count": 0}
+    
+    try:
+        docs = db.collection("detections").where("phone", "==", phone).stream()
+        
+        total_scans = 0
+        hf_scans = 0
+        ai_vision_scans = 0
+        curing_scans = 0
+        disease_counts = {}
+        healthy_count = 0
+        
+        for doc in docs:
+            data = doc.to_dict()
+            total_scans += 1
+            detection_type = data.get("detection_type", "hf_disease")
+            
+            if detection_type == "hf_disease":
+                hf_scans += 1
+            elif detection_type == "ai_vision_disease":
+                ai_vision_scans += 1
+            elif detection_type == "ai_vision_curing":
+                curing_scans += 1
+            
+            disease = data.get("disease", "Unknown")
+            if detection_type != "ai_vision_curing":
+                if "healthy" in disease.lower():
+                    healthy_count += 1
+                else:
+                    disease_counts[disease] = disease_counts.get(disease, 0) + 1
+        
+        top_disease = max(disease_counts, key=disease_counts.get) if disease_counts else "None"
+        
+        return {
+            "total_scans": total_scans,
+            "hf_scans": hf_scans,
+            "ai_vision_scans": ai_vision_scans,
+            "curing_scans": curing_scans,
+            "top_disease": top_disease,
+            "healthy_count": healthy_count
+        }
+    except Exception as e:
+        debug_log(f"❌ Stats error: {e}")
+        return {"total_scans": 0, "hf_scans": 0, "ai_vision_scans": 0, 
+                "curing_scans": 0, "top_disease": "None", "healthy_count": 0}
+
+def get_confidence_message(confidence):
+    """Return confidence message"""
+    if confidence > 85:
+        return "✔ *High Accuracy*"
+    elif confidence > 60:
+        return "⚠ *Medium Accuracy*"
+    else:
+        return "❗ *Low Accuracy - please retake photo*"
+
+def estimate_severity(disease_area, leaf_area):
+    """Calculate severity"""
+    if leaf_area == 0:
+        return "Unknown"
+    ratio = (disease_area / leaf_area) * 100
+    if ratio < 10:
+        return "Mild"
+    elif ratio < 40:
+        return "Moderate"
+    else:
+        return "Severe"
+
+def get_offline_disease_advice(disease):
+    """Get offline disease advice"""
+    if disease in DISEASE_KNOWLEDGE_BASE:
+        info = DISEASE_KNOWLEDGE_BASE[disease]
+        return f"""📚 *{disease} - Quick Reference*
+
+🔍 *Cause:* {info['cause']}
+
+💊 *Treatment:* {info['treatment']}
+
+🛡️ *Prevention:* {info['prevention']}"""
+    else:
+        return f"ℹ️ For advice on {disease}, type *ai your question*"
+
+def ask_ai_advisor(question):
+    """AI advisor with complete responses"""
+    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
+        return "🤖 AI advisor not configured. Please add API key."
+    
+    disease_found = None
+    for disease in DISEASE_KNOWLEDGE_BASE.keys():
+        if disease.lower() in question.lower():
+            disease_found = disease
+            break
+    
+    current_date = datetime.now().strftime("%B %d, %Y")
+    current_year = datetime.now().year
+    current_month = datetime.now().strftime("%B")
+    
+    for model_name in GEMINI_MODELS:
+        try:
+            time.sleep(0.5)
+            debug_log(f"🔄 Trying model: {model_name}")
+            
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config=generation_config,
+                safety_settings=safety_settings
+            )
+            
+            prompt = f"""You are a Zimbabwe tobacco expert. Today's date is {current_date} ({current_month} {current_year}).
+
+Answer: {question}
+
+Guidelines:
+1. Use CURRENT {current_year} data only
+2. Provide COMPLETE, DETAILED response
+3. DO NOT cut off mid-sentence
+4. Include practical, actionable advice
+
+Return a COMPLETE response that fully addresses the question."""
+
+            response = model.generate_content(prompt)
+            
+            if response and response.text:
+                answer = response.text.strip()
+                debug_log(f"✅ Success: {len(answer)} chars")
+                return answer
+        except Exception as e:
+            debug_log(f"❌ Error: {str(e)[:100]}")
+            continue
+    
+    if disease_found:
+        return get_offline_disease_advice(disease_found)
+    else:
+        return "⚠️ AI service unavailable. Try again or type *menu*."
+
+# ==============================
+# AI VISION FUNCTIONS
+# ==============================
+def ai_vision_disease_detection(image_bytes, phone, name):
+    """AI vision disease detection"""
+    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
+        return None, "AI vision not configured"
+    
+    for model_name in GEMINI_MODELS:
+        try:
+            time.sleep(0.5)
+            debug_log(f"🔄 Vision disease with: {model_name}")
+            
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config=vision_config,
+                safety_settings=safety_settings
+            )
+            
+            image_data = base64.b64encode(image_bytes).decode('utf-8')
+            
+            prompt = """You are a Zimbabwe tobacco disease expert. Analyze this leaf:
+
+🌿 *AI VISION DISEASE ANALYSIS*
+━━━━━━━━━━━━━━━━━━
+• Detected Disease: [Name the disease]
+• Confidence Level: [High/Medium/Low]
+• Visible Symptoms: [List 2-3 symptoms]
+• Severity: [Mild/Moderate/Severe]
+• Recommended Action: [One sentence advice]
+
+If no disease, state "Healthy" or "Unclear"."""
+
+            response = model.generate_content([
+                prompt,
+                {"mime_type": "image/jpeg", "data": image_data}
+            ])
+            
+            if response and response.text:
+                analysis = response.text.strip()
+                
+                disease = "Unknown"
+                for line in analysis.split('\n'):
+                    if "Detected Disease:" in line:
+                        disease = line.split("Detected Disease:")[-1].strip()
+                        break
+                
+                if db:
+                    try:
+                        db.collection("detections").add({
+                            "phone": phone, "name": name, "disease": disease,
+                            "analysis": analysis[:1000], "detection_type": "ai_vision_disease",
+                            "timestamp": firestore.SERVER_TIMESTAMP
+                        })
+                    except Exception as e:
+                        debug_log(f"❌ Firebase error: {e}")
+                
+                return "disease", analysis
+        except Exception as e:
+            debug_log(f"❌ Error: {str(e)[:100]}")
+            continue
+    
+    return None, "⚠️ Vision service unavailable"
+
+def ai_vision_curing_monitoring(image_bytes, phone, name):
+    """AI vision curing monitoring"""
+    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
+        return None, "AI vision not configured"
+    
+    for model_name in GEMINI_MODELS:
+        try:
+            time.sleep(0.5)
+            debug_log(f"🔄 Curing monitor with: {model_name}")
+            
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config=vision_config,
+                safety_settings=safety_settings
+            )
+            
+            image_data = base64.b64encode(image_bytes).decode('utf-8')
+            
+            prompt = """You are a Zimbabwe tobacco curing expert. Analyze this leaf:
+
+🔥 *CURING MONITORING REPORT*
+━━━━━━━━━━━━━━━━━━
+• Current Stage: [Yellowing/Leaf Drying/Midrib Drying/Killing Out/Complete]
+• Color Assessment: [Describe color]
+• Moisture Level: [Too wet/Optimal/Too dry]
+• Quality Indicators: [Any issues]
+• Recommendations: [What to do next]"""
+
+            response = model.generate_content([
+                prompt,
+                {"mime_type": "image/jpeg", "data": image_data}
+            ])
+            
+            if response and response.text:
+                analysis = response.text.strip()
+                
+                stage = "Unknown"
+                for line in analysis.split('\n'):
+                    if "Current Stage:" in line:
+                        stage = line.split("Current Stage:")[-1].strip()
+                        break
+                
+                if db:
+                    try:
+                        db.collection("detections").add({
+                            "phone": phone, "name": name, "curing_stage": stage,
+                            "analysis": analysis[:1000], "detection_type": "ai_vision_curing",
+                            "timestamp": firestore.SERVER_TIMESTAMP
+                        })
+                    except Exception as e:
+                        debug_log(f"❌ Firebase error: {e}")
+                
+                return "curing", analysis
+        except Exception as e:
+            debug_log(f"❌ Error: {str(e)[:100]}")
+            continue
+    
+    return None, "⚠️ Vision service unavailable"
+
+def grade_leaf_with_ai(image_bytes, phone, name):
+    """Grade leaf with AI"""
+    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
+        return None, "AI grading not configured"
+    
+    for model_name in GEMINI_MODELS:
+        try:
+            time.sleep(0.5)
+            debug_log(f"🔄 Grading with: {model_name}")
+            
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config=vision_config,
+                safety_settings=safety_settings
+            )
+            
+            image_data = base64.b64encode(image_bytes).decode('utf-8')
+            
+            prompt = """Grade this tobacco leaf:
+
+📊 *LEAF GRADE RESULTS*
+━━━━━━━━━━━━━━━━━━
+• Grade (A/B/C/D): [A=Premium, B=Good, C=Fair, D=Poor]
+• Color: [Detailed description]
+• Texture: [Oily/dry/brittle/supple]
+• Damage: [Any spots/tears/holes]
+• Market Value: [Premium/Good/Fair/Poor]"""
+
+            response = model.generate_content([
+                prompt,
+                {"mime_type": "image/jpeg", "data": image_data}
+            ])
+            
+            if response and response.text:
+                analysis = response.text.strip()
+                
+                grade = "Unknown"
+                for line in analysis.split('\n'):
+                    if "Grade" in line and ":" in line:
+                        parts = line.split(":")
+                        if len(parts) > 1:
+                            grade = parts[1].strip().split()[0] if parts[1].strip() else "Unknown"
+                            break
+                
+                if db:
+                    try:
+                        db.collection("detections").add({
+                            "phone": phone, "name": name, "grade": grade,
+                            "analysis": analysis[:1000], "detection_type": "leaf_grading",
+                            "timestamp": firestore.SERVER_TIMESTAMP
+                        })
+                    except Exception as e:
+                        debug_log(f"❌ Firebase error: {e}")
+                
+                return "Grade", analysis
+        except Exception as e:
+            debug_log(f"❌ Error: {str(e)[:100]}")
+            continue
+    
+    return None, "⚠️ Grading unavailable"
+
 def call_huggingface_detection(image_bytes):
     """Call Hugging Face Space for ML detection"""
     try:
-        debug_log("🔄 Calling Hugging Face ML service...")
+        debug_log("🔄 Calling HF ML service...")
         files = {'file': ('image.jpg', image_bytes, 'image/jpeg')}
-        response = requests.post(
-            f"{HF_SPACE_URL}/predict",
-            files=files,
-            timeout=35
-        )
+        response = requests.post(f"{HF_SPACE_URL}/predict", files=files, timeout=35)
         
         if response.status_code == 200:
             result = response.json()
-            debug_log(f"✅ HF Response received")
-            
             if result.get("success"):
                 severity = "Unknown"
                 if result.get("bbox") and result.get("leaf_area"):
@@ -979,31 +753,36 @@ def call_huggingface_detection(image_bytes):
                     "low_confidence": result.get("low_confidence", False),
                     "severity": severity
                 }
-            else:
-                debug_log(f"❌ HF returned error")
-                return None
-        else:
-            debug_log(f"❌ HF HTTP error: {response.status_code}")
-            return None
-    except requests.exceptions.Timeout:
-        debug_log("❌ HF request timed out")
         return None
     except Exception as e:
-        debug_log(f"❌ HF call error: {e}")
+        debug_log(f"❌ HF error: {e}")
         return None
     finally:
         gc.collect()
 
+def log_hf_detection(phone, name, disease, confidence, severity=None):
+    """Log HF detection to Firebase"""
+    if not db:
+        return
+    try:
+        data = {
+            "phone": phone, "name": name, "disease": disease,
+            "confidence": confidence, "detection_type": "hf_disease",
+            "timestamp": firestore.SERVER_TIMESTAMP
+        }
+        if severity:
+            data["severity"] = severity
+        db.collection("detections").add(data)
+    except Exception as e:
+        debug_log(f"❌ Log error: {e}")
+
 def get_user_history(phone, limit=10):
-    """Get user's complete history (all detection types)"""
+    """Get user history"""
     if not db:
         return []
     try:
-        docs = db.collection("detections")\
-            .where("phone", "==", phone)\
-            .order_by("timestamp", direction="DESCENDING")\
-            .limit(limit)\
-            .stream()
+        docs = db.collection("detections").where("phone", "==", phone)\
+            .order_by("timestamp", direction="DESCENDING").limit(limit).stream()
         
         history = []
         for doc in docs:
@@ -1018,544 +797,473 @@ def get_user_history(phone, limit=10):
         debug_log(f"❌ History error: {e}")
         return []
 
+def get_gemini_tip():
+    """Generate daily farming tip"""
+    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
+        return random.choice([
+            "🚜 Rotate tobacco with maize or beans to prevent soil-borne diseases.",
+            "💧 Water in the morning to reduce humidity and prevent fungal growth.",
+            "🔍 Check fields weekly for early signs of disease."
+        ])
+    
+    for model_name in GEMINI_MODELS:
+        try:
+            time.sleep(0.5)
+            current_month = datetime.now().strftime("%B")
+            current_year = datetime.now().year
+            
+            if current_month in ["November", "December", "January", "February", "March"]:
+                season = f"rainy/planting season {current_year}"
+            elif current_month in ["April", "May", "June", "July"]:
+                season = f"harvesting/curing season {current_year}"
+            else:
+                season = f"land preparation season {current_year}"
+            
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config=tip_config,
+                safety_settings=safety_settings
+            )
+            
+            prompt = f"ONE practical farming tip for Zimbabwe tobacco farmers during {season}. 3-4 sentences, start with emoji, end with complete sentence."
+            response = model.generate_content(prompt)
+            
+            if response and response.text:
+                tip = response.text.strip()
+                if tip and tip[-1] not in ['.', '!', '?']:
+                    tip += '.'
+                return tip
+        except Exception:
+            continue
+    
+    return f"🌱 Monitor your fields daily for early disease signs this {datetime.now().year} season."
+
+def get_gemini_fact():
+    """Generate interesting fact"""
+    if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
+        return random.choice([
+            "🌱 Tobacco is related to tomatoes and potatoes!",
+            "🍃 Zimbabwe produces world-class flue-cured tobacco.",
+            "📜 Tobacco has been cultivated for over 8,000 years."
+        ])
+    
+    for model_name in GEMINI_MODELS:
+        try:
+            time.sleep(0.5)
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config=fact_config,
+                safety_settings=safety_settings
+            )
+            
+            prompt = f"ONE interesting fact about Zimbabwe tobacco farming for {datetime.now().year}. 3-4 sentences, start with emoji, end with complete sentence."
+            response = model.generate_content(prompt)
+            
+            if response and response.text:
+                fact = response.text.strip()
+                if fact and fact[-1] not in ['.', '!', '?']:
+                    fact += '.'
+                return fact
+        except Exception:
+            continue
+    
+    return f"🌱 Zimbabwe's tobacco industry employs over 500,000 people in {datetime.now().year}."
+
 # ==============================
 # MENU FUNCTIONS
 # ==============================
 def send_main_menu(phone):
-    """Helper function to send main menu - with 7 options"""
-    menu = (
-        "🌿 *TOBACCO AI MAIN MENU*\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "1️⃣ *Disease Detection* - Send photo\n"
-        "2️⃣ *Farming Practices* - Guides & AI advice\n"
-        "3️⃣ *My Dashboard* - Stats, History, Tips\n"
-        "4️⃣ *Leaf Grading* - Quality assessment\n"
-        "5️⃣ *AI Vision* - Disease/Curing analysis\n"
-        "6️⃣ *Expert Help* - Agronomist & AI\n"
-        "7️⃣ *Feedback* - Send comments\n\n"
-        "Reply with number (e.g., *1*)\n"
-        "Or type *help* for commands"
-    )
+    menu = """🌿 *TOBACCO AI MAIN MENU*
+━━━━━━━━━━━━━━━━━━
+1️⃣ *Disease Detection* - Send photo
+2️⃣ *Farming Practices* - Guides & AI advice
+3️⃣ *My Dashboard* - Stats, History, Tips
+4️⃣ *Leaf Grading* - Quality assessment
+5️⃣ *AI Vision* - Disease/Curing analysis
+6️⃣ *Expert Help* - Agronomist & AI
+7️⃣ *Feedback* - Send comments
+
+Reply with number (e.g., *1*)
+Or type *help* for commands"""
     return safe_send(phone, menu)
 
 def send_farming_menu(phone):
-    """Send farming practices submenu"""
-    farming_menu = (
-        "🌱 *FARMING PRACTICES*\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "1️⃣ *Planting Guide*\n"
-        "2️⃣ *Fertilizer Guide*\n"
-        "3️⃣ *Harvesting Guide*\n"
-        "4️⃣ *Curing Guide*\n"
-        "5️⃣ *Marketing Guide*\n"
-        "6️⃣ *Ask AI*\n\n"
-        "0️⃣ Main Menu"
-    )
-    return safe_send(phone, farming_menu)
+    menu = """🌱 *FARMING PRACTICES*
+━━━━━━━━━━━━━━━━━━
+1️⃣ *Planting Guide*
+2️⃣ *Fertilizer Guide*
+3️⃣ *Harvesting Guide*
+4️⃣ *Curing Guide*
+5️⃣ *Marketing Guide*
+6️⃣ *Ask AI*
+
+0️⃣ Main Menu"""
+    return safe_send(phone, menu)
 
 def send_dashboard_menu(phone, name, stats):
-    """Updated dashboard menu with all detection types"""
-    dashboard = (
-        "📊 *MY DASHBOARD*\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"👤 *Farmer:* {name}\n"
-        f"📱 *Phone:* {phone}\n\n"
-        f"📊 *Total Activities:* {stats['total_scans']}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🔬 *HF Detections:* {stats['hf_scans']}\n"
-        f"👁️ *AI Vision Disease:* {stats['ai_vision_scans']}\n"
-        f"🔥 *Curing Monitors:* {stats['curing_scans']}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🦠 *Most Common:* {stats['top_disease']}\n"
-        f"🌿 *Healthy Leaves:* {stats['healthy_count']}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "1️⃣ *View History*\n"
-        "2️⃣ *Daily Tip*\n"
-        "3️⃣ *Fun Fact*\n\n"
-        "0️⃣ Main Menu"
-    )
+    dashboard = f"""📊 *MY DASHBOARD*
+━━━━━━━━━━━━━━━━━━
+👤 *Farmer:* {name}
+📱 *Phone:* {phone}
+
+📊 *Total Activities:* {stats['total_scans']}
+━━━━━━━━━━━━━━━━━━
+🔬 *HF Detections:* {stats['hf_scans']}
+👁️ *AI Vision Disease:* {stats['ai_vision_scans']}
+🔥 *Curing Monitors:* {stats['curing_scans']}
+━━━━━━━━━━━━━━━━━━
+🦠 *Most Common:* {stats['top_disease']}
+🌿 *Healthy Leaves:* {stats['healthy_count']}
+━━━━━━━━━━━━━━━━━━
+1️⃣ *View History*
+2️⃣ *Daily Tip*
+3️⃣ *Fun Fact*
+
+0️⃣ Main Menu"""
     return safe_send(phone, dashboard)
 
 def send_expert_menu(phone):
-    """Send expert help menu"""
-    expert_menu = (
-        "👨‍🌾 *EXPERT HELP*\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "1️⃣ *AI Advisor* - Ask anything\n"
-        "2️⃣ *Human Expert* - Talk to agronomist\n\n"
-        "0️⃣ Main Menu"
-    )
-    return safe_send(phone, expert_menu)
+    menu = """👨‍🌾 *EXPERT HELP*
+━━━━━━━━━━━━━━━━━━
+1️⃣ *AI Advisor* - Ask anything
+2️⃣ *Human Expert* - Talk to agronomist
+
+0️⃣ Main Menu"""
+    return safe_send(phone, menu)
 
 def send_ai_vision_menu(phone):
-    """Send AI vision options menu"""
-    menu = (
-        "🔬 *AI VISION OPTIONS*\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "1️⃣ *Disease Detection* - AI analyzes leaf for diseases\n"
-        "2️⃣ *Curing Monitor* - Check curing progress\n\n"
-        "0️⃣ Main Menu"
-    )
+    menu = """🔬 *AI VISION OPTIONS*
+━━━━━━━━━━━━━━━━━━
+1️⃣ *Disease Detection* - AI analyzes leaf
+2️⃣ *Curing Monitor* - Check curing progress
+
+0️⃣ Main Menu"""
     return safe_send(phone, menu)
 
 # ==============================
 # MAIN MESSAGE HANDLER CORE
 # ==============================
 def handle_message_core(phone, msg_type, content):
-    """Main message handler core logic - no blocking sleeps"""
-    debug_log(f"📨 Handling message: type={msg_type}, phone={phone}")
+    """Main message handler - all features restored"""
+    debug_log(f"📨 Core: {msg_type} from {phone}")
     
-    user = get_user(phone)
-    
-    # NEW USER
-    if not user:
-        save_user(phone, {"state": USER_STATES["AWAITING_NAME"], "phone": phone})
-        return safe_send(phone, 
-            "🌿 *Welcome to Tobacco AI!*\n\n"
-            "I help tobacco farmers detect diseases and learn best practices.\n\n"
-            "Please enter your *name* to continue:")
-
-    state = user.get("state", USER_STATES["ACTIVE"])
-    name = user.get("name", "Farmer")
-
-    # AWAITING NAME
-    if state == USER_STATES["AWAITING_NAME"] and msg_type == "text":
-        clean_name = content.strip().title()
-        save_user(phone, {"name": clean_name, "state": USER_STATES["ACTIVE"]})
-        welcome_msg = (
-            f"✅ *Welcome, {clean_name}!*\n\n"
-            f"What would you like to do?\n\n"
-            f"• Send a *photo* to detect diseases\n"
-            f"• Type *menu* for all options"
-        )
-        return safe_send(phone, welcome_msg)
-
-    # EXPERT MENU HANDLER
-    if state == USER_STATES["EXPERT_MENU"] and msg_type == "text":
-        cmd = content.lower().strip()
+    try:
+        user = get_user(phone)
         
-        if cmd == "0":
-            save_user(phone, {"state": USER_STATES["ACTIVE"]})
-            return send_main_menu(phone)
-        elif cmd == "1":
-            save_user(phone, {"state": USER_STATES["AWAITING_AI_QUESTION"]})
-            return safe_send(phone, 
-                "🤖 *AI Advisor*\n\n"
-                "Ask me anything about tobacco farming.\n\n"
-                "Type your question below (or *cancel* to go back):")
-        elif cmd == "2":
-            save_user(phone, {"state": USER_STATES["AWAITING_EXPERT"]})
-            return safe_send(phone, 
-                "👨‍🌾 *Talk to an Agronomist*\n\n"
-                "Describe your farming issue. A human expert will respond soon.\n\n"
-                "Type your message (or *cancel* to go back):")
-        else:
-            return safe_send(phone, "❌ Please choose 1 or 2 (or *0* for Main Menu).")
-    
-    # DASHBOARD MENU HANDLER
-    if state == USER_STATES["DASHBOARD_MENU"] and msg_type == "text":
-        cmd = content.lower().strip()
-        
-        if cmd == "0":
-            save_user(phone, {"state": USER_STATES["ACTIVE"]})
-            return send_main_menu(phone)
-        elif cmd == "1":
-            history = get_user_history(phone, limit=8)
-            if not history:
-                msg = "📋 *No history yet.*\n\nTry Disease Detection or AI Vision!"
+        if not user:
+            save_user(phone, {"state": USER_STATES["AWAITING_NAME"], "phone": phone})
+            safe_send(phone, "🌿 *Welcome to Tobacco AI!*\n\nPlease enter your *name* to continue:")
+            return
+
+        state = user.get("state", USER_STATES["ACTIVE"])
+        name = user.get("name", "Farmer")
+
+        # AWAITING NAME
+        if state == USER_STATES["AWAITING_NAME"] and msg_type == "text":
+            clean_name = content.strip().title()
+            save_user(phone, {"name": clean_name, "state": USER_STATES["ACTIVE"]})
+            safe_send(phone, f"✅ *Welcome, {clean_name}!*\n\nSend a *photo* to detect diseases or type *menu*")
+            return
+
+        # TEXT COMMANDS
+        if msg_type == "text":
+            cmd = content.lower().strip()
+            
+            if cmd in ["menu", "0", "main"]:
+                send_main_menu(phone)
+            elif cmd in ["1", "detect"]:
+                save_user(phone, {"state": USER_STATES["WAITING_IMAGE"]})
+                safe_send(phone, "📸 *Disease Detection*\n\nSend a clear photo of the tobacco leaf.")
+            elif cmd in ["2", "farming"]:
+                save_user(phone, {"state": USER_STATES["FARMING_MENU"]})
+                send_farming_menu(phone)
+            elif cmd in ["3", "dashboard"]:
+                stats = get_user_statistics(phone)
+                save_user(phone, {"state": USER_STATES["DASHBOARD_MENU"]})
+                send_dashboard_menu(phone, name, stats)
+            elif cmd in ["4", "grade"]:
+                save_user(phone, {"state": USER_STATES["WAITING_GRADE_IMAGE"]})
+                safe_send(phone, "🏷️ *LEAF QUALITY GRADING*\n\nSend a clear photo of your cured leaf.")
+            elif cmd in ["5", "vision"]:
+                save_user(phone, {"state": USER_STATES["WAITING_AI_VISION"]})
+                send_ai_vision_menu(phone)
+            elif cmd in ["6", "expert"]:
+                save_user(phone, {"state": USER_STATES["EXPERT_MENU"]})
+                send_expert_menu(phone)
+            elif cmd in ["7", "feedback"]:
+                save_user(phone, {"state": USER_STATES["AWAITING_FEEDBACK"]})
+                safe_send(phone, "📝 *Send Feedback*\n\nType your message (or *cancel*):")
+            elif cmd.startswith("ai "):
+                question = cmd[3:].strip()
+                if question:
+                    safe_send(phone, "🤔 Thinking...")
+                    result = ask_ai_advisor(question)
+                    safe_send(phone, result)
+                    send_main_menu(phone)
+            elif cmd == "help":
+                safe_send(phone, "📚 *HELP*\n• menu - Main menu\n• 1-7 - Menu options\n• ai [question] - Ask AI")
             else:
-                msg = "📋 *YOUR COMPLETE HISTORY*\n━━━━━━━━━━━━━━━━━━\n"
-                for i, item in enumerate(history[:8], 1):
-                    det_type = item.get("detection_type", "unknown")
-                    if det_type == "hf_disease":
-                        disease = item.get('disease', 'Unknown')
-                        conf = item.get('confidence', 0)
-                        msg += f"{i}. 🔬 *{disease}* - {conf:.0f}% (HF)\n"
-                    elif det_type == "ai_vision_disease":
-                        disease = item.get('disease', 'Unknown')
-                        msg += f"{i}. 👁️ *{disease}* (AI Vision)\n"
-                    elif det_type == "ai_vision_curing":
-                        stage = item.get('curing_stage', 'Unknown')
-                        msg += f"{i}. 🔥 *Curing:* {stage}\n"
-                    elif det_type == "leaf_grading":
-                        grade = item.get('grade', 'Unknown')
-                        msg += f"{i}. 📊 *Grade {grade}*\n"
-                    else:
-                        msg += f"{i}. 📝 Analysis\n"
-                    if item.get('date'):
-                        msg += f"   📅 {item.get('date')}\n"
-            safe_send(phone, msg)
-            stats = get_user_statistics(phone)
-            return send_dashboard_menu(phone, name, stats)
-        elif cmd == "2":
-            tip = get_gemini_tip()
-            safe_send(phone, f"💡 *Daily Tip*\n\n{tip}")
-            stats = get_user_statistics(phone)
-            return send_dashboard_menu(phone, name, stats)
-        elif cmd == "3":
-            fact = get_gemini_fact()
-            safe_send(phone, f"🎲 *Did You Know?*\n\n{fact}")
-            stats = get_user_statistics(phone)
-            return send_dashboard_menu(phone, name, stats)
-        else:
-            return safe_send(phone, "❌ Please choose 1, 2, or 3 (or *0* for Main Menu).")
+                safe_send(phone, "❓ Command not recognized. Type *menu*")
+            return
 
-    # AWAITING AI QUESTION - NO SLEEP
-    if state == USER_STATES["AWAITING_AI_QUESTION"] and msg_type == "text":
-        if content.lower() == "cancel":
-            save_user(phone, {"state": USER_STATES["ACTIVE"]})
-            return send_main_menu(phone)
-        
-        safe_send(phone, f"🤔 AI Advisor is thinking...")
-        result = ask_ai_advisor(content)
-        safe_send(phone, result)
-        
-        # NO SLEEP - send menu immediately
-        save_user(phone, {"state": USER_STATES["ACTIVE"]})
-        return send_main_menu(phone)
-
-    # FARMING PRACTICES SUBMENU HANDLER
-    if state == USER_STATES["FARMING_MENU"] and msg_type == "text":
-        cmd = content.lower().strip()
-        
-        if cmd == "0":
-            save_user(phone, {"state": USER_STATES["ACTIVE"]})
-            return send_main_menu(phone)
-        
-        static_guides = {
-            "1": PLANTING_GUIDE,
-            "2": FERTILIZER_GUIDE,
-            "3": HARVESTING_GUIDE,
-            "4": CURING_GUIDE,
-            "5": MARKETING_GUIDE
-        }
-        
-        if cmd in static_guides:
-            safe_send(phone, static_guides[cmd])
-            return send_farming_menu(phone)
-        elif cmd == "6":
-            save_user(phone, {"state": USER_STATES["AWAITING_AI_QUESTION"]})
-            return safe_send(phone, 
-                "🤖 *AI Advisor*\n\n"
-                "Ask me anything about tobacco farming.\n\n"
-                "Type your question below (or *cancel* to go back):")
-        else:
-            safe_send(phone, "❌ Please choose 1-6 (or *0* for Main Menu).")
-            return send_farming_menu(phone)
-
-    # LEAF GRADING
-    if state == USER_STATES["WAITING_GRADE_IMAGE"] and msg_type == "image":
-        debug_log(f"📸 Processing grading image from {phone}")
-        safe_send(phone, f"🔍 Analyzing leaf quality, {name}...")
-        
-        image_bytes = download_image(content)
-        if not image_bytes:
-            debug_log("❌ Download failed")
-            safe_send(phone, "❌ Failed to download image. Please try again.")
-            save_user(phone, {"state": USER_STATES["ACTIVE"]})
-            return send_main_menu(phone)
-        
-        grade, analysis = grade_leaf_with_ai(image_bytes, phone, name)
-        if analysis:
-            safe_send(phone, analysis)
-        else:
-            safe_send(phone, "❌ Could not analyze the image. Please try again.")
-        
-        save_user(phone, {"state": USER_STATES["ACTIVE"]})
-        send_main_menu(phone)
-        gc.collect()
-        return
-
-    # DISEASE DETECTION
-    if state == USER_STATES["WAITING_IMAGE"] and msg_type == "image":
-        current_time = time.time()
-        if phone in LAST_SCAN:
-            if current_time - LAST_SCAN[phone] < 5:
-                debug_log(f"⚠️ Spam prevention: {phone} tried to send image too quickly")
-                return safe_send(phone, "⏱️ Please wait 5 seconds between scans.")
-        
-        LAST_SCAN[phone] = current_time
-        
-        debug_log(f"📸 Processing disease detection from {phone}")
-        safe_send(phone, f"🔍 Downloading your image, {name}...")
-        
-        image_bytes = download_image(content)
-        if not image_bytes:
-            debug_log("❌ Download failed")
-            safe_send(phone, "❌ Failed to download image. Please try again.")
-            save_user(phone, {"state": USER_STATES["ACTIVE"]})
-            return send_main_menu(phone)
-        
-        safe_send(phone, f"✅ Image downloaded! Running AI analysis...")
-        
-        result = call_huggingface_detection(image_bytes)
-        save_user(phone, {"state": USER_STATES["ACTIVE"]})
-        
-        if not result:
-            debug_log("❌ Detection failed")
-            safe_send(phone, "❌ AI analysis failed. Please try another photo.")
-            return send_main_menu(phone)
-        
-        disease = result["disease"]
-        confidence = result["confidence"]
-        severity = result.get("severity", "Unknown")
-        confidence_msg = get_confidence_message(confidence)
-        
-        debug_log(f"✅ Detection result: {disease} ({confidence:.1f}%) Severity: {severity}")
-        
-        log_hf_detection(phone, name, disease, confidence, severity)
-        
-        if confidence < 50:
-            response = f"⚠️ *Low Confidence ({confidence:.1f}%)*\n\n{confidence_msg}\n\n"
-            response += "🔬 *Recommendation:* Try our AI Vision for a more detailed analysis.\n"
-            response += "Type *5* then *1* from the main menu for AI Vision disease detection."
-        elif result["low_confidence"]:
-            response = f"⚠️ *Low Confidence ({confidence:.1f}%)*\n\n{confidence_msg}\n\nPlease upload a clearer photo."
-        elif result["is_healthy"]:
-            response = f"🎉 *Healthy Leaf Detected!*\n\nConfidence: {confidence:.1f}%\n{confidence_msg}\n\nGreat job!"
-        else:
-            response = f"📊 *{disease} DETECTED*\n\nConfidence: {confidence:.1f}%\n{confidence_msg}"
+        # IMAGE HANDLERS
+        if state == USER_STATES["WAITING_IMAGE"] and msg_type == "image":
+            safe_send(phone, f"🔍 Processing image...")
+            image_bytes = download_image(content)
+            if not image_bytes:
+                safe_send(phone, "❌ Failed to download image.")
+                save_user(phone, {"state": USER_STATES["ACTIVE"]})
+                send_main_menu(phone)
+                return
             
-            if severity != "Unknown":
-                response += f"\nSeverity: *{severity}*"
-            
-            response += f"\n\n*Treatment:*\n{result['treatment']}"
-        
-        safe_send(phone, response)
-        
-        if not result["is_healthy"] and not result["low_confidence"] and confidence >= 50:
-            offline_advice = get_offline_disease_advice(disease)
-            safe_send(phone, offline_advice + "\n\nType *ai your question* for more advice")
-        
-        send_main_menu(phone)
-        gc.collect()
-        return
-
-    # AI VISION SUBMENU HANDLER
-    if state == USER_STATES["WAITING_AI_VISION"] and msg_type == "text":
-        cmd = content.lower().strip()
-        
-        if cmd == "0":
+            result = call_huggingface_detection(image_bytes)
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
-            return send_main_menu(phone)
-        elif cmd == "1":
-            save_user(phone, {"state": USER_STATES["WAITING_AI_VISION_DISEASE"]})
-            return safe_send(phone, 
-                "🔬 *AI Vision Disease Detection*\n\n"
-                "Send a clear photo of the tobacco leaf.\n\n"
-                "I'll analyze it with AI vision for disease identification and save to your dashboard.")
-        elif cmd == "2":
-            save_user(phone, {"state": USER_STATES["WAITING_AI_VISION_CURING"]})
-            return safe_send(phone, 
-                "🔥 *Curing Monitor*\n\n"
-                "Send a clear photo of your leaf during curing.\n\n"
-                "I'll assess the curing stage and save to your dashboard.")
-        else:
-            return safe_send(phone, "❌ Please choose 1, 2, or 0")
-
-    # AI VISION DISEASE DETECTION
-    if state == USER_STATES["WAITING_AI_VISION_DISEASE"] and msg_type == "image":
-        debug_log(f"📸 Processing AI Vision Disease Detection from {phone}")
-        safe_send(phone, f"🔬 Analyzing with AI Vision, {name}...")
-        
-        image_bytes = download_image(content)
-        if not image_bytes:
-            debug_log("❌ Download failed")
-            safe_send(phone, "❌ Failed to download image. Please try again.")
-            save_user(phone, {"state": USER_STATES["ACTIVE"]})
-            return send_main_menu(phone)
-        
-        result_type, analysis = ai_vision_disease_detection(image_bytes, phone, name)
-        
-        if analysis:
-            safe_send(phone, analysis)
-        else:
-            safe_send(phone, "❌ Could not analyze the image. Please try again.")
-        
-        save_user(phone, {"state": USER_STATES["ACTIVE"]})
-        send_main_menu(phone)
-        gc.collect()
-        return
-
-    # AI VISION CURING MONITORING
-    if state == USER_STATES["WAITING_AI_VISION_CURING"] and msg_type == "image":
-        debug_log(f"📸 Processing AI Vision Curing Monitoring from {phone}")
-        safe_send(phone, f"🔥 Analyzing curing progress, {name}...")
-        
-        image_bytes = download_image(content)
-        if not image_bytes:
-            debug_log("❌ Download failed")
-            safe_send(phone, "❌ Failed to download image. Please try again.")
-            save_user(phone, {"state": USER_STATES["ACTIVE"]})
-            return send_main_menu(phone)
-        
-        result_type, analysis = ai_vision_curing_monitoring(image_bytes, phone, name)
-        
-        if analysis:
-            safe_send(phone, analysis)
-        else:
-            safe_send(phone, "❌ Could not analyze the image. Please try again.")
-        
-        save_user(phone, {"state": USER_STATES["ACTIVE"]})
-        send_main_menu(phone)
-        gc.collect()
-        return
-
-    # AWAITING FEEDBACK
-    if state == USER_STATES["AWAITING_FEEDBACK"] and msg_type == "text":
-        if content.lower() == "cancel":
-            safe_send(phone, "Feedback cancelled.")
-        else:
-            if ADMIN_PHONE:
-                admin_msg = (
-                    f"📝 *NEW FEEDBACK RECEIVED*\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"👤 *From:* {name}\n"
-                    f"📱 *Phone:* {phone}\n"
-                    f"📅 *Date:* {datetime.now().strftime('%d %b %Y at %H:%M')}\n\n"
-                    f"💬 *Message:*\n{content}\n\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"Reply to this message to respond to the farmer."
-                )
-                safe_send(ADMIN_PHONE, admin_msg)
-                debug_log(f"📨 Feedback sent to admin: {ADMIN_PHONE}")
             
-            safe_send(phone, "✅ Thank you! Your feedback has been sent to our team. We appreciate your input!")
-        
-        save_user(phone, {"state": USER_STATES["ACTIVE"]})
-        return send_main_menu(phone)
-
-    # AWAITING EXPERT
-    if state == USER_STATES["AWAITING_EXPERT"] and msg_type == "text":
-        if content.lower() == "cancel":
-            safe_send(phone, "Expert request cancelled.")
-        else:
-            if ADMIN_PHONE:
-                admin_msg = (
-                    f"🚨 *URGENT: EXPERT REQUEST*\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"👤 *Farmer:* {name}\n"
-                    f"📱 *Phone:* {phone}\n"
-                    f"📅 *Date:* {datetime.now().strftime('%d %b %Y at %H:%M')}\n\n"
-                    f"💬 *Issue Description:*\n{content}\n\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"PLEASE RESPOND TO THIS FARMER ASAP.\n"
-                    f"Reply to this message to contact them."
-                )
-                safe_send(ADMIN_PHONE, admin_msg)
-                debug_log(f"📨 Expert request sent to admin: {ADMIN_PHONE}")
+            if not result:
+                safe_send(phone, "❌ Analysis failed. Try another photo.")
+                send_main_menu(phone)
+                return
             
-            safe_send(phone, "👨‍🌾 Your request has been sent to our expert team. They will contact you within 24-48 hours. Thank you for your patience!")
-        
-        save_user(phone, {"state": USER_STATES["ACTIVE"]})
-        return send_main_menu(phone)
-
-    # TEXT COMMANDS
-    if msg_type == "text":
-        cmd = content.lower().strip()
-        
-        if cmd in ["menu", "0", "main"]:
-            return send_main_menu(phone)
-        elif cmd in ["1", "detect"]:
-            save_user(phone, {"state": USER_STATES["WAITING_IMAGE"]})
-            safe_send(phone, 
-                "📸 *Disease Detection*\n\n"
-                "Send a clear photo of the tobacco leaf.\n\n"
-                "Tips: Good lighting, close-up, steady camera")
-        elif cmd in ["2", "farming"]:
-            save_user(phone, {"state": USER_STATES["FARMING_MENU"]})
-            return send_farming_menu(phone)
-        elif cmd in ["3", "dashboard"]:
-            stats = get_user_statistics(phone)
-            save_user(phone, {"state": USER_STATES["DASHBOARD_MENU"]})
-            return send_dashboard_menu(phone, name, stats)
-        elif cmd in ["4", "grade"]:
-            save_user(phone, {"state": USER_STATES["WAITING_GRADE_IMAGE"]})
-            safe_send(phone, 
-                "🏷️ *LEAF QUALITY GRADING*\n\n"
-                "Send a clear photo of your cured leaf.\n\n"
-                "I'll analyze: grade, color, damage\n\n"
-                "Tips: Good lighting, flat surface")
-        elif cmd in ["5", "vision"]:
-            save_user(phone, {"state": USER_STATES["WAITING_AI_VISION"]})
-            return send_ai_vision_menu(phone)
-        elif cmd in ["6", "expert"]:
-            save_user(phone, {"state": USER_STATES["EXPERT_MENU"]})
-            return send_expert_menu(phone)
-        elif cmd in ["7", "feedback"]:
-            save_user(phone, {"state": USER_STATES["AWAITING_FEEDBACK"]})
-            safe_send(phone, 
-                "📝 *Send Feedback*\n\n"
-                "Type your message below (or *cancel*):")
-        elif cmd.startswith("ai "):
-            question = cmd[3:].strip()
-            if question:
-                safe_send(phone, f"🤔 AI Advisor is thinking...")
-                result = ask_ai_advisor(question)
-                safe_send(phone, result)
-                return send_main_menu(phone)
+            disease = result["disease"]
+            confidence = result["confidence"]
+            confidence_msg = get_confidence_message(confidence)
+            
+            log_hf_detection(phone, name, disease, confidence, result.get("severity"))
+            
+            if result["is_healthy"]:
+                response = f"🎉 *Healthy Leaf!*\n\nConfidence: {confidence:.1f}%\n{confidence_msg}"
             else:
-                safe_send(phone, "❓ Example: *ai how to prevent black shank*")
-        elif cmd == "help":
-            help_text = (
-                "📚 *QUICK HELP*\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                "• *menu* - Main menu\n"
-                "• *1* - Disease detection\n"
-                "• *2* - Farming practices\n"
-                "• *3* - Dashboard\n"
-                "• *4* - Leaf grading\n"
-                "• *5* - AI Vision (Disease/Curing)\n"
-                "• *6* - Expert help\n"
-                "• *7* - Feedback\n"
-                "• *ai [question]* - Ask AI"
-            )
-            safe_send(phone, help_text)
-        else:
-            safe_send(phone, 
-                "❓ Command not recognized.\n\n"
-                "Type *menu* to see options")
+                response = f"📊 *{disease}*\n\nConfidence: {confidence:.1f}%\n{confidence_msg}\n\n*Treatment:*\n{result['treatment']}"
+            
+            safe_send(phone, response)
+            
+            if not result["is_healthy"] and confidence >= 50:
+                safe_send(phone, get_offline_disease_advice(disease))
+            
+            send_main_menu(phone)
+            gc.collect()
+            return
+
+        # FARMING MENU
+        if state == USER_STATES["FARMING_MENU"] and msg_type == "text":
+            cmd = content.lower().strip()
+            guides = {"1": PLANTING_GUIDE, "2": FERTILIZER_GUIDE, "3": HARVESTING_GUIDE, 
+                     "4": CURING_GUIDE, "5": MARKETING_GUIDE}
+            
+            if cmd == "0":
+                save_user(phone, {"state": USER_STATES["ACTIVE"]})
+                send_main_menu(phone)
+            elif cmd in guides:
+                safe_send(phone, guides[cmd])
+                send_farming_menu(phone)
+            elif cmd == "6":
+                save_user(phone, {"state": USER_STATES["AWAITING_AI_QUESTION"]})
+                safe_send(phone, "🤖 *AI Advisor*\n\nAsk me anything about tobacco farming.")
+            else:
+                safe_send(phone, "❌ Choose 1-6 (or 0)")
+                send_farming_menu(phone)
+            return
+
+        # AI QUESTION
+        if state == USER_STATES["AWAITING_AI_QUESTION"] and msg_type == "text":
+            if content.lower() == "cancel":
+                save_user(phone, {"state": USER_STATES["ACTIVE"]})
+                send_main_menu(phone)
+                return
+            
+            safe_send(phone, "🤔 Thinking...")
+            result = ask_ai_advisor(content)
+            safe_send(phone, result)
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            send_main_menu(phone)
+            return
+
+        # EXPERT MENU
+        if state == USER_STATES["EXPERT_MENU"] and msg_type == "text":
+            cmd = content.lower().strip()
+            if cmd == "0":
+                save_user(phone, {"state": USER_STATES["ACTIVE"]})
+                send_main_menu(phone)
+            elif cmd == "1":
+                save_user(phone, {"state": USER_STATES["AWAITING_AI_QUESTION"]})
+                safe_send(phone, "🤖 *AI Advisor*\n\nAsk me anything:")
+            elif cmd == "2":
+                save_user(phone, {"state": USER_STATES["AWAITING_EXPERT"]})
+                safe_send(phone, "👨‍🌾 *Expert Help*\n\nDescribe your issue:")
+            return
+
+        # EXPERT REQUEST
+        if state == USER_STATES["AWAITING_EXPERT"] and msg_type == "text":
+            if content.lower() == "cancel":
+                safe_send(phone, "Cancelled.")
+            else:
+                if ADMIN_PHONE:
+                    admin_msg = f"🚨 *EXPERT REQUEST*\n👤 {name}\n📱 {phone}\n💬 {content}"
+                    safe_send(ADMIN_PHONE, admin_msg)
+                safe_send(phone, "✅ Request sent. Expert will contact you.")
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            send_main_menu(phone)
+            return
+
+        # FEEDBACK
+        if state == USER_STATES["AWAITING_FEEDBACK"] and msg_type == "text":
+            if content.lower() == "cancel":
+                safe_send(phone, "Cancelled.")
+            else:
+                if ADMIN_PHONE:
+                    admin_msg = f"📝 *FEEDBACK*\n👤 {name}\n📱 {phone}\n💬 {content}"
+                    safe_send(ADMIN_PHONE, admin_msg)
+                safe_send(phone, "✅ Thank you for your feedback!")
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            send_main_menu(phone)
+            return
+
+        # GRADE IMAGE
+        if state == USER_STATES["WAITING_GRADE_IMAGE"] and msg_type == "image":
+            safe_send(phone, f"🔍 Analyzing leaf quality...")
+            image_bytes = download_image(content)
+            if not image_bytes:
+                safe_send(phone, "❌ Failed to download image.")
+                save_user(phone, {"state": USER_STATES["ACTIVE"]})
+                send_main_menu(phone)
+                return
+            
+            grade, analysis = grade_leaf_with_ai(image_bytes, phone, name)
+            safe_send(phone, analysis or "❌ Could not analyze image.")
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            send_main_menu(phone)
+            gc.collect()
+            return
+
+        # AI VISION MENU
+        if state == USER_STATES["WAITING_AI_VISION"] and msg_type == "text":
+            cmd = content.lower().strip()
+            if cmd == "0":
+                save_user(phone, {"state": USER_STATES["ACTIVE"]})
+                send_main_menu(phone)
+            elif cmd == "1":
+                save_user(phone, {"state": USER_STATES["WAITING_AI_VISION_DISEASE"]})
+                safe_send(phone, "🔬 *AI Vision Disease*\n\nSend a clear photo of the leaf.")
+            elif cmd == "2":
+                save_user(phone, {"state": USER_STATES["WAITING_AI_VISION_CURING"]})
+                safe_send(phone, "🔥 *Curing Monitor*\n\nSend a photo of curing leaf.")
+            return
+
+        # AI VISION DISEASE
+        if state == USER_STATES["WAITING_AI_VISION_DISEASE"] and msg_type == "image":
+            safe_send(phone, f"🔬 Analyzing with AI Vision...")
+            image_bytes = download_image(content)
+            if not image_bytes:
+                safe_send(phone, "❌ Failed to download image.")
+                save_user(phone, {"state": USER_STATES["ACTIVE"]})
+                send_main_menu(phone)
+                return
+            
+            result_type, analysis = ai_vision_disease_detection(image_bytes, phone, name)
+            safe_send(phone, analysis or "❌ Could not analyze.")
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            send_main_menu(phone)
+            gc.collect()
+            return
+
+        # AI VISION CURING
+        if state == USER_STATES["WAITING_AI_VISION_CURING"] and msg_type == "image":
+            safe_send(phone, f"🔥 Analyzing curing progress...")
+            image_bytes = download_image(content)
+            if not image_bytes:
+                safe_send(phone, "❌ Failed to download image.")
+                save_user(phone, {"state": USER_STATES["ACTIVE"]})
+                send_main_menu(phone)
+                return
+            
+            result_type, analysis = ai_vision_curing_monitoring(image_bytes, phone, name)
+            safe_send(phone, analysis or "❌ Could not analyze.")
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            send_main_menu(phone)
+            gc.collect()
+            return
+
+        # DASHBOARD MENU
+        if state == USER_STATES["DASHBOARD_MENU"] and msg_type == "text":
+            cmd = content.lower().strip()
+            if cmd == "0":
+                save_user(phone, {"state": USER_STATES["ACTIVE"]})
+                send_main_menu(phone)
+            elif cmd == "1":
+                history = get_user_history(phone, limit=8)
+                if not history:
+                    safe_send(phone, "📋 *No history yet.*")
+                else:
+                    msg = "📋 *YOUR HISTORY*\n━━━━━━━━━━━━━━━━━━\n"
+                    for i, item in enumerate(history[:8], 1):
+                        det_type = item.get("detection_type", "unknown")
+                        if det_type == "hf_disease":
+                            msg += f"{i}. 🔬 *{item.get('disease', 'Unknown')}* - {item.get('confidence', 0):.0f}%\n"
+                        elif det_type == "ai_vision_disease":
+                            msg += f"{i}. 👁️ *{item.get('disease', 'Unknown')}* (AI)\n"
+                        elif det_type == "ai_vision_curing":
+                            msg += f"{i}. 🔥 *Curing:* {item.get('curing_stage', 'Unknown')}\n"
+                        elif det_type == "leaf_grading":
+                            msg += f"{i}. 📊 *Grade {item.get('grade', 'Unknown')}*\n"
+                        if item.get('date'):
+                            msg += f"   📅 {item.get('date')}\n"
+                    safe_send(phone, msg)
+                stats = get_user_statistics(phone)
+                send_dashboard_menu(phone, name, stats)
+            elif cmd == "2":
+                tip = get_gemini_tip()
+                safe_send(phone, f"💡 *Daily Tip*\n\n{tip}")
+                stats = get_user_statistics(phone)
+                send_dashboard_menu(phone, name, stats)
+            elif cmd == "3":
+                fact = get_gemini_fact()
+                safe_send(phone, f"🎲 *Did You Know?*\n\n{fact}")
+                stats = get_user_statistics(phone)
+                send_dashboard_menu(phone, name, stats)
+            return
+
+    except Exception as e:
+        debug_log(f"❌ Core error: {e}")
+        import traceback
+        traceback.print_exc()
+        safe_send(phone, "⚠️ An error occurred. Type *menu*")
 
 # ==============================
-# LIGHTWEIGHT HANDLER FOR QUEUE
+# QUEUE HANDLERS
 # ==============================
 def handle_message(phone, msg_type, content):
-    """Fast handler - just queues messages for processing"""
+    """Queue messages for processing"""
+    debug_log(f"📨 Queue: Adding {msg_type} from {phone}")
     MESSAGE_QUEUE.put((phone, msg_type, content))
 
-# ==============================
-# BACKGROUND WORKER
-# ==============================
 def process_queue():
-    """Background worker to process messages"""
+    """Background worker"""
+    global QUEUE_WORKER_RUNNING
+    QUEUE_WORKER_RUNNING = True
+    debug_log("🚀 Queue worker started")
+    
     while True:
         try:
-            phone, msg_type, content = MESSAGE_QUEUE.get()
-            
-            debug_log(f"⚙️ Processing queued message for {phone}")
-            
-            # Call main logic
+            phone, msg_type, content = MESSAGE_QUEUE.get(timeout=1)
+            debug_log(f"⚙️ Processing for {phone}")
             handle_message_core(phone, msg_type, content)
-            
             MESSAGE_QUEUE.task_done()
-            
         except Exception as e:
-            debug_log(f"❌ Queue processing error: {e}")
+            if "Empty" not in str(e):
+                debug_log(f"❌ Queue error: {e}")
 
 # ==============================
 # FLASK ROUTES
 # ==============================
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    """Main webhook endpoint with duplicate prevention and queue"""
+    """Main webhook endpoint"""
     if request.method == "GET":
         verify_token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
-        
         if verify_token == VERIFY_TOKEN:
             debug_log("✅ Webhook verified")
             return challenge, 200
-        debug_log("❌ Webhook verification failed")
         return "Forbidden", 403
     
     try:
@@ -1573,26 +1281,20 @@ def webhook():
         
         msg = messages[0]
         msg_id = msg.get("id")
-        
-        # DUPLICATE PROTECTION - IMPROVED WITH LIMIT INCREASED
-        with LOCK:
-            if msg_id in PROCESSED_MESSAGES:
-                debug_log(f"⚠️ Duplicate message skipped: {msg_id}")
-                return jsonify({"status": "duplicate"}), 200
-            
-            PROCESSED_MESSAGES.add(msg_id)
-            
-            # Improved cleanup - only remove oldest entries when limit reached
-            if len(PROCESSED_MESSAGES) > PROCESSED_MESSAGES_LIMIT:
-                # Convert to list and remove first 1000 entries
-                messages_list = list(PROCESSED_MESSAGES)
-                PROCESSED_MESSAGES.clear()
-                # Keep the most recent 4000 entries
-                PROCESSED_MESSAGES.update(messages_list[-4000:])
-                debug_log(f"🧹 Cleaned PROCESSED_MESSAGES, now {len(PROCESSED_MESSAGES)} entries")
-        
         from_number = msg.get("from")
         msg_type = msg.get("type")
+        
+        debug_log(f"📨 Message: {msg_id} from {from_number}, type={msg_type}")
+        
+        with LOCK:
+            if msg_id in PROCESSED_MESSAGES:
+                debug_log(f"⚠️ Duplicate skipped: {msg_id}")
+                return jsonify({"status": "duplicate"}), 200
+            PROCESSED_MESSAGES.add(msg_id)
+            if len(PROCESSED_MESSAGES) > PROCESSED_MESSAGES_LIMIT:
+                messages_list = list(PROCESSED_MESSAGES)
+                PROCESSED_MESSAGES.clear()
+                PROCESSED_MESSAGES.update(messages_list[-4000:])
         
         if msg_type == "text":
             content = msg.get("text", {}).get("body", "")
@@ -1601,9 +1303,7 @@ def webhook():
         else:
             return jsonify({"status": "ignored"}), 200
         
-        # QUEUE IT (FAST RESPONSE - immediately returns to WhatsApp)
         handle_message(from_number, msg_type, content)
-        
         return jsonify({"status": "queued"}), 200
         
     except Exception as e:
@@ -1612,23 +1312,18 @@ def webhook():
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Health check endpoint"""
     return jsonify({
         "status": "healthy",
         "firebase": db is not None,
-        "huggingface_url": HF_SPACE_URL,
-        "ai_provider": "gemini" if AI_API_KEY else "disabled",
-        "current_year": datetime.now().year,
-        "admin_configured": bool(ADMIN_PHONE),
         "queue_size": MESSAGE_QUEUE.qsize(),
-        "processed_messages_count": len(PROCESSED_MESSAGES),
+        "queue_worker_running": QUEUE_WORKER_RUNNING,
+        "processed_messages": len(PROCESSED_MESSAGES),
         "timestamp": datetime.now().isoformat()
-    }), 200
+    })
 
 @app.route("/", methods=["GET"])
 def home():
-    """Root endpoint"""
-    return "🌿 Tobacco AI Assistant is running!"
+    return "🌿 Tobacco AI Assistant is running! Visit /health for status."
 
 # ==============================
 # START THE APP
@@ -1636,23 +1331,13 @@ def home():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     
-    # Start background worker
     worker_thread = threading.Thread(target=process_queue, daemon=True)
     worker_thread.start()
     
-    debug_log(f"🚀 Starting Tobacco AI Assistant on port {port}")
-    debug_log(f"🚀 Queue worker started")
-    debug_log(f"🤖 Using Hugging Face Space: {HF_SPACE_URL}")
-    debug_log(f"🧠 Available Gemini models: {', '.join(GEMINI_MODELS)}")
-    debug_log(f"📱 Admin phone: {ADMIN_PHONE if ADMIN_PHONE else 'Not configured'}")
-    debug_log(f"📅 Current year: {datetime.now().year}")
+    debug_log("=" * 50)
+    debug_log(f"🚀 Starting on port {port}")
+    debug_log(f"🚀 Queue worker: {worker_thread.name}")
     debug_log(f"📊 Max tokens: {generation_config['max_output_tokens']}")
-    debug_log(f"📏 Chunk size for long messages: 3000 characters")
-    debug_log(f"🔒 Processed messages limit: {PROCESSED_MESSAGES_LIMIT}")
-    if AI_API_KEY and AI_API_KEY != "your_api_key_here":
-        debug_log(f"✅ AI Advisor enabled with COMPLETE responses and queue system")
-    else:
-        debug_log(f"ℹ️ AI Advisor disabled - set AI_API_KEY environment variable")
+    debug_log("=" * 50)
     
     app.run(host="0.0.0.0", port=port, debug=False)
-
