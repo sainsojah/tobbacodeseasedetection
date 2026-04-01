@@ -1,7 +1,9 @@
 """
 Tobacco AI Assistant - Render WhatsApp Bot
-Fixed: Complete responses, admin feedback working, increased token limits
-Added: PayNow Payment Integration (USD & ZWG)
+With PayNow Payments (USD & ZWG)
+Minimum donation: $0.50 USD / 15 ZWG
+All payment methods: EcoCash, InnBucks, OneMoney, Telecash, Zimswitch,
+Internet/Mobile Banking, POS2U, Visa/Mastercard
 """
 
 import os
@@ -12,8 +14,6 @@ import time
 import base64
 import re
 import gc
-import hashlib
-import hmac
 from flask import Flask, request, jsonify
 from datetime import datetime
 import firebase_admin
@@ -21,6 +21,16 @@ from firebase_admin import credentials, firestore
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import google.generativeai as genai
+
+# ==============================
+# PAYNOW LIBRARY
+# ==============================
+try:
+    from paynow import Paynow
+    PAYNOW_AVAILABLE = True
+except ImportError:
+    PAYNOW_AVAILABLE = False
+    print("⚠️ Paynow library not installed. Payments will be disabled.")
 
 # ==============================
 # INITIALIZATION
@@ -42,20 +52,30 @@ HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "https://saintsouldier-tobacco-ai.
 # AI API Keys
 AI_API_KEY = os.environ.get("AI_API_KEY")
 
-# PayNow API Configuration
+# PayNow Credentials (separate for USD and ZWG)
 PAYNOW_USD_API_KEY = os.environ.get("PAYNOW_USD_API_KEY")
-PAYNOW_USD_SECRET = os.environ.get("PAYNOW_USD_SECRET")
-PAYNOW_USD_ENDPOINT = os.environ.get("PAYNOW_USD_ENDPOINT", "https://api.paynow.co.zw/v1")
 PAYNOW_USD_MERCHANT_ID = os.environ.get("PAYNOW_USD_MERCHANT_ID")
-
 PAYNOW_ZWG_API_KEY = os.environ.get("PAYNOW_ZWG_API_KEY")
-PAYNOW_ZWG_SECRET = os.environ.get("PAYNOW_ZWG_SECRET")
-PAYNOW_ZWG_ENDPOINT = os.environ.get("PAYNOW_ZWG_ENDPOINT", "https://api.paynow.co.zw/v1")
 PAYNOW_ZWG_MERCHANT_ID = os.environ.get("PAYNOW_ZWG_MERCHANT_ID")
+RESULT_URL = os.environ.get("RESULT_URL")  # where PayNow sends payment status
 
-# Return URL for payment callback
-RETURN_URL = os.environ.get("RETURN_URL", "https://your-app.onrender.com/payment-callback")
-RESULT_URL = os.environ.get("RESULT_URL", "https://your-app.onrender.com/payment-result")
+# ==============================
+# PAYNOW INSTANCES
+# ==============================
+paynow_usd = None
+paynow_zwg = None
+
+if PAYNOW_AVAILABLE:
+    if PAYNOW_USD_API_KEY and PAYNOW_USD_MERCHANT_ID:
+        paynow_usd = Paynow(PAYNOW_USD_MERCHANT_ID, PAYNOW_USD_API_KEY, RESULT_URL, RESULT_URL)
+        debug_log("✅ PayNow USD initialized")
+    if PAYNOW_ZWG_API_KEY and PAYNOW_ZWG_MERCHANT_ID:
+        paynow_zwg = Paynow(PAYNOW_ZWG_MERCHANT_ID, PAYNOW_ZWG_API_KEY, RESULT_URL, RESULT_URL)
+        debug_log("✅ PayNow ZWG initialized")
+    if not paynow_usd and not paynow_zwg:
+        debug_log("⚠️ No PayNow credentials provided. Payments will be disabled.")
+else:
+    debug_log("⚠️ Paynow library not installed. Payments disabled.")
 
 # Configure Google Generative AI
 if AI_API_KEY and AI_API_KEY != "your_api_key_here":
@@ -77,7 +97,7 @@ GEMINI_MODELS = [
 # Spam prevention - cooldown dictionary
 LAST_SCAN = {}
 
-# INCREASED TOKEN LIMITS for complete responses
+# Generation configs
 generation_config = {
     "temperature": 0.7,
     "top_p": 0.8,
@@ -122,9 +142,8 @@ fact_config = {
     "max_output_tokens": 600,
 }
 
-# Higher limit for trimming - only used as safety net
 def trim_message(text, max_length=3000):
-    """Trim message to safe WhatsApp length (only as safety net)"""
+    """Trim message to safe WhatsApp length"""
     if not text:
         return "No response available."
     if len(text) > max_length:
@@ -135,7 +154,7 @@ def trim_message(text, max_length=3000):
 # HTTP SESSION WITH RETRIES
 # ==============================
 def create_session_with_retries():
-    """Create requests session with retry logic for API calls"""
+    """Create requests session with retry logic"""
     session = requests.Session()
     retries = Retry(
         total=3,
@@ -165,7 +184,7 @@ if FIREBASE_CONFIG:
         debug_log(f"❌ Firebase error: {e}")
 
 # ==============================
-# ENHANCED USER STATES - FIXED WITH ALL STATES + PAYMENT
+# ENHANCED USER STATES
 # ==============================
 USER_STATES = {
     "AWAITING_NAME": "awaiting_name",
@@ -181,359 +200,120 @@ USER_STATES = {
     "WAITING_AI_VISION": "waiting_ai_vision",
     "WAITING_AI_VISION_DISEASE": "waiting_ai_vision_disease",
     "WAITING_AI_VISION_CURING": "waiting_ai_vision_curing",
+    # Payment states
     "PAYMENT_MENU": "payment_menu",
-    "WAITING_PAYMENT_AMOUNT": "waiting_payment_amount",
-    "WAITING_PAYMENT_CURRENCY": "waiting_payment_currency",
-    "WAITING_PAYMENT_REFERENCE": "waiting_payment_reference"
+    "PAYMENT_CURRENCY": "payment_currency",
+    "PAYMENT_METHOD": "payment_method",
+    "PAYMENT_AMOUNT": "payment_amount",
+    "PAYMENT_INNBUCKS_CODE": "payment_innbucks_code",
+    "PAYMENT_PROCESSING": "payment_processing"
 }
 
 # ==============================
-# PAYNOW INTEGRATION
+# PAYMENT METHODS
 # ==============================
-
-def generate_paynow_signature(data, secret):
-    """Generate HMAC-SHA512 signature for PayNow"""
-    sorted_data = dict(sorted(data.items()))
-    signature_string = "&".join([f"{k}={v}" for k, v in sorted_data.items() if v])
-    signature = hmac.new(
-        secret.encode('utf-8'),
-        signature_string.encode('utf-8'),
-        hashlib.sha512
-    ).hexdigest()
-    return signature
-
-def create_paynow_payment(currency, amount, reference, email, phone, name):
-    """Create a PayNow payment link"""
-    
-    if currency.upper() == "USD":
-        api_key = PAYNOW_USD_API_KEY
-        secret = PAYNOW_USD_SECRET
-        merchant_id = PAYNOW_USD_MERCHANT_ID
-        endpoint = PAYNOW_USD_ENDPOINT
-    else:  # ZWG
-        api_key = PAYNOW_ZWG_API_KEY
-        secret = PAYNOW_ZWG_SECRET
-        merchant_id = PAYNOW_ZWG_MERCHANT_ID
-        endpoint = PAYNOW_ZWG_ENDPOINT
-    
-    if not all([api_key, secret, merchant_id]):
-        debug_log(f"❌ PayNow {currency} not configured")
-        return None, f"PayNow {currency} payment not configured"
-    
-    try:
-        # Generate unique transaction reference
-        transaction_ref = f"{reference}_{int(time.time())}"
-        
-        payload = {
-            "merchant_id": merchant_id,
-            "transaction_reference": transaction_ref,
-            "amount": str(amount),
-            "currency": currency.upper(),
-            "customer_name": name,
-            "customer_email": email or f"farmer_{phone}@tobacco.ai",
-            "customer_phone": phone,
-            "return_url": RETURN_URL,
-            "result_url": RESULT_URL,
-            "description": f"Tobacco AI Service - {reference}"
-        }
-        
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "X-PayNow-Signature": generate_paynow_signature(payload, secret)
-        }
-        
-        response = requests.post(
-            f"{endpoint}/transactions",
-            json=payload,
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            if result.get("success"):
-                payment_url = result.get("payment_url")
-                transaction_id = result.get("transaction_id")
-                debug_log(f"✅ PayNow payment created: {transaction_id} - {payment_url}")
-                
-                # Store payment in Firebase
-                if db:
-                    db.collection("payments").add({
-                        "phone": phone,
-                        "name": name,
-                        "amount": amount,
-                        "currency": currency,
-                        "reference": reference,
-                        "transaction_ref": transaction_ref,
-                        "transaction_id": transaction_id,
-                        "status": "pending",
-                        "created_at": firestore.SERVER_TIMESTAMP
-                    })
-                
-                return transaction_ref, payment_url
-            else:
-                debug_log(f"❌ PayNow error: {result}")
-                return None, result.get("message", "Payment creation failed")
-        else:
-            debug_log(f"❌ PayNow HTTP error: {response.status_code}")
-            return None, f"Payment service error: {response.status_code}"
-            
-    except Exception as e:
-        debug_log(f"❌ PayNow exception: {e}")
-        return None, str(e)
-
-def verify_paynow_payment(transaction_ref, currency):
-    """Verify payment status with PayNow"""
-    
-    if currency.upper() == "USD":
-        api_key = PAYNOW_USD_API_KEY
-        secret = PAYNOW_USD_SECRET
-        endpoint = PAYNOW_USD_ENDPOINT
-    else:
-        api_key = PAYNOW_ZWG_API_KEY
-        secret = PAYNOW_ZWG_SECRET
-        endpoint = PAYNOW_ZWG_ENDPOINT
-    
-    if not api_key:
-        return False, "API not configured"
-    
-    try:
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        response = requests.get(
-            f"{endpoint}/transactions/{transaction_ref}",
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            status = result.get("status")
-            debug_log(f"✅ Payment status for {transaction_ref}: {status}")
-            return status == "paid", result
-        else:
-            debug_log(f"❌ Payment verification error: {response.status_code}")
-            return False, None
-            
-    except Exception as e:
-        debug_log(f"❌ Payment verification exception: {e}")
-        return False, None
-
-# ==============================
-# PAYMENT PRODUCTS/SERVICES
-# ==============================
-
-PAYMENT_PRODUCTS = {
-    "1": {
-        "name": "Premium Support Package",
-        "description": "Priority support from tobacco experts",
-        "usd_price": 50,
-        "zwg_price": 2000,
-        "reference": "PREMIUM_SUPPORT"
-    },
-    "2": {
-        "name": "Disease Analysis Bundle (10 scans)",
-        "description": "10 AI disease detections with detailed reports",
-        "usd_price": 30,
-        "zwg_price": 1200,
-        "reference": "DISEASE_BUNDLE"
-    },
-    "3": {
-        "name": "Farm Consultation (1 hour)",
-        "description": "One-on-one consultation with agronomist",
-        "usd_price": 25,
-        "zwg_price": 1000,
-        "reference": "CONSULTATION"
-    },
-    "4": {
-        "name": "Custom Amount",
-        "description": "Enter your own amount",
-        "usd_price": None,
-        "zwg_price": None,
-        "reference": "CUSTOM"
-    }
+PAYMENT_METHODS = {
+    "USD": [
+        "EcoCash USD",
+        "InnBucks USD",
+        "Zimswitch USD",
+        "Internet/Mobile Banking USD",
+        "POS2U USD",
+        "Visa/Mastercard USD"
+    ],
+    "ZWG": [
+        "EcoCash ZWG",
+        "OneMoney ZWG",
+        "Telecash ZWG",
+        "Zimswitch ZWG",
+        "Internet/Mobile Banking ZWG",
+        "POS2U ZWG",
+        "Visa/Mastercard ZWG"
+    ]
 }
 
-def send_payment_menu(phone):
-    """Send payment options menu"""
-    menu = (
-        "💰 *PAYMENT OPTIONS*\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "Choose a service to pay for:\n\n"
-        "1️⃣ *Premium Support* - $50 USD / ZWG 2000\n"
-        "2️⃣ *Disease Bundle (10 scans)* - $30 USD / ZWG 1200\n"
-        "3️⃣ *Farm Consultation* - $25 USD / ZWG 1000\n"
-        "4️⃣ *Custom Amount*\n\n"
-        "0️⃣ Main Menu\n\n"
-        "Reply with number (e.g., *1*)"
-    )
-    return send_whatsapp(phone, menu)
+METHOD_TYPE = {
+    "EcoCash USD": {"type": "mobile", "method": "ecocash", "currency": "USD"},
+    "InnBucks USD": {"type": "mobile", "method": "innbucks", "currency": "USD"},
+    "Zimswitch USD": {"type": "link", "currency": "USD"},
+    "Internet/Mobile Banking USD": {"type": "link", "currency": "USD"},
+    "POS2U USD": {"type": "link", "currency": "USD"},
+    "Visa/Mastercard USD": {"type": "link", "currency": "USD"},
+    "EcoCash ZWG": {"type": "mobile", "method": "ecocash", "currency": "ZWG"},
+    "OneMoney ZWG": {"type": "mobile", "method": "onemoney", "currency": "ZWG"},
+    "Telecash ZWG": {"type": "mobile", "method": "telecash", "currency": "ZWG"},
+    "Zimswitch ZWG": {"type": "link", "currency": "ZWG"},
+    "Internet/Mobile Banking ZWG": {"type": "link", "currency": "ZWG"},
+    "POS2U ZWG": {"type": "link", "currency": "ZWG"},
+    "Visa/Mastercard ZWG": {"type": "link", "currency": "ZWG"}
+}
 
-def send_currency_menu(phone, product):
-    """Send currency selection menu"""
-    menu = (
-        f"💱 *SELECT CURRENCY*\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"Product: {product['name']}\n\n"
-        f"1️⃣ *USD* - ${product['usd_price'] if product['usd_price'] else 'Custom'}\n"
-        f"2️⃣ *ZWG* - ZWG {product['zwg_price'] if product['zwg_price'] else 'Custom'}\n\n"
-        f"0️⃣ Cancel\n\n"
-        f"Reply with 1 or 2"
-    )
-    return send_whatsapp(phone, menu)
-
-def process_payment(phone, name, currency, amount, reference, email=None):
-    """Process payment and send payment link"""
-    
-    debug_log(f"Processing payment: {phone} - {currency} {amount} - {reference}")
-    
-    # Create payment
-    transaction_ref, payment_url = create_paynow_payment(
-        currency=currency,
-        amount=amount,
-        reference=reference,
-        email=email,
-        phone=phone,
-        name=name
-    )
-    
-    if payment_url:
-        # Send payment link to user
-        payment_msg = (
-            f"💳 *PAYMENT LINK READY*\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"💰 Amount: {currency} {amount}\n"
-            f"📝 Reference: {reference}\n"
-            f"🔑 Transaction ID: {transaction_ref}\n\n"
-            f"Click the link below to complete payment:\n"
-            f"{payment_url}\n\n"
-            f"⚠️ *Important:* After payment, you'll receive a confirmation.\n"
-            f"Your services will be activated within 5 minutes.\n\n"
-            f"Type *payment status* to check payment status."
-        )
-        send_whatsapp(phone, payment_msg)
-        
-        # Store payment reference in user state
-        save_user(phone, {
-            "pending_payment": {
-                "transaction_ref": transaction_ref,
-                "currency": currency,
-                "amount": amount,
-                "reference": reference
-            }
-        })
-        
-        return True
-    else:
-        send_whatsapp(phone, f"❌ Payment creation failed: {payment_url}\nPlease try again later.")
-        return False
-
-def check_payment_status(phone, user_data):
-    """Check status of pending payment"""
-    
-    pending = user_data.get("pending_payment")
-    if not pending:
-        send_whatsapp(phone, "📭 No pending payment found.")
-        return
-    
-    transaction_ref = pending.get("transaction_ref")
-    currency = pending.get("currency")
-    
-    if not transaction_ref:
-        send_whatsapp(phone, "⚠️ Invalid payment reference. Please try again.")
-        return
-    
-    send_whatsapp(phone, f"🔍 Checking payment status for {transaction_ref}...")
-    
-    is_paid, result = verify_paynow_payment(transaction_ref, currency)
-    
-    if is_paid:
-        # Update payment in Firebase
-        if db:
-            try:
-                payments = db.collection("payments").where("transaction_ref", "==", transaction_ref).stream()
-                for payment in payments:
-                    payment.reference.update({"status": "paid", "paid_at": firestore.SERVER_TIMESTAMP})
-                
-                # Update user with activated services
-                user_ref = db.collection("users").document(phone)
-                user_ref.update({
-                    "paid_services": firestore.ArrayUnion([pending.get("reference")]),
-                    "pending_payment": firestore.DELETE_FIELD
-                })
-            except Exception as e:
-                debug_log(f"❌ Payment update error: {e}")
-        
-        send_whatsapp(phone, (
-            f"✅ *PAYMENT CONFIRMED!*\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"💰 Amount: {currency} {pending.get('amount')}\n"
-            f"📝 Service: {pending.get('reference')}\n\n"
-            f"Your service has been activated! 🎉\n"
-            f"Type *menu* to access your purchased services."
-        ))
-        
-        # Clear pending payment from user
-        save_user(phone, {"pending_payment": None})
-    else:
-        send_whatsapp(phone, (
-            f"⏳ *PAYMENT PENDING*\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"Transaction: {transaction_ref}\n\n"
-            f"Your payment is still pending.\n"
-            f"Please complete the payment using the link sent to you.\n\n"
-            f"Type *resend payment* to get the link again."
-        ))
-
-def resend_payment_link(phone, user_data):
-    """Resend payment link for pending transaction"""
-    
-    pending = user_data.get("pending_payment")
-    if not pending:
-        send_whatsapp(phone, "📭 No pending payment found.")
-        return
-    
-    transaction_ref = pending.get("transaction_ref")
-    currency = pending.get("currency")
-    
-    # Recreate payment link
-    try:
-        if currency.upper() == "USD":
-            api_key = PAYNOW_USD_API_KEY
-            endpoint = PAYNOW_USD_ENDPOINT
-        else:
-            api_key = PAYNOW_ZWG_API_KEY
-            endpoint = PAYNOW_ZWG_ENDPOINT
-        
-        headers = {"Authorization": f"Bearer {api_key}"}
-        
-        response = requests.get(
-            f"{endpoint}/transactions/{transaction_ref}",
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            payment_url = result.get("payment_url")
-            
-            if payment_url:
-                send_whatsapp(phone, f"🔄 *Payment Link Resent*\n\nClick to pay: {payment_url}")
-            else:
-                send_whatsapp(phone, "❌ Could not retrieve payment link. Please create a new payment.")
-        else:
-            send_whatsapp(phone, "❌ Could not retrieve payment details. Please create a new payment.")
-            
-    except Exception as e:
-        debug_log(f"❌ Resend payment error: {e}")
-        send_whatsapp(phone, "❌ Error retrieving payment link. Please try again.")
+MIN_AMOUNT_USD = 0.50
+MIN_AMOUNT_ZWG = 15
 
 # ==============================
-# DISEASE KNOWLEDGE BASE (Offline Fallback)
+# PAYMENT FUNCTIONS
+# ==============================
+def get_paynow_instance(currency):
+    """Return the correct PayNow instance for the currency"""
+    if currency == "USD":
+        return paynow_usd
+    elif currency == "ZWG":
+        return paynow_zwg
+    return None
+
+def start_mobile_payment(phone, name, amount, currency, method, innbucks_code=None):
+    """Initiate mobile payment using the appropriate PayNow instance"""
+    paynow = get_paynow_instance(currency)
+    if not paynow:
+        return False, f"PayNow {currency} not configured"
+
+    reference = f"Ref-{phone.replace('+', '')}-{currency}"
+    email = f"{phone}@tobacco.ai"
+
+    payment = paynow.create_payment(reference, email)
+    payment.add("Tobacco AI Service", amount)
+
+    try:
+        if method == 'innbucks' and innbucks_code:
+            response = paynow.send_mobile(payment, phone, method, innbucks_code)
+        else:
+            response = paynow.send_mobile(payment, phone, method)
+
+        if response.success:
+            poll_url = response.poll_url
+            debug_log(f"✅ {currency} payment initiated: {reference}")
+            return True, poll_url
+        else:
+            debug_log(f"❌ {currency} payment failed")
+            return False, "Payment initiation failed. Please try again."
+    except Exception as e:
+        debug_log(f"❌ {currency} payment exception: {e}")
+        return False, f"Error: {str(e)}"
+
+def generate_payment_link(phone, name, amount, currency, method_name):
+    """Generate a payment link using the appropriate PayNow instance"""
+    paynow = get_paynow_instance(currency)
+    if not paynow:
+        return False, f"PayNow {currency} not configured"
+
+    reference = f"Ref-{phone.replace('+', '')}-{currency}"
+    email = f"{phone}@tobacco.ai"
+
+    payment = paynow.create_payment(reference, email)
+    payment.add("Tobacco AI Service", amount)
+
+    response = paynow.send(payment)
+
+    if response.success:
+        link = response.redirect_url
+        debug_log(f"✅ {currency} payment link generated")
+        return True, link
+    else:
+        return False, "Could not generate payment link. Please try again."
+
+# ==============================
+# DISEASE KNOWLEDGE BASE
 # ==============================
 DISEASE_KNOWLEDGE_BASE = {
     "Black Shank": {
@@ -643,7 +423,7 @@ MARKETING_GUIDE = f"""💰 *MARKETING {datetime.now().year}*
 • Documents: ID, TIMB registration, grower number"""
 
 # ==============================
-# UPDATED USER STATISTICS FUNCTION - INCLUDES AI VISION
+# USER STATISTICS
 # ==============================
 def get_user_statistics(phone):
     """Get detailed statistics for a user including all detection types"""
@@ -658,11 +438,7 @@ def get_user_statistics(phone):
         }
     
     try:
-        # Get all detections
-        docs = db.collection("detections")\
-            .where("phone", "==", phone)\
-            .stream()
-        
+        docs = db.collection("detections").where("phone", "==", phone).stream()
         total_scans = 0
         hf_scans = 0
         ai_vision_scans = 0
@@ -675,7 +451,6 @@ def get_user_statistics(phone):
             total_scans += 1
             detection_type = data.get("detection_type", "hf_disease")
             
-            # Count by type
             if detection_type == "hf_disease":
                 hf_scans += 1
             elif detection_type == "ai_vision_disease":
@@ -683,7 +458,6 @@ def get_user_statistics(phone):
             elif detection_type == "ai_vision_curing":
                 curing_scans += 1
             
-            # Track diseases (excluding curing scans)
             disease = data.get("disease", "Unknown")
             if detection_type != "ai_vision_curing":
                 if disease == "Healthy" or "healthy" in disease.lower():
@@ -715,10 +489,9 @@ def get_user_statistics(phone):
         }
 
 # ==============================
-# CONFIDENCE INTERPRETATION
+# AI FUNCTIONS
 # ==============================
 def get_confidence_message(confidence):
-    """Return human-readable confidence level with emoji"""
     if confidence > 85:
         return "✔ *High Accuracy*"
     elif confidence > 60:
@@ -726,16 +499,10 @@ def get_confidence_message(confidence):
     else:
         return "❗ *Low Accuracy - please retake photo*"
 
-# ==============================
-# SEVERITY ESTIMATION FUNCTION
-# ==============================
 def estimate_severity(disease_area, leaf_area):
-    """Calculate severity based on disease area vs leaf area"""
     if leaf_area == 0:
         return "Unknown"
-    
     ratio = (disease_area / leaf_area) * 100
-    
     if ratio < 10:
         return "Mild"
     elif ratio < 40:
@@ -743,11 +510,7 @@ def estimate_severity(disease_area, leaf_area):
     else:
         return "Severe"
 
-# ==============================
-# OFFLINE DISEASE ADVICE
-# ==============================
 def get_offline_disease_advice(disease):
-    """Get disease advice from local knowledge base"""
     if disease in DISEASE_KNOWLEDGE_BASE:
         info = DISEASE_KNOWLEDGE_BASE[disease]
         return f"""📚 *{disease} - Quick Reference*
@@ -763,39 +526,29 @@ def get_offline_disease_advice(disease):
     else:
         return f"ℹ️ For specific advice on {disease}, please ask the AI advisor (type *ai your question*)"
 
-# ==============================
-# IMPROVED AI ADVISOR WITH CURRENT DATE
-# ==============================
 def ask_ai_advisor(question):
-    """AI advisor with current date reference"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return "🤖 AI advisor not configured. Please add API key."
     
-    # Check if question contains a known disease name
     disease_found = None
     for disease in DISEASE_KNOWLEDGE_BASE.keys():
         if disease.lower() in question.lower():
             disease_found = disease
             break
     
-    # Get current date for context
     current_date = datetime.now().strftime("%B %d, %Y")
     current_year = datetime.now().year
     current_month = datetime.now().strftime("%B")
     
-    # Try each model in sequence until one works
     for model_name in GEMINI_MODELS:
         try:
             time.sleep(1)
             debug_log(f"🔄 Trying Gemini model: {model_name}")
-            
             model = genai.GenerativeModel(
                 model_name=model_name,
                 generation_config=generation_config,
                 safety_settings=safety_settings
             )
-            
-            # Prompt with current date instruction
             prompt = f"""You are a Zimbabwe tobacco expert. Today's date is {current_date} ({current_month} {current_year}).
 
 Answer the following question using CURRENT information (2025-{current_year}) only. DO NOT reference 2024 or older data unless specifically asked about historical trends.
@@ -810,34 +563,25 @@ IMPORTANT GUIDELINES:
 5. End with a complete sentence - DO NOT cut off mid-sentence
 
 If asked about prices, volumes, or market conditions - provide estimates based on CURRENT {current_year} season projections."""
-
-            # Generate response
             response = model.generate_content(prompt)
-            
             if response and response.text:
                 answer = response.text.strip()
-                debug_log(f"✅ Success with model: {model_name} (response length: {len(answer)} chars)")
+                debug_log(f"✅ Success with model: {model_name}")
                 return answer
             else:
                 debug_log(f"⚠️ Empty response from {model_name}")
                 continue
-                
         except Exception as e:
             debug_log(f"❌ Error with {model_name}: {str(e)[:100]}")
             continue
     
-    # If all models fail, use fallback
     debug_log(f"⚠️ All Gemini models failed, using fallback")
     if disease_found:
         return get_offline_disease_advice(disease_found)
     else:
-        return f"⚠️ AI service temporarily unavailable. Please try again later or use the farming guides (type *menu*)."
+        return f"⚠️ AI service temporarily unavailable. Please try again later."
 
-# ==============================
-# AI VISION FOR DISEASE DETECTION (WITH FIREBASE LOGGING)
-# ==============================
 def ai_vision_disease_detection(image_bytes, phone, name):
-    """Use AI vision to detect diseases in tobacco leaf and log to Firebase"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return None, "AI vision not configured"
     
@@ -845,15 +589,12 @@ def ai_vision_disease_detection(image_bytes, phone, name):
         try:
             time.sleep(1)
             debug_log(f"🔄 AI Vision Disease Detection with model: {model_name}")
-            
             model = genai.GenerativeModel(
                 model_name=model_name,
                 generation_config=vision_config,
                 safety_settings=safety_settings
             )
-            
             image_data = base64.b64encode(image_bytes).decode('utf-8')
-            
             prompt = """You are a Zimbabwe tobacco disease expert. Analyze this leaf image and provide:
 
 🌿 *AI VISION DISEASE ANALYSIS*
@@ -865,24 +606,18 @@ def ai_vision_disease_detection(image_bytes, phone, name):
 • Recommended Action: [One sentence advice]
 
 Be specific and accurate. If you cannot identify any disease, state "Healthy" or "Unclear"."""
-
             response = model.generate_content([
                 prompt,
                 {"mime_type": "image/jpeg", "data": image_data}
             ])
-            
             if response and response.text:
                 analysis = response.text.strip()
                 debug_log(f"✅ AI Vision Disease Detection complete")
-                
-                # Extract disease name for logging
                 disease = "Unknown"
                 for line in analysis.split('\n'):
                     if "Detected Disease:" in line:
                         disease = line.split("Detected Disease:")[-1].strip()
                         break
-                
-                # Log to Firebase
                 if db:
                     try:
                         db.collection("detections").add({
@@ -896,23 +631,16 @@ Be specific and accurate. If you cannot identify any disease, state "Healthy" or
                         debug_log(f"📊 Logged AI Vision Disease: {disease}")
                     except Exception as e:
                         debug_log(f"❌ Firebase log error: {e}")
-                
                 return "disease", analysis
             else:
                 debug_log(f"⚠️ Empty response from {model_name}")
                 continue
-                
         except Exception as e:
             debug_log(f"❌ Error with {model_name}: {str(e)[:100]}")
             continue
-    
     return None, "⚠️ AI Vision service unavailable. Please try again later."
 
-# ==============================
-# AI VISION FOR CURING MONITORING (WITH FIREBASE LOGGING)
-# ==============================
 def ai_vision_curing_monitoring(image_bytes, phone, name):
-    """Use AI vision to monitor tobacco curing progress and log to Firebase"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return None, "AI vision not configured"
     
@@ -920,15 +648,12 @@ def ai_vision_curing_monitoring(image_bytes, phone, name):
         try:
             time.sleep(1)
             debug_log(f"🔄 AI Vision Curing Monitoring with model: {model_name}")
-            
             model = genai.GenerativeModel(
                 model_name=model_name,
                 generation_config=vision_config,
                 safety_settings=safety_settings
             )
-            
             image_data = base64.b64encode(image_bytes).decode('utf-8')
-            
             prompt = """You are a Zimbabwe tobacco curing expert. Analyze this leaf image and assess the curing progress:
 
 🔥 *CURING MONITORING REPORT*
@@ -940,24 +665,18 @@ def ai_vision_curing_monitoring(image_bytes, phone, name):
 • Recommendations: [What to do next in the curing process]
 
 Provide practical advice for the farmer based on what you see."""
-
             response = model.generate_content([
                 prompt,
                 {"mime_type": "image/jpeg", "data": image_data}
             ])
-            
             if response and response.text:
                 analysis = response.text.strip()
                 debug_log(f"✅ AI Vision Curing Monitoring complete")
-                
-                # Extract stage for logging
                 stage = "Unknown"
                 for line in analysis.split('\n'):
                     if "Current Stage:" in line:
                         stage = line.split("Current Stage:")[-1].strip()
                         break
-                
-                # Log to Firebase
                 if db:
                     try:
                         db.collection("detections").add({
@@ -971,23 +690,16 @@ Provide practical advice for the farmer based on what you see."""
                         debug_log(f"📊 Logged Curing Monitor: {stage}")
                     except Exception as e:
                         debug_log(f"❌ Firebase log error: {e}")
-                
                 return "curing", analysis
             else:
                 debug_log(f"⚠️ Empty response from {model_name}")
                 continue
-                
         except Exception as e:
             debug_log(f"❌ Error with {model_name}: {str(e)[:100]}")
             continue
-    
     return None, "⚠️ AI Vision service unavailable. Please try again later."
 
-# ==============================
-# AI LEAF GRADING (WITH FIREBASE LOGGING)
-# ==============================
 def grade_leaf_with_ai(image_bytes, phone, name):
-    """Grade leaf using google.generativeai library and log to Firebase"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return None, "AI grading not configured"
     
@@ -995,15 +707,12 @@ def grade_leaf_with_ai(image_bytes, phone, name):
         try:
             time.sleep(1)
             debug_log(f"🔄 Trying Gemini Vision with model: {model_name}")
-            
             model = genai.GenerativeModel(
                 model_name=model_name,
                 generation_config=vision_config,
                 safety_settings=safety_settings
             )
-            
             image_data = base64.b64encode(image_bytes).decode('utf-8')
-            
             prompt = """Grade this tobacco leaf thoroughly. Provide a COMPLETE analysis with ALL fields filled:
 
 📊 *LEAF GRADE RESULTS*
@@ -1015,18 +724,14 @@ def grade_leaf_with_ai(image_bytes, phone, name):
 • Market Value: [Premium/Good/Fair/Poor with brief explanation]
 
 IMPORTANT: Fill in ALL fields completely. Do not leave anything blank. End with a complete sentence."""
-
             for attempt in range(3):
                 try:
                     response = model.generate_content([
                         prompt,
                         {"mime_type": "image/jpeg", "data": image_data}
                     ])
-                    
                     if response and response.text:
                         analysis = response.text.strip()
-                        
-                        # Extract grade for logging
                         grade = "Unknown"
                         for line in analysis.split('\n'):
                             if "Grade" in line and ":" in line:
@@ -1034,8 +739,6 @@ IMPORTANT: Fill in ALL fields completely. Do not leave anything blank. End with 
                                 if len(parts) > 1:
                                     grade = parts[1].strip().split()[0] if parts[1].strip() else "Unknown"
                                     break
-                        
-                        # Log to Firebase
                         if db:
                             try:
                                 db.collection("detections").add({
@@ -1049,36 +752,28 @@ IMPORTANT: Fill in ALL fields completely. Do not leave anything blank. End with 
                                 debug_log(f"📊 Logged Leaf Grade: {grade}")
                             except Exception as e:
                                 debug_log(f"❌ Firebase log error: {e}")
-                        
                         if len(analysis) > 100:
                             debug_log(f"✅ Complete grading with model: {model_name}")
                             return "Grade", analysis
                         elif len(analysis) > 50:
-                            debug_log(f"⚠️ Partial grading from {model_name}, but sending anyway")
+                            debug_log(f"⚠️ Partial grading from {model_name}")
                             return "Grade", analysis
                         else:
-                            debug_log(f"⚠️ Response too short from {model_name}, attempt {attempt+1}")
+                            debug_log(f"⚠️ Response too short, attempt {attempt+1}")
                             time.sleep(2)
                     else:
-                        debug_log(f"⚠️ Empty response from {model_name}, attempt {attempt+1}")
+                        debug_log(f"⚠️ Empty response, attempt {attempt+1}")
                         time.sleep(2)
-                        
                 except Exception as e:
-                    debug_log(f"⚠️ Attempt {attempt+1} failed for {model_name}: {str(e)[:100]}")
+                    debug_log(f"⚠️ Attempt {attempt+1} failed: {str(e)[:100]}")
                     time.sleep(2)
                     continue
-                
         except Exception as e:
             debug_log(f"❌ Error with {model_name}: {str(e)[:100]}")
             continue
-    
     return None, "⚠️ Grading service temporarily unavailable. Please try again later."
 
-# ==============================
-# UPDATED HF DETECTION LOGGING
-# ==============================
 def log_hf_detection(phone, name, disease, confidence, severity=None):
-    """Log HF detection to Firebase"""
     if not db:
         return
     try:
@@ -1092,56 +787,44 @@ def log_hf_detection(phone, name, disease, confidence, severity=None):
         }
         if severity:
             data["severity"] = severity
-        
         db.collection("detections").add(data)
         debug_log(f"📊 Logged HF detection: {disease} ({confidence:.1f}%)")
     except Exception as e:
         debug_log(f"❌ Log error: {e}")
 
-# ==============================
-# IMPROVED DAILY TIP
-# ==============================
 def get_gemini_tip():
-    """Generate a fresh daily farming tip"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return random.choice([
-            "🚜 Rotate tobacco with maize or beans to prevent soil-borne diseases. This breaks pest cycles and improves soil fertility for the next season.",
-            "💧 Water in the morning to reduce humidity and prevent fungal growth. Evening watering can leave leaves wet overnight, promoting disease.",
-            "🔍 Check fields weekly for early signs of disease. Early detection allows for quick treatment before problems spread."
+            "🚜 Rotate tobacco with maize or beans to prevent soil-borne diseases.",
+            "💧 Water in the morning to reduce humidity and prevent fungal growth.",
+            "🔍 Check fields weekly for early signs of disease."
         ])
-    
     for model_name in GEMINI_MODELS:
         try:
             time.sleep(0.5)
-            
             current_month = datetime.now().strftime("%B")
             current_year = datetime.now().year
-            
             if current_month in ["November", "December", "January", "February", "March"]:
                 season = f"rainy/planting season {current_year}"
             elif current_month in ["April", "May", "June", "July"]:
                 season = f"harvesting/curing season {current_year}"
             else:
                 season = f"land preparation season {current_year}"
-            
             model = genai.GenerativeModel(
                 model_name=model_name,
                 generation_config=tip_config,
                 safety_settings=safety_settings
             )
-            
             prompt = f"""ONE practical farming tip for Zimbabwe tobacco farmers during {season}. 
 
 Requirements:
 - 3-4 complete sentences
 - Start with an emoji
 - Include specific details
-- End with a complete sentence (no cut-offs)
-- Use {current_year} context only
+- End with a complete sentence
 
 Tip:"""
             response = model.generate_content(prompt)
-            
             if response and response.text:
                 tip = response.text.strip()
                 if tip and tip[-1] not in ['.', '!', '?']:
@@ -1149,49 +832,39 @@ Tip:"""
                 return tip
             else:
                 continue
-                
         except Exception:
             continue
-    
     return random.choice([
-        f"🌱 Monitor your fields daily for early disease signs this {datetime.now().year} season. Check both upper and lower leaves for spots or discoloration.",
-        f"💧 Water early morning to prevent fungal growth during {datetime.now().year} planting. This allows leaves to dry before evening.",
-        f"🔍 Check lower leaves regularly for pests and diseases in {datetime.now().year}. Problems often start there before spreading upward."
+        f"🌱 Monitor your fields daily for early disease signs this {datetime.now().year} season.",
+        f"💧 Water early morning to prevent fungal growth during {datetime.now().year} planting.",
+        f"🔍 Check lower leaves regularly for pests and diseases in {datetime.now().year}."
     ])
 
-# ==============================
-# IMPROVED FUN FACT
-# ==============================
 def get_gemini_fact():
-    """Generate a fresh interesting fact"""
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
         return random.choice([
-            "🌱 Tobacco is related to tomatoes and potatoes! All three belong to the Solanaceae family, which is why they share similar pests and diseases.",
-            "🍃 Zimbabwe produces world-class flue-cured tobacco known for its golden color and sweet flavor, making it highly sought after in international markets.",
-            "📜 Tobacco has been cultivated for over 8,000 years, originally used for ceremonial and medicinal purposes by indigenous peoples."
+            "🌱 Tobacco is related to tomatoes and potatoes! All three belong to the Solanaceae family.",
+            "🍃 Zimbabwe produces world-class flue-cured tobacco known for its golden color.",
+            "📜 Tobacco has been cultivated for over 8,000 years."
         ])
-    
     for model_name in GEMINI_MODELS:
         try:
             time.sleep(0.5)
-            
             model = genai.GenerativeModel(
                 model_name=model_name,
                 generation_config=fact_config,
                 safety_settings=safety_settings
             )
-            
             prompt = f"""ONE interesting fact about Zimbabwe tobacco farming for {datetime.now().year}.
 
 Requirements:
 - 3-4 complete sentences
 - Start with an emoji
-- Include specific details or statistics
-- End with a complete sentence (no cut-offs)
+- Include specific details
+- End with a complete sentence
 
 Fact:"""
             response = model.generate_content(prompt)
-            
             if response and response.text:
                 fact = response.text.strip()
                 if fact and fact[-1] not in ['.', '!', '?']:
@@ -1199,24 +872,20 @@ Fact:"""
                 return fact
             else:
                 continue
-                
         except Exception:
             continue
-    
     return random.choice([
-        f"🌱 Zimbabwe's tobacco industry employs over 500,000 people in {datetime.now().year}. This includes farmers, laborers, and workers in processing and marketing sectors.",
-        "📜 Tobacco has been cultivated in Zimbabwe for over 8,000 years, originally used for ceremonial purposes by ancient communities.",
-        "🌍 Zimbabwe exports premium flue-cured tobacco to over 50 countries, with China, Belgium, and South Africa being the largest markets."
+        f"🌱 Zimbabwe's tobacco industry employs over 500,000 people in {datetime.now().year}.",
+        "📜 Tobacco has been cultivated in Zimbabwe for over 8,000 years.",
+        "🌍 Zimbabwe exports premium flue-cured tobacco to over 50 countries."
     ])
 
 # ==============================
 # HELPER FUNCTIONS
 # ==============================
 def send_whatsapp(to, text):
-    """Send WhatsApp message"""
     if not text:
         text = "Processing..."
-    
     url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
@@ -1237,7 +906,6 @@ def send_whatsapp(to, text):
         return False
 
 def send_whatsapp_with_retry(to, text, max_retries=3):
-    """Send WhatsApp with retry logic"""
     for attempt in range(max_retries):
         if send_whatsapp(to, text):
             return True
@@ -1245,7 +913,6 @@ def send_whatsapp_with_retry(to, text, max_retries=3):
     return False
 
 def get_user(phone):
-    """Get user from Firebase"""
     if not db:
         return None
     try:
@@ -1256,7 +923,6 @@ def get_user(phone):
         return None
 
 def save_user(phone, data):
-    """Save user to Firebase"""
     if not db:
         return False
     try:
@@ -1267,7 +933,6 @@ def save_user(phone, data):
         return False
 
 def download_image(media_id):
-    """Download image from WhatsApp"""
     try:
         debug_log(f"📥 Downloading media ID: {media_id}")
         url_resp = requests.get(
@@ -1278,19 +943,15 @@ def download_image(media_id):
         if url_resp.status_code != 200:
             debug_log(f"❌ Failed to get media URL: {url_resp.status_code}")
             return None
-        
         media_data = url_resp.json()
         media_url = media_data.get("url")
-        
         if not media_url:
             return None
-        
         img_resp = requests.get(
             media_url,
             headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
             timeout=30
         )
-        
         if img_resp.status_code == 200:
             debug_log(f"✅ Image downloaded: {len(img_resp.content)} bytes")
             return img_resp.content
@@ -1302,7 +963,6 @@ def download_image(media_id):
         return None
 
 def call_huggingface_detection(image_bytes):
-    """Call Hugging Face Space for ML detection"""
     try:
         debug_log("🔄 Calling Hugging Face ML service...")
         files = {'file': ('image.jpg', image_bytes, 'image/jpeg')}
@@ -1311,16 +971,13 @@ def call_huggingface_detection(image_bytes):
             files=files,
             timeout=35
         )
-        
         if response.status_code == 200:
             result = response.json()
             debug_log(f"✅ HF Response received")
-            
             if result.get("success"):
                 severity = "Unknown"
                 if result.get("bbox") and result.get("leaf_area"):
                     severity = estimate_severity(result.get("bbox"), result.get("leaf_area"))
-                
                 return {
                     "disease": result.get("disease"),
                     "confidence": result.get("confidence"),
@@ -1345,7 +1002,6 @@ def call_huggingface_detection(image_bytes):
         gc.collect()
 
 def get_user_history(phone, limit=10):
-    """Get user's complete history (all detection types)"""
     if not db:
         return []
     try:
@@ -1354,7 +1010,6 @@ def get_user_history(phone, limit=10):
             .order_by("timestamp", direction="DESCENDING")\
             .limit(limit)\
             .stream()
-        
         history = []
         for doc in docs:
             data = doc.to_dict()
@@ -1369,10 +1024,9 @@ def get_user_history(phone, limit=10):
         return []
 
 # ==============================
-# UPDATED MENU FUNCTIONS
+# MENU FUNCTIONS
 # ==============================
 def send_main_menu(phone):
-    """Helper function to send main menu - with 8 options including Payment"""
     menu = (
         "🌿 *TOBACCO AI MAIN MENU*\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -1383,14 +1037,13 @@ def send_main_menu(phone):
         "5️⃣ *AI Vision* - Disease/Curing analysis\n"
         "6️⃣ *Expert Help* - Agronomist & AI\n"
         "7️⃣ *Feedback* - Send comments\n"
-        "8️⃣ *Payments* - Buy services & support\n\n"
+        "8️⃣ *Payments* - Donate / Buy services\n\n"
         "Reply with number (e.g., *1*)\n"
         "Or type *help* for commands"
     )
     return send_whatsapp(phone, menu)
 
 def send_farming_menu(phone):
-    """Send farming practices submenu"""
     farming_menu = (
         "🌱 *FARMING PRACTICES*\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -1405,7 +1058,6 @@ def send_farming_menu(phone):
     return send_whatsapp(phone, farming_menu)
 
 def send_dashboard_menu(phone, name, stats):
-    """Updated dashboard menu with all detection types"""
     dashboard = (
         "📊 *MY DASHBOARD*\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -1428,7 +1080,6 @@ def send_dashboard_menu(phone, name, stats):
     return send_whatsapp(phone, dashboard)
 
 def send_expert_menu(phone):
-    """Send expert help menu"""
     expert_menu = (
         "👨‍🌾 *EXPERT HELP*\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -1439,7 +1090,6 @@ def send_expert_menu(phone):
     return send_whatsapp(phone, expert_menu)
 
 def send_ai_vision_menu(phone):
-    """Send AI vision options menu"""
     menu = (
         "🔬 *AI VISION OPTIONS*\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -1449,11 +1099,44 @@ def send_ai_vision_menu(phone):
     )
     return send_whatsapp(phone, menu)
 
+def send_currency_menu(phone):
+    menu = (
+        "💰 *SELECT CURRENCY*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "1️⃣ *USD* - US Dollar (min $0.50)\n"
+        "2️⃣ *ZWG* - Zimbabwe Gold (min 15 ZWG)\n\n"
+        "0️⃣ Main Menu\n\n"
+        "Reply with number"
+    )
+    return send_whatsapp(phone, menu)
+
+def send_methods_menu(phone, currency):
+    methods = PAYMENT_METHODS.get(currency, [])
+    if not methods:
+        send_whatsapp(phone, f"❌ No payment methods available for {currency}.")
+        return False
+    menu = f"💳 *PAYMENT METHODS ({currency})*\n━━━━━━━━━━━━━━━━━━\n"
+    for i, method in enumerate(methods, 1):
+        menu += f"{i}️⃣ *{method}*\n"
+    menu += "\n0️⃣ Main Menu\n\nReply with number"
+    return send_whatsapp(phone, menu)
+
+def send_amount_request(phone, currency, method_name):
+    min_amount = MIN_AMOUNT_USD if currency == "USD" else MIN_AMOUNT_ZWG
+    msg = (
+        f"💰 *ENTER AMOUNT ({currency})*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Payment method: {method_name}\n"
+        f"Minimum: {min_amount} {currency}\n\n"
+        f"Type the amount (e.g., 10.50)\n"
+        f"Type *cancel* to go back."
+    )
+    return send_whatsapp(phone, msg)
+
 # ==============================
-# UPDATED MESSAGE HANDLER - WITH ALL DETECTION TYPES LOGGED + PAYMENTS
+# MAIN MESSAGE HANDLER
 # ==============================
 def handle_message(phone, msg_type, content):
-    """Main message handler with improved response handling and payment integration"""
     debug_log(f"📨 Handling message: type={msg_type}, phone={phone}")
     
     user = get_user(phone)
@@ -1481,87 +1164,135 @@ def handle_message(phone, msg_type, content):
         )
         return send_whatsapp(phone, welcome_msg)
 
+    # ==============================
     # PAYMENT HANDLERS
+    # ==============================
     if state == USER_STATES["PAYMENT_MENU"] and msg_type == "text":
         cmd = content.lower().strip()
-        
         if cmd == "0":
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
             return send_main_menu(phone)
-        elif cmd in PAYMENT_PRODUCTS:
-            product = PAYMENT_PRODUCTS[cmd]
-            save_user(phone, {
-                "state": USER_STATES["WAITING_PAYMENT_CURRENCY"],
-                "selected_product": product
-            })
-            return send_currency_menu(phone, product)
+        elif cmd in ["1", "2"]:
+            currency = "USD" if cmd == "1" else "ZWG"
+            save_user(phone, {"state": USER_STATES["PAYMENT_CURRENCY"], "payment_currency": currency})
+            return send_methods_menu(phone, currency)
         else:
-            return send_whatsapp(phone, "❌ Please choose a valid option (1-4 or 0)")
+            return send_whatsapp(phone, "❌ Please choose 1 or 2 (or 0 to cancel).")
 
-    if state == USER_STATES["WAITING_PAYMENT_CURRENCY"] and msg_type == "text":
-        cmd = content.lower().strip()
-        product = user.get("selected_product")
-        
-        if not product:
+    if state == USER_STATES["PAYMENT_CURRENCY"] and msg_type == "text":
+        try:
+            method_index = int(content.strip()) - 1
+            currency = user.get("payment_currency")
+            methods = PAYMENT_METHODS.get(currency, [])
+            if 0 <= method_index < len(methods):
+                method_name = methods[method_index]
+                method_info = METHOD_TYPE[method_name]
+                save_user(phone, {
+                    "state": USER_STATES["PAYMENT_AMOUNT"],
+                    "payment_currency": currency,
+                    "payment_method_name": method_name,
+                    "payment_method_info": method_info
+                })
+                return send_amount_request(phone, currency, method_name)
+            else:
+                send_whatsapp(phone, "❌ Invalid selection.")
+                return send_methods_menu(phone, currency)
+        except ValueError:
+            send_whatsapp(phone, "❌ Please enter a number.")
+            return send_methods_menu(phone, currency)
+
+    if state == USER_STATES["PAYMENT_AMOUNT"] and msg_type == "text":
+        if content.lower().strip() == "cancel":
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
             return send_main_menu(phone)
-        
-        if cmd == "0":
-            save_user(phone, {"state": USER_STATES["ACTIVE"]})
-            return send_main_menu(phone)
-        elif cmd == "1":
-            currency = "USD"
-            amount = product.get("usd_price")
-            if amount is None:
-                # Custom amount - ask for amount
-                save_user(phone, {
-                    "state": USER_STATES["WAITING_PAYMENT_AMOUNT"],
-                    "selected_product": product,
-                    "selected_currency": currency
-                })
-                return send_whatsapp(phone, f"💰 Enter the amount in {currency}:\n\nExample: 10.00")
-            else:
-                # Process payment directly
-                process_payment(phone, name, currency, amount, product["reference"])
-                save_user(phone, {"state": USER_STATES["ACTIVE"]})
-                return
-        elif cmd == "2":
-            currency = "ZWG"
-            amount = product.get("zwg_price")
-            if amount is None:
-                save_user(phone, {
-                    "state": USER_STATES["WAITING_PAYMENT_AMOUNT"],
-                    "selected_product": product,
-                    "selected_currency": currency
-                })
-                return send_whatsapp(phone, f"💰 Enter the amount in ZWG:\n\nExample: 500")
-            else:
-                process_payment(phone, name, currency, amount, product["reference"])
-                save_user(phone, {"state": USER_STATES["ACTIVE"]})
-                return
-        else:
-            return send_whatsapp(phone, "❌ Please choose 1 (USD) or 2 (ZWG)")
-
-    if state == USER_STATES["WAITING_PAYMENT_AMOUNT"] and msg_type == "text":
         try:
             amount = float(content.strip())
-            if amount <= 0:
-                raise ValueError("Amount must be positive")
-            
-            product = user.get("selected_product")
-            currency = user.get("selected_currency")
-            
-            if product and currency:
-                process_payment(phone, name, currency, amount, product["reference"])
-                save_user(phone, {"state": USER_STATES["ACTIVE"]})
-            else:
-                send_whatsapp(phone, "❌ Payment session expired. Please start over.")
-                save_user(phone, {"state": USER_STATES["ACTIVE"]})
-                send_main_menu(phone)
-        except ValueError:
-            send_whatsapp(phone, "❌ Please enter a valid amount (e.g., 10.00)")
+            currency = user.get("payment_currency")
+            method_name = user.get("payment_method_name")
+            method_info = user.get("payment_method_info")
+            min_amount = MIN_AMOUNT_USD if currency == "USD" else MIN_AMOUNT_ZWG
+            if amount < min_amount:
+                send_whatsapp(phone, f"❌ Minimum amount is {min_amount} {currency}.")
+                return send_amount_request(phone, currency, method_name)
 
+            if method_info["type"] == "mobile":
+                mobile_method = method_info["method"]
+                if mobile_method == "innbucks":
+                    save_user(phone, {
+                        "state": USER_STATES["PAYMENT_INNBUCKS_CODE"],
+                        "payment_currency": currency,
+                        "payment_amount": amount,
+                        "payment_method_name": method_name,
+                        "payment_mobile_method": mobile_method
+                    })
+                    return send_whatsapp(phone,
+                        "🔑 *InnBucks Payment*\n\n"
+                        "1. Open your InnBucks app\n"
+                        "2. Generate an *Authorization Code*\n"
+                        "3. Type that code here\n\n"
+                        "Type *cancel* to go back.")
+                else:
+                    save_user(phone, {"state": USER_STATES["PAYMENT_PROCESSING"]})
+                    success, result = start_mobile_payment(phone, name, amount, currency, mobile_method)
+                    if success:
+                        save_user(phone, {"pending_payment": result, "payment_status": "pending"})
+                        send_whatsapp(phone,
+                            f"💸 *{method_name} Payment Initiated*\n\n"
+                            f"Amount: {amount:.2f} {currency}\n\n"
+                            f"Please check your phone for the PIN prompt and authorize.\n"
+                            f"We'll notify you once confirmed.")
+                    else:
+                        send_whatsapp(phone, f"❌ Payment failed: {result}")
+                        save_user(phone, {"state": USER_STATES["ACTIVE"]})
+                        send_main_menu(phone)
+            else:
+                # Link-based payment
+                success, link = generate_payment_link(phone, name, amount, currency, method_name)
+                if success:
+                    send_whatsapp(phone,
+                        f"💳 *{method_name} Payment Link*\n\n"
+                        f"Amount: {amount:.2f} {currency}\n\n"
+                        f"Click to pay: {link}\n\n"
+                        f"After payment, you'll receive confirmation.")
+                    save_user(phone, {"pending_payment": link, "payment_status": "link_sent"})
+                    time.sleep(5)
+                    save_user(phone, {"state": USER_STATES["ACTIVE"]})
+                    send_main_menu(phone)
+                else:
+                    send_whatsapp(phone, f"❌ Could not create payment link: {link}")
+                    save_user(phone, {"state": USER_STATES["ACTIVE"]})
+                    send_main_menu(phone)
+        except ValueError:
+            send_whatsapp(phone, "❌ Invalid amount.")
+            return send_amount_request(phone, currency, method_name)
+
+    if state == USER_STATES["PAYMENT_INNBUCKS_CODE"] and msg_type == "text":
+        if content.lower().strip() == "cancel":
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            return send_main_menu(phone)
+        code = content.strip()
+        currency = user.get("payment_currency")
+        amount = user.get("payment_amount")
+        mobile_method = user.get("payment_mobile_method")
+        if not all([currency, amount, mobile_method]):
+            send_whatsapp(phone, "⚠️ Session expired. Please start over.")
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            return send_main_menu(phone)
+        success, result = start_mobile_payment(phone, name, amount, currency, mobile_method, code)
+        if success:
+            save_user(phone, {"pending_payment": result, "payment_status": "pending"})
+            send_whatsapp(phone,
+                f"💸 *InnBucks Payment Initiated*\n\n"
+                f"Amount: {amount:.2f} {currency}\n\n"
+                f"Please authorize in your InnBucks app.")
+        else:
+            send_whatsapp(phone, f"❌ Payment failed: {result}")
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            send_main_menu(phone)
+
+    # ==============================
     # EXPERT MENU HANDLER
+    # ==============================
     if state == USER_STATES["EXPERT_MENU"] and msg_type == "text":
         cmd = content.lower().strip()
         
@@ -1583,7 +1314,9 @@ def handle_message(phone, msg_type, content):
         else:
             return send_whatsapp(phone, "❌ Please choose 1 or 2 (or *0* for Main Menu).")
     
-    # DASHBOARD MENU HANDLER - UPDATED FOR BETTER HISTORY
+    # ==============================
+    # DASHBOARD MENU HANDLER
+    # ==============================
     if state == USER_STATES["DASHBOARD_MENU"] and msg_type == "text":
         cmd = content.lower().strip()
         
@@ -1631,7 +1364,9 @@ def handle_message(phone, msg_type, content):
         else:
             return send_whatsapp(phone, "❌ Please choose 1, 2, or 3 (or *0* for Main Menu).")
 
-    # AWAITING AI QUESTION - WITH 20 SECOND DELAY
+    # ==============================
+    # AWAITING AI QUESTION
+    # ==============================
     if state == USER_STATES["AWAITING_AI_QUESTION"] and msg_type == "text":
         if content.lower() == "cancel":
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
@@ -1647,7 +1382,9 @@ def handle_message(phone, msg_type, content):
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         return send_main_menu(phone)
 
-    # FARMING PRACTICES SUBMENU HANDLER
+    # ==============================
+    # FARMING PRACTICES SUBMENU
+    # ==============================
     if state == USER_STATES["FARMING_MENU"] and msg_type == "text":
         cmd = content.lower().strip()
         
@@ -1676,7 +1413,9 @@ def handle_message(phone, msg_type, content):
             send_whatsapp(phone, "❌ Please choose 1-6 (or *0* for Main Menu).")
             return send_farming_menu(phone)
 
-    # LEAF GRADING - WITH FIREBASE LOGGING
+    # ==============================
+    # LEAF GRADING
+    # ==============================
     if state == USER_STATES["WAITING_GRADE_IMAGE"] and msg_type == "image":
         debug_log(f"📸 Processing grading image from {phone}")
         send_whatsapp(phone, f"🔍 Analyzing leaf quality, {name}...")
@@ -1701,7 +1440,9 @@ def handle_message(phone, msg_type, content):
         gc.collect()
         return
 
-    # DISEASE DETECTION - WITH UPDATED LOGGING
+    # ==============================
+    # DISEASE DETECTION
+    # ==============================
     if state == USER_STATES["WAITING_IMAGE"] and msg_type == "image":
         current_time = time.time()
         if phone in LAST_SCAN:
@@ -1738,10 +1479,8 @@ def handle_message(phone, msg_type, content):
         
         debug_log(f"✅ Detection result: {disease} ({confidence:.1f}%) Severity: {severity}")
         
-        # Log to Firebase using updated function
         log_hf_detection(phone, name, disease, confidence, severity)
         
-        # IMPROVEMENT: If confidence < 50%, recommend AI Vision
         if confidence < 50:
             response = f"⚠️ *Low Confidence ({confidence:.1f}%)*\n\n{confidence_msg}\n\n"
             response += "🔬 *Recommendation:* Try our AI Vision for a more detailed analysis.\n"
@@ -1770,7 +1509,9 @@ def handle_message(phone, msg_type, content):
         gc.collect()
         return
 
-    # AI VISION SUBMENU HANDLER
+    # ==============================
+    # AI VISION SUBMENU
+    # ==============================
     if state == USER_STATES["WAITING_AI_VISION"] and msg_type == "text":
         cmd = content.lower().strip()
         
@@ -1792,7 +1533,9 @@ def handle_message(phone, msg_type, content):
         else:
             return send_whatsapp(phone, "❌ Please choose 1, 2, or 0")
 
-    # AI VISION DISEASE DETECTION - WITH FIREBASE LOGGING
+    # ==============================
+    # AI VISION DISEASE DETECTION
+    # ==============================
     if state == USER_STATES["WAITING_AI_VISION_DISEASE"] and msg_type == "image":
         debug_log(f"📸 Processing AI Vision Disease Detection from {phone}")
         send_whatsapp(phone, f"🔬 Analyzing with AI Vision, {name}...")
@@ -1818,7 +1561,9 @@ def handle_message(phone, msg_type, content):
         gc.collect()
         return
 
-    # AI VISION CURING MONITORING - WITH FIREBASE LOGGING
+    # ==============================
+    # AI VISION CURING MONITORING
+    # ==============================
     if state == USER_STATES["WAITING_AI_VISION_CURING"] and msg_type == "image":
         debug_log(f"📸 Processing AI Vision Curing Monitoring from {phone}")
         send_whatsapp(phone, f"🔥 Analyzing curing progress, {name}...")
@@ -1844,7 +1589,9 @@ def handle_message(phone, msg_type, content):
         gc.collect()
         return
 
+    # ==============================
     # AWAITING FEEDBACK
+    # ==============================
     if state == USER_STATES["AWAITING_FEEDBACK"] and msg_type == "text":
         if content.lower() == "cancel":
             send_whatsapp(phone, "Feedback cancelled.")
@@ -1869,7 +1616,9 @@ def handle_message(phone, msg_type, content):
         time.sleep(2)
         return send_main_menu(phone)
 
+    # ==============================
     # AWAITING EXPERT
+    # ==============================
     if state == USER_STATES["AWAITING_EXPERT"] and msg_type == "text":
         if content.lower() == "cancel":
             send_whatsapp(phone, "Expert request cancelled.")
@@ -1895,7 +1644,9 @@ def handle_message(phone, msg_type, content):
         time.sleep(2)
         return send_main_menu(phone)
 
-    # TEXT COMMANDS - UPDATED FOR 8 OPTIONS + PAYMENT COMMANDS
+    # ==============================
+    # TEXT COMMANDS
+    # ==============================
     if msg_type == "text":
         cmd = content.lower().strip()
         
@@ -1932,13 +1683,15 @@ def handle_message(phone, msg_type, content):
             send_whatsapp(phone, 
                 "📝 *Send Feedback*\n\n"
                 "Type your message below (or *cancel*):")
-        elif cmd in ["8", "payment", "pay"]:
+        elif cmd in ["8", "pay", "payment", "donate"]:
             save_user(phone, {"state": USER_STATES["PAYMENT_MENU"]})
-            return send_payment_menu(phone)
+            return send_currency_menu(phone)
         elif cmd == "payment status":
-            check_payment_status(phone, user)
-        elif cmd == "resend payment":
-            resend_payment_link(phone, user)
+            pending = user.get("pending_payment")
+            if pending:
+                send_whatsapp(phone, "Your payment is being processed. You will receive confirmation soon.")
+            else:
+                send_whatsapp(phone, "No pending payment found.")
         elif cmd.startswith("ai "):
             question = cmd[3:].strip()
             if question:
@@ -1963,10 +1716,9 @@ def handle_message(phone, msg_type, content):
                 "• *5* - AI Vision (Disease/Curing)\n"
                 "• *6* - Expert help\n"
                 "• *7* - Feedback\n"
-                "• *8* - Payments\n"
-                "• *payment status* - Check payment\n"
-                "• *resend payment* - Resend link\n"
-                "• *ai [question]* - Ask AI"
+                "• *8* - Payments (Donate / Buy services)\n"
+                "• *ai [question]* - Ask AI\n"
+                "• *payment status* - Check pending payment"
             )
             send_whatsapp(phone, help_text)
         else:
@@ -1975,63 +1727,44 @@ def handle_message(phone, msg_type, content):
                 "Type *menu* to see options")
 
 # ==============================
-# PAYMENT CALLBACK ROUTES
+# PAYNOW CALLBACK ROUTE
 # ==============================
+@app.route("/paynow_update", methods=["POST"])
+def paynow_update():
+    """Handle PayNow payment confirmation"""
+    data = request.form
+    debug_log(f"PayNow callback received: {data}")
 
-@app.route("/payment-callback", methods=["GET", "POST"])
-def payment_callback():
-    """Handle PayNow payment callback"""
-    debug_log(f"Payment callback received: {request.method}")
+    status = data.get("status")
+    reference = data.get("reference")
     
-    if request.method == "POST":
-        data = request.json
-        debug_log(f"Callback data: {data}")
-        
-        # Verify signature
-        # ... implement signature verification based on PayNow docs
-        
-        transaction_ref = data.get("transaction_reference")
-        status = data.get("status")
-        
-        if transaction_ref and status == "paid":
-            # Update payment in Firebase
-            if db:
-                try:
-                    payments = db.collection("payments").where("transaction_ref", "==", transaction_ref).stream()
-                    for payment in payments:
-                        payment.reference.update({
-                            "status": "paid",
-                            "callback_data": data,
-                            "paid_at": firestore.SERVER_TIMESTAMP
-                        })
-                    
-                    # Get user phone
-                    payment_doc = payments[0].to_dict()
-                    phone = payment_doc.get("phone")
-                    
-                    if phone:
-                        # Notify user
-                        send_whatsapp(phone, (
-                            f"✅ *PAYMENT CONFIRMED!*\n"
-                            f"━━━━━━━━━━━━━━━━━━\n"
-                            f"Your payment has been confirmed.\n"
-                            f"Transaction: {transaction_ref}\n\n"
-                            f"Your service has been activated! 🎉"
-                        ))
-                        
-                        # Clear pending payment
+    if reference and reference.startswith("Ref-"):
+        # reference format: Ref-<phone>-<currency>
+        parts = reference.split("-")
+        if len(parts) >= 2:
+            phone = parts[1]
+            if status and status.lower() == "paid":
+                debug_log(f"✅ Payment confirmed for {phone}")
+                if db:
+                    try:
                         user_ref = db.collection("users").document(phone)
+                        user_ref.update({
+                            "premium": True,
+                            "premium_since": firestore.SERVER_TIMESTAMP,
+                            "payment_status": "completed"
+                        })
                         user_ref.update({"pending_payment": firestore.DELETE_FIELD})
-                        
-                except Exception as e:
-                    debug_log(f"❌ Callback update error: {e}")
-    
-    return jsonify({"status": "ok"}), 200
-
-@app.route("/payment-result", methods=["GET", "POST"])
-def payment_result():
-    """Handle PayNow result page"""
-    return "Payment processing complete. You can close this window."
+                        debug_log(f"✅ Updated user {phone} to premium")
+                    except Exception as e:
+                        debug_log(f"❌ Firebase update error: {e}")
+                # Notify user
+                send_whatsapp(phone, 
+                    "🎉 *PAYMENT RECEIVED!*\n\n"
+                    "Thank you for your support! Your contribution helps us improve the service.\n\n"
+                    "Type *menu* to continue.")
+            else:
+                debug_log(f"⚠️ Payment not paid for {phone}: {status}")
+    return "OK", 200
 
 # ==============================
 # FLASK ROUTES
@@ -2092,8 +1825,8 @@ def health():
         "ai_provider": "gemini" if AI_API_KEY else "disabled",
         "current_year": datetime.now().year,
         "admin_configured": bool(ADMIN_PHONE),
-        "paynow_usd_configured": bool(PAYNOW_USD_API_KEY),
-        "paynow_zwg_configured": bool(PAYNOW_ZWG_API_KEY),
+        "paynow_usd_configured": bool(paynow_usd),
+        "paynow_zwg_configured": bool(paynow_zwg),
         "timestamp": datetime.now().isoformat()
     }), 200
 
@@ -2111,12 +1844,11 @@ if __name__ == "__main__":
     debug_log(f"🤖 Using Hugging Face Space: {HF_SPACE_URL}")
     debug_log(f"🧠 Available Gemini models: {', '.join(GEMINI_MODELS)}")
     debug_log(f"📱 Admin phone: {ADMIN_PHONE if ADMIN_PHONE else 'Not configured'}")
-    debug_log(f"💰 PayNow USD: {'Configured' if PAYNOW_USD_API_KEY else 'Not configured'}")
-    debug_log(f"💰 PayNow ZWG: {'Configured' if PAYNOW_ZWG_API_KEY else 'Not configured'}")
+    debug_log(f"💰 PayNow USD: {'Configured' if paynow_usd else 'Not configured'}")
+    debug_log(f"💰 PayNow ZWG: {'Configured' if paynow_zwg else 'Not configured'}")
     debug_log(f"📅 Current year: {datetime.now().year}")
     if AI_API_KEY and AI_API_KEY != "your_api_key_here":
         debug_log(f"✅ AI Advisor enabled with CURRENT YEAR focus and 20-second delay")
     else:
         debug_log(f"ℹ️ AI Advisor disabled - set AI_API_KEY environment variable")
     app.run(host="0.0.0.0", port=port, debug=False)
-    
