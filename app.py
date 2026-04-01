@@ -1,6 +1,7 @@
 """
 Tobacco AI Assistant - Render WhatsApp Bot
 Fixed: Complete responses, admin feedback working, increased token limits
+Added: PayNow Payment Integration (USD & ZWG)
 """
 
 import os
@@ -11,6 +12,8 @@ import time
 import base64
 import re
 import gc
+import hashlib
+import hmac
 from flask import Flask, request, jsonify
 from datetime import datetime
 import firebase_admin
@@ -38,6 +41,21 @@ HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "https://saintsouldier-tobacco-ai.
 
 # AI API Keys
 AI_API_KEY = os.environ.get("AI_API_KEY")
+
+# PayNow API Configuration
+PAYNOW_USD_API_KEY = os.environ.get("PAYNOW_USD_API_KEY")
+PAYNOW_USD_SECRET = os.environ.get("PAYNOW_USD_SECRET")
+PAYNOW_USD_ENDPOINT = os.environ.get("PAYNOW_USD_ENDPOINT", "https://api.paynow.co.zw/v1")
+PAYNOW_USD_MERCHANT_ID = os.environ.get("PAYNOW_USD_MERCHANT_ID")
+
+PAYNOW_ZWG_API_KEY = os.environ.get("PAYNOW_ZWG_API_KEY")
+PAYNOW_ZWG_SECRET = os.environ.get("PAYNOW_ZWG_SECRET")
+PAYNOW_ZWG_ENDPOINT = os.environ.get("PAYNOW_ZWG_ENDPOINT", "https://api.paynow.co.zw/v1")
+PAYNOW_ZWG_MERCHANT_ID = os.environ.get("PAYNOW_ZWG_MERCHANT_ID")
+
+# Return URL for payment callback
+RETURN_URL = os.environ.get("RETURN_URL", "https://your-app.onrender.com/payment-callback")
+RESULT_URL = os.environ.get("RESULT_URL", "https://your-app.onrender.com/payment-result")
 
 # Configure Google Generative AI
 if AI_API_KEY and AI_API_KEY != "your_api_key_here":
@@ -147,7 +165,7 @@ if FIREBASE_CONFIG:
         debug_log(f"❌ Firebase error: {e}")
 
 # ==============================
-# ENHANCED USER STATES - FIXED WITH ALL STATES
+# ENHANCED USER STATES - FIXED WITH ALL STATES + PAYMENT
 # ==============================
 USER_STATES = {
     "AWAITING_NAME": "awaiting_name",
@@ -162,8 +180,357 @@ USER_STATES = {
     "DASHBOARD_MENU": "dashboard_menu",
     "WAITING_AI_VISION": "waiting_ai_vision",
     "WAITING_AI_VISION_DISEASE": "waiting_ai_vision_disease",
-    "WAITING_AI_VISION_CURING": "waiting_ai_vision_curing"
+    "WAITING_AI_VISION_CURING": "waiting_ai_vision_curing",
+    "PAYMENT_MENU": "payment_menu",
+    "WAITING_PAYMENT_AMOUNT": "waiting_payment_amount",
+    "WAITING_PAYMENT_CURRENCY": "waiting_payment_currency",
+    "WAITING_PAYMENT_REFERENCE": "waiting_payment_reference"
 }
+
+# ==============================
+# PAYNOW INTEGRATION
+# ==============================
+
+def generate_paynow_signature(data, secret):
+    """Generate HMAC-SHA512 signature for PayNow"""
+    sorted_data = dict(sorted(data.items()))
+    signature_string = "&".join([f"{k}={v}" for k, v in sorted_data.items() if v])
+    signature = hmac.new(
+        secret.encode('utf-8'),
+        signature_string.encode('utf-8'),
+        hashlib.sha512
+    ).hexdigest()
+    return signature
+
+def create_paynow_payment(currency, amount, reference, email, phone, name):
+    """Create a PayNow payment link"""
+    
+    if currency.upper() == "USD":
+        api_key = PAYNOW_USD_API_KEY
+        secret = PAYNOW_USD_SECRET
+        merchant_id = PAYNOW_USD_MERCHANT_ID
+        endpoint = PAYNOW_USD_ENDPOINT
+    else:  # ZWG
+        api_key = PAYNOW_ZWG_API_KEY
+        secret = PAYNOW_ZWG_SECRET
+        merchant_id = PAYNOW_ZWG_MERCHANT_ID
+        endpoint = PAYNOW_ZWG_ENDPOINT
+    
+    if not all([api_key, secret, merchant_id]):
+        debug_log(f"❌ PayNow {currency} not configured")
+        return None, f"PayNow {currency} payment not configured"
+    
+    try:
+        # Generate unique transaction reference
+        transaction_ref = f"{reference}_{int(time.time())}"
+        
+        payload = {
+            "merchant_id": merchant_id,
+            "transaction_reference": transaction_ref,
+            "amount": str(amount),
+            "currency": currency.upper(),
+            "customer_name": name,
+            "customer_email": email or f"farmer_{phone}@tobacco.ai",
+            "customer_phone": phone,
+            "return_url": RETURN_URL,
+            "result_url": RESULT_URL,
+            "description": f"Tobacco AI Service - {reference}"
+        }
+        
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "X-PayNow-Signature": generate_paynow_signature(payload, secret)
+        }
+        
+        response = requests.post(
+            f"{endpoint}/transactions",
+            json=payload,
+            headers=headers,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("success"):
+                payment_url = result.get("payment_url")
+                transaction_id = result.get("transaction_id")
+                debug_log(f"✅ PayNow payment created: {transaction_id} - {payment_url}")
+                
+                # Store payment in Firebase
+                if db:
+                    db.collection("payments").add({
+                        "phone": phone,
+                        "name": name,
+                        "amount": amount,
+                        "currency": currency,
+                        "reference": reference,
+                        "transaction_ref": transaction_ref,
+                        "transaction_id": transaction_id,
+                        "status": "pending",
+                        "created_at": firestore.SERVER_TIMESTAMP
+                    })
+                
+                return transaction_ref, payment_url
+            else:
+                debug_log(f"❌ PayNow error: {result}")
+                return None, result.get("message", "Payment creation failed")
+        else:
+            debug_log(f"❌ PayNow HTTP error: {response.status_code}")
+            return None, f"Payment service error: {response.status_code}"
+            
+    except Exception as e:
+        debug_log(f"❌ PayNow exception: {e}")
+        return None, str(e)
+
+def verify_paynow_payment(transaction_ref, currency):
+    """Verify payment status with PayNow"""
+    
+    if currency.upper() == "USD":
+        api_key = PAYNOW_USD_API_KEY
+        secret = PAYNOW_USD_SECRET
+        endpoint = PAYNOW_USD_ENDPOINT
+    else:
+        api_key = PAYNOW_ZWG_API_KEY
+        secret = PAYNOW_ZWG_SECRET
+        endpoint = PAYNOW_ZWG_ENDPOINT
+    
+    if not api_key:
+        return False, "API not configured"
+    
+    try:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        response = requests.get(
+            f"{endpoint}/transactions/{transaction_ref}",
+            headers=headers,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            status = result.get("status")
+            debug_log(f"✅ Payment status for {transaction_ref}: {status}")
+            return status == "paid", result
+        else:
+            debug_log(f"❌ Payment verification error: {response.status_code}")
+            return False, None
+            
+    except Exception as e:
+        debug_log(f"❌ Payment verification exception: {e}")
+        return False, None
+
+# ==============================
+# PAYMENT PRODUCTS/SERVICES
+# ==============================
+
+PAYMENT_PRODUCTS = {
+    "1": {
+        "name": "Premium Support Package",
+        "description": "Priority support from tobacco experts",
+        "usd_price": 50,
+        "zwg_price": 2000,
+        "reference": "PREMIUM_SUPPORT"
+    },
+    "2": {
+        "name": "Disease Analysis Bundle (10 scans)",
+        "description": "10 AI disease detections with detailed reports",
+        "usd_price": 30,
+        "zwg_price": 1200,
+        "reference": "DISEASE_BUNDLE"
+    },
+    "3": {
+        "name": "Farm Consultation (1 hour)",
+        "description": "One-on-one consultation with agronomist",
+        "usd_price": 25,
+        "zwg_price": 1000,
+        "reference": "CONSULTATION"
+    },
+    "4": {
+        "name": "Custom Amount",
+        "description": "Enter your own amount",
+        "usd_price": None,
+        "zwg_price": None,
+        "reference": "CUSTOM"
+    }
+}
+
+def send_payment_menu(phone):
+    """Send payment options menu"""
+    menu = (
+        "💰 *PAYMENT OPTIONS*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Choose a service to pay for:\n\n"
+        "1️⃣ *Premium Support* - $50 USD / ZWG 2000\n"
+        "2️⃣ *Disease Bundle (10 scans)* - $30 USD / ZWG 1200\n"
+        "3️⃣ *Farm Consultation* - $25 USD / ZWG 1000\n"
+        "4️⃣ *Custom Amount*\n\n"
+        "0️⃣ Main Menu\n\n"
+        "Reply with number (e.g., *1*)"
+    )
+    return send_whatsapp(phone, menu)
+
+def send_currency_menu(phone, product):
+    """Send currency selection menu"""
+    menu = (
+        f"💱 *SELECT CURRENCY*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Product: {product['name']}\n\n"
+        f"1️⃣ *USD* - ${product['usd_price'] if product['usd_price'] else 'Custom'}\n"
+        f"2️⃣ *ZWG* - ZWG {product['zwg_price'] if product['zwg_price'] else 'Custom'}\n\n"
+        f"0️⃣ Cancel\n\n"
+        f"Reply with 1 or 2"
+    )
+    return send_whatsapp(phone, menu)
+
+def process_payment(phone, name, currency, amount, reference, email=None):
+    """Process payment and send payment link"""
+    
+    debug_log(f"Processing payment: {phone} - {currency} {amount} - {reference}")
+    
+    # Create payment
+    transaction_ref, payment_url = create_paynow_payment(
+        currency=currency,
+        amount=amount,
+        reference=reference,
+        email=email,
+        phone=phone,
+        name=name
+    )
+    
+    if payment_url:
+        # Send payment link to user
+        payment_msg = (
+            f"💳 *PAYMENT LINK READY*\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Amount: {currency} {amount}\n"
+            f"📝 Reference: {reference}\n"
+            f"🔑 Transaction ID: {transaction_ref}\n\n"
+            f"Click the link below to complete payment:\n"
+            f"{payment_url}\n\n"
+            f"⚠️ *Important:* After payment, you'll receive a confirmation.\n"
+            f"Your services will be activated within 5 minutes.\n\n"
+            f"Type *payment status* to check payment status."
+        )
+        send_whatsapp(phone, payment_msg)
+        
+        # Store payment reference in user state
+        save_user(phone, {
+            "pending_payment": {
+                "transaction_ref": transaction_ref,
+                "currency": currency,
+                "amount": amount,
+                "reference": reference
+            }
+        })
+        
+        return True
+    else:
+        send_whatsapp(phone, f"❌ Payment creation failed: {payment_url}\nPlease try again later.")
+        return False
+
+def check_payment_status(phone, user_data):
+    """Check status of pending payment"""
+    
+    pending = user_data.get("pending_payment")
+    if not pending:
+        send_whatsapp(phone, "📭 No pending payment found.")
+        return
+    
+    transaction_ref = pending.get("transaction_ref")
+    currency = pending.get("currency")
+    
+    if not transaction_ref:
+        send_whatsapp(phone, "⚠️ Invalid payment reference. Please try again.")
+        return
+    
+    send_whatsapp(phone, f"🔍 Checking payment status for {transaction_ref}...")
+    
+    is_paid, result = verify_paynow_payment(transaction_ref, currency)
+    
+    if is_paid:
+        # Update payment in Firebase
+        if db:
+            try:
+                payments = db.collection("payments").where("transaction_ref", "==", transaction_ref).stream()
+                for payment in payments:
+                    payment.reference.update({"status": "paid", "paid_at": firestore.SERVER_TIMESTAMP})
+                
+                # Update user with activated services
+                user_ref = db.collection("users").document(phone)
+                user_ref.update({
+                    "paid_services": firestore.ArrayUnion([pending.get("reference")]),
+                    "pending_payment": firestore.DELETE_FIELD
+                })
+            except Exception as e:
+                debug_log(f"❌ Payment update error: {e}")
+        
+        send_whatsapp(phone, (
+            f"✅ *PAYMENT CONFIRMED!*\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Amount: {currency} {pending.get('amount')}\n"
+            f"📝 Service: {pending.get('reference')}\n\n"
+            f"Your service has been activated! 🎉\n"
+            f"Type *menu* to access your purchased services."
+        ))
+        
+        # Clear pending payment from user
+        save_user(phone, {"pending_payment": None})
+    else:
+        send_whatsapp(phone, (
+            f"⏳ *PAYMENT PENDING*\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"Transaction: {transaction_ref}\n\n"
+            f"Your payment is still pending.\n"
+            f"Please complete the payment using the link sent to you.\n\n"
+            f"Type *resend payment* to get the link again."
+        ))
+
+def resend_payment_link(phone, user_data):
+    """Resend payment link for pending transaction"""
+    
+    pending = user_data.get("pending_payment")
+    if not pending:
+        send_whatsapp(phone, "📭 No pending payment found.")
+        return
+    
+    transaction_ref = pending.get("transaction_ref")
+    currency = pending.get("currency")
+    
+    # Recreate payment link
+    try:
+        if currency.upper() == "USD":
+            api_key = PAYNOW_USD_API_KEY
+            endpoint = PAYNOW_USD_ENDPOINT
+        else:
+            api_key = PAYNOW_ZWG_API_KEY
+            endpoint = PAYNOW_ZWG_ENDPOINT
+        
+        headers = {"Authorization": f"Bearer {api_key}"}
+        
+        response = requests.get(
+            f"{endpoint}/transactions/{transaction_ref}",
+            headers=headers,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            payment_url = result.get("payment_url")
+            
+            if payment_url:
+                send_whatsapp(phone, f"🔄 *Payment Link Resent*\n\nClick to pay: {payment_url}")
+            else:
+                send_whatsapp(phone, "❌ Could not retrieve payment link. Please create a new payment.")
+        else:
+            send_whatsapp(phone, "❌ Could not retrieve payment details. Please create a new payment.")
+            
+    except Exception as e:
+        debug_log(f"❌ Resend payment error: {e}")
+        send_whatsapp(phone, "❌ Error retrieving payment link. Please try again.")
 
 # ==============================
 # DISEASE KNOWLEDGE BASE (Offline Fallback)
@@ -1005,7 +1372,7 @@ def get_user_history(phone, limit=10):
 # UPDATED MENU FUNCTIONS
 # ==============================
 def send_main_menu(phone):
-    """Helper function to send main menu - with 7 options"""
+    """Helper function to send main menu - with 8 options including Payment"""
     menu = (
         "🌿 *TOBACCO AI MAIN MENU*\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -1015,7 +1382,8 @@ def send_main_menu(phone):
         "4️⃣ *Leaf Grading* - Quality assessment\n"
         "5️⃣ *AI Vision* - Disease/Curing analysis\n"
         "6️⃣ *Expert Help* - Agronomist & AI\n"
-        "7️⃣ *Feedback* - Send comments\n\n"
+        "7️⃣ *Feedback* - Send comments\n"
+        "8️⃣ *Payments* - Buy services & support\n\n"
         "Reply with number (e.g., *1*)\n"
         "Or type *help* for commands"
     )
@@ -1082,10 +1450,10 @@ def send_ai_vision_menu(phone):
     return send_whatsapp(phone, menu)
 
 # ==============================
-# UPDATED MESSAGE HANDLER - WITH ALL DETECTION TYPES LOGGED
+# UPDATED MESSAGE HANDLER - WITH ALL DETECTION TYPES LOGGED + PAYMENTS
 # ==============================
 def handle_message(phone, msg_type, content):
-    """Main message handler with improved response handling and 20s delay"""
+    """Main message handler with improved response handling and payment integration"""
     debug_log(f"📨 Handling message: type={msg_type}, phone={phone}")
     
     user = get_user(phone)
@@ -1112,6 +1480,86 @@ def handle_message(phone, msg_type, content):
             f"• Type *menu* for all options"
         )
         return send_whatsapp(phone, welcome_msg)
+
+    # PAYMENT HANDLERS
+    if state == USER_STATES["PAYMENT_MENU"] and msg_type == "text":
+        cmd = content.lower().strip()
+        
+        if cmd == "0":
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            return send_main_menu(phone)
+        elif cmd in PAYMENT_PRODUCTS:
+            product = PAYMENT_PRODUCTS[cmd]
+            save_user(phone, {
+                "state": USER_STATES["WAITING_PAYMENT_CURRENCY"],
+                "selected_product": product
+            })
+            return send_currency_menu(phone, product)
+        else:
+            return send_whatsapp(phone, "❌ Please choose a valid option (1-4 or 0)")
+
+    if state == USER_STATES["WAITING_PAYMENT_CURRENCY"] and msg_type == "text":
+        cmd = content.lower().strip()
+        product = user.get("selected_product")
+        
+        if not product:
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            return send_main_menu(phone)
+        
+        if cmd == "0":
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            return send_main_menu(phone)
+        elif cmd == "1":
+            currency = "USD"
+            amount = product.get("usd_price")
+            if amount is None:
+                # Custom amount - ask for amount
+                save_user(phone, {
+                    "state": USER_STATES["WAITING_PAYMENT_AMOUNT"],
+                    "selected_product": product,
+                    "selected_currency": currency
+                })
+                return send_whatsapp(phone, f"💰 Enter the amount in {currency}:\n\nExample: 10.00")
+            else:
+                # Process payment directly
+                process_payment(phone, name, currency, amount, product["reference"])
+                save_user(phone, {"state": USER_STATES["ACTIVE"]})
+                return
+        elif cmd == "2":
+            currency = "ZWG"
+            amount = product.get("zwg_price")
+            if amount is None:
+                save_user(phone, {
+                    "state": USER_STATES["WAITING_PAYMENT_AMOUNT"],
+                    "selected_product": product,
+                    "selected_currency": currency
+                })
+                return send_whatsapp(phone, f"💰 Enter the amount in ZWG:\n\nExample: 500")
+            else:
+                process_payment(phone, name, currency, amount, product["reference"])
+                save_user(phone, {"state": USER_STATES["ACTIVE"]})
+                return
+        else:
+            return send_whatsapp(phone, "❌ Please choose 1 (USD) or 2 (ZWG)")
+
+    if state == USER_STATES["WAITING_PAYMENT_AMOUNT"] and msg_type == "text":
+        try:
+            amount = float(content.strip())
+            if amount <= 0:
+                raise ValueError("Amount must be positive")
+            
+            product = user.get("selected_product")
+            currency = user.get("selected_currency")
+            
+            if product and currency:
+                process_payment(phone, name, currency, amount, product["reference"])
+                save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            else:
+                send_whatsapp(phone, "❌ Payment session expired. Please start over.")
+                save_user(phone, {"state": USER_STATES["ACTIVE"]})
+                send_main_menu(phone)
+        except ValueError:
+            send_whatsapp(phone, "❌ Please enter a valid amount (e.g., 10.00)")
 
     # EXPERT MENU HANDLER
     if state == USER_STATES["EXPERT_MENU"] and msg_type == "text":
@@ -1447,7 +1895,7 @@ def handle_message(phone, msg_type, content):
         time.sleep(2)
         return send_main_menu(phone)
 
-    # TEXT COMMANDS - UPDATED FOR 7 OPTIONS
+    # TEXT COMMANDS - UPDATED FOR 8 OPTIONS + PAYMENT COMMANDS
     if msg_type == "text":
         cmd = content.lower().strip()
         
@@ -1484,6 +1932,13 @@ def handle_message(phone, msg_type, content):
             send_whatsapp(phone, 
                 "📝 *Send Feedback*\n\n"
                 "Type your message below (or *cancel*):")
+        elif cmd in ["8", "payment", "pay"]:
+            save_user(phone, {"state": USER_STATES["PAYMENT_MENU"]})
+            return send_payment_menu(phone)
+        elif cmd == "payment status":
+            check_payment_status(phone, user)
+        elif cmd == "resend payment":
+            resend_payment_link(phone, user)
         elif cmd.startswith("ai "):
             question = cmd[3:].strip()
             if question:
@@ -1508,6 +1963,9 @@ def handle_message(phone, msg_type, content):
                 "• *5* - AI Vision (Disease/Curing)\n"
                 "• *6* - Expert help\n"
                 "• *7* - Feedback\n"
+                "• *8* - Payments\n"
+                "• *payment status* - Check payment\n"
+                "• *resend payment* - Resend link\n"
                 "• *ai [question]* - Ask AI"
             )
             send_whatsapp(phone, help_text)
@@ -1515,6 +1973,65 @@ def handle_message(phone, msg_type, content):
             send_whatsapp(phone, 
                 "❓ Command not recognized.\n\n"
                 "Type *menu* to see options")
+
+# ==============================
+# PAYMENT CALLBACK ROUTES
+# ==============================
+
+@app.route("/payment-callback", methods=["GET", "POST"])
+def payment_callback():
+    """Handle PayNow payment callback"""
+    debug_log(f"Payment callback received: {request.method}")
+    
+    if request.method == "POST":
+        data = request.json
+        debug_log(f"Callback data: {data}")
+        
+        # Verify signature
+        # ... implement signature verification based on PayNow docs
+        
+        transaction_ref = data.get("transaction_reference")
+        status = data.get("status")
+        
+        if transaction_ref and status == "paid":
+            # Update payment in Firebase
+            if db:
+                try:
+                    payments = db.collection("payments").where("transaction_ref", "==", transaction_ref).stream()
+                    for payment in payments:
+                        payment.reference.update({
+                            "status": "paid",
+                            "callback_data": data,
+                            "paid_at": firestore.SERVER_TIMESTAMP
+                        })
+                    
+                    # Get user phone
+                    payment_doc = payments[0].to_dict()
+                    phone = payment_doc.get("phone")
+                    
+                    if phone:
+                        # Notify user
+                        send_whatsapp(phone, (
+                            f"✅ *PAYMENT CONFIRMED!*\n"
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"Your payment has been confirmed.\n"
+                            f"Transaction: {transaction_ref}\n\n"
+                            f"Your service has been activated! 🎉"
+                        ))
+                        
+                        # Clear pending payment
+                        user_ref = db.collection("users").document(phone)
+                        user_ref.update({"pending_payment": firestore.DELETE_FIELD})
+                        
+                except Exception as e:
+                    debug_log(f"❌ Callback update error: {e}")
+    
+    return jsonify({"status": "ok"}), 200
+
+@app.route("/payment-result", methods=["GET", "POST"])
+def payment_result():
+    """Handle PayNow result page"""
+    return "Payment processing complete. You can close this window."
 
 # ==============================
 # FLASK ROUTES
@@ -1575,13 +2092,15 @@ def health():
         "ai_provider": "gemini" if AI_API_KEY else "disabled",
         "current_year": datetime.now().year,
         "admin_configured": bool(ADMIN_PHONE),
+        "paynow_usd_configured": bool(PAYNOW_USD_API_KEY),
+        "paynow_zwg_configured": bool(PAYNOW_ZWG_API_KEY),
         "timestamp": datetime.now().isoformat()
     }), 200
 
 @app.route("/", methods=["GET"])
 def home():
     """Root endpoint"""
-    return "🌿 Tobacco AI Assistant is running!"
+    return "🌿 Tobacco AI Assistant with Payments is running!"
 
 # ==============================
 # START THE APP
@@ -1592,9 +2111,12 @@ if __name__ == "__main__":
     debug_log(f"🤖 Using Hugging Face Space: {HF_SPACE_URL}")
     debug_log(f"🧠 Available Gemini models: {', '.join(GEMINI_MODELS)}")
     debug_log(f"📱 Admin phone: {ADMIN_PHONE if ADMIN_PHONE else 'Not configured'}")
+    debug_log(f"💰 PayNow USD: {'Configured' if PAYNOW_USD_API_KEY else 'Not configured'}")
+    debug_log(f"💰 PayNow ZWG: {'Configured' if PAYNOW_ZWG_API_KEY else 'Not configured'}")
     debug_log(f"📅 Current year: {datetime.now().year}")
     if AI_API_KEY and AI_API_KEY != "your_api_key_here":
         debug_log(f"✅ AI Advisor enabled with CURRENT YEAR focus and 20-second delay")
     else:
         debug_log(f"ℹ️ AI Advisor disabled - set AI_API_KEY environment variable")
     app.run(host="0.0.0.0", port=port, debug=False)
+    
