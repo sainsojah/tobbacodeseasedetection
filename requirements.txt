@@ -1,4 +1,3 @@
-
 flask==3.0.3
 gunicorn==21.2.0
 requests==2.31.0
@@ -8,5 +7,4 @@ Pillow==10.3.0
 numpy==1.26.4
 google-generativeai==0.8.4
 python-dotenv==1.0.1
-paynow==1.0.0
-
+paynow==1.0.8
