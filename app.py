@@ -443,12 +443,12 @@ def ask_ai_advisor(question):
     
     for model_name in GEMINI_MODELS:
         try:
-            time.sleep(1)
+            time.sleep(2)
             debug_log(f"🔄 Trying: {model_name}")
             model = genai.GenerativeModel(model_name=model_name, generation_config=generation_config, safety_settings=safety_settings)
             prompt = f"""You are a Zimbabwe tobacco expert. Today: {current_date}. Use CURRENT {current_year} data only.
 Question: {question}
-Keep response under 200 words. Use bullet points. End with complete sentence."""
+Keep response under 500 words. Use bullet points. End with complete sentence."""
             response = model.generate_content(prompt)
             if response and response.text:
                 return response.text.strip()
@@ -466,7 +466,7 @@ def ai_vision_disease_detection(image_bytes, phone, name):
     
     for model_name in GEMINI_MODELS[:3]:
         try:
-            time.sleep(1)
+            time.sleep(2)
             model = genai.GenerativeModel(model_name=model_name, generation_config=vision_config, safety_settings=safety_settings)
             image_data = base64.b64encode(image_bytes).decode('utf-8')
             prompt = """Analyze this tobacco leaf:
@@ -499,7 +499,7 @@ def ai_vision_curing_monitoring(image_bytes, phone, name):
     
     for model_name in GEMINI_MODELS[:3]:
         try:
-            time.sleep(1)
+            time.sleep(2)
             model = genai.GenerativeModel(model_name=model_name, generation_config=vision_config, safety_settings=safety_settings)
             image_data = base64.b64encode(image_bytes).decode('utf-8')
             prompt = """Assess curing progress:
@@ -531,7 +531,7 @@ def grade_leaf_with_ai(image_bytes, phone, name):
     
     for model_name in GEMINI_MODELS[:3]:
         try:
-            time.sleep(1)
+            time.sleep(2)
             model = genai.GenerativeModel(model_name=model_name, generation_config=vision_config, safety_settings=safety_settings)
             image_data = base64.b64encode(image_bytes).decode('utf-8')
             prompt = """Grade this tobacco leaf:
@@ -604,7 +604,7 @@ def send_main_menu(phone):
             "5️⃣ *AI Vision* - Disease/Curing analysis\n"
             "6️⃣ *Expert Help* - Agronomist & AI\n"
             "7️⃣ *Feedback* - Send comments\n"
-            "8️⃣ *Payments* - Donate / Buy services\n\n"
+            "8️⃣ *Payments* - Donate\n"
             "Reply with number or *help*")
     return send_whatsapp(phone, menu)
 
