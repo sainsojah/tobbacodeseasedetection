@@ -1,5 +1,5 @@
 """
-Tobacco AI Assistant - WhatsApp Bot
+Tobacco AI Assistant - WhatsApp Bot G
 """
 
 import os
@@ -149,7 +149,8 @@ USER_STATES = {
     "WAITING_AI_VISION_CURING": "waiting_ai_vision_curing",
     "PAYMENT_MENU": "payment_menu", "PAYMENT_CURRENCY": "payment_currency",
     "PAYMENT_METHOD": "payment_method", "PAYMENT_AMOUNT": "payment_amount",
-    "PAYMENT_INNBUCKS_CODE": "payment_innbucks_code", "PAYMENT_PROCESSING": "payment_processing"
+    "PAYMENT_INNBUCKS_CODE": "payment_innbucks_code", "PAYMENT_PROCESSING": "payment_processing",
+    "PAYMENT_MOBILE_NUMBER": "payment_mobile_number"   # NEW: separate mobile number input
 }
 
 # ==============================
@@ -160,15 +161,15 @@ PAYMENT_METHODS = {
     "ZWG": ["EcoCash ZWG", "OneMoney ZWG", "Telecash ZWG", "Zimswitch ZWG", "Internet/Mobile Banking ZWG", "POS2U ZWG", "Visa/Mastercard ZWG"]
 }
 METHOD_TYPE = {
-    "EcoCash USD": {"type": "mobile", "method": "ecocash", "currency": "USD"},
-    "InnBucks USD": {"type": "mobile", "method": "innbucks", "currency": "USD"},
+    "EcoCash USD": {"type": "mobile", "method": "ecocash", "currency": "USD", "display": "EcoCash"},
+    "InnBucks USD": {"type": "mobile", "method": "innbucks", "currency": "USD", "display": "InnBucks"},
     "Zimswitch USD": {"type": "link", "currency": "USD"},
     "Internet/Mobile Banking USD": {"type": "link", "currency": "USD"},
     "POS2U USD": {"type": "link", "currency": "USD"},
     "Visa/Mastercard USD": {"type": "link", "currency": "USD"},
-    "EcoCash ZWG": {"type": "mobile", "method": "ecocash", "currency": "ZWG"},
-    "OneMoney ZWG": {"type": "mobile", "method": "onemoney", "currency": "ZWG"},
-    "Telecash ZWG": {"type": "mobile", "method": "telecash", "currency": "ZWG"},
+    "EcoCash ZWG": {"type": "mobile", "method": "ecocash", "currency": "ZWG", "display": "EcoCash"},
+    "OneMoney ZWG": {"type": "mobile", "method": "onemoney", "currency": "ZWG", "display": "OneMoney"},
+    "Telecash ZWG": {"type": "mobile", "method": "telecash", "currency": "ZWG", "display": "Telecash"},
     "Zimswitch ZWG": {"type": "link", "currency": "ZWG"},
     "Internet/Mobile Banking ZWG": {"type": "link", "currency": "ZWG"},
     "POS2U ZWG": {"type": "link", "currency": "ZWG"},
@@ -186,10 +187,15 @@ SENT_MESSAGES = set()
 PAYMENT_TIMEOUT_MINUTES = 5
 
 def format_phone(phone):
-    """Ensure phone number is in 263 format for EcoCash."""
-    phone = phone.replace("+", "").strip()
-    if phone.startswith("0"):
-        return "263" + phone[1:]
+    """Ensure phone number is in 263 format for PayNow."""
+    phone = re.sub(r'[^0-9+]', '', phone)
+    if phone.startswith('+'):
+        phone = phone[1:]
+    if phone.startswith('0'):
+        phone = '263' + phone[1:]
+    elif not phone.startswith('263'):
+        if phone.startswith('7') and len(phone) == 9:
+            phone = '263' + phone
     return phone
 
 def send_safe(phone, text):
@@ -204,29 +210,36 @@ def send_safe(phone, text):
 def get_paynow_instance(currency):
     return paynow_usd if currency == "USD" else paynow_zwg
 
-def start_mobile_payment(phone, name, amount, currency, method, innbucks_code=None):
+def start_mobile_payment(phone, name, amount, currency, method, mobile_number=None, innbucks_code=None):
+    """
+    phone: WhatsApp user's phone number (for tracking/notifications)
+    mobile_number: actual mobile money number to charge (for EcoCash/OneMoney/Telecash)
+    """
     paynow = get_paynow_instance(currency)
     if not paynow:
         return False, f"PayNow {currency} not configured"
     
-    formatted_phone = format_phone(phone)
-    reference = f"Ref-{formatted_phone}-{currency}-{int(time.time())}"
-    payment = paynow.create_payment(reference, f"{formatted_phone}@tobacco.ai")
+    # Use the provided mobile number, or fallback to WhatsApp number
+    recipient = format_phone(mobile_number) if mobile_number else format_phone(phone)
+    
+    # Reference uses WhatsApp number to keep user identity
+    reference = f"Ref-{format_phone(phone)}-{currency}-{int(time.time())}"
+    payment = paynow.create_payment(reference, f"{recipient}@tobacco.ai")
     payment.add("Tobacco AI Service", amount)
     
     try:
-        debug_log(f"📱 Initiating {method} payment: {amount} {currency} for {formatted_phone}")
+        debug_log(f"📱 Initiating {method} payment: {amount} {currency} to {recipient}")
         if method == 'innbucks' and innbucks_code:
-            response = paynow.send_mobile(payment, formatted_phone, method, innbucks_code)
+            response = paynow.send_mobile(payment, recipient, method, innbucks_code)
         else:
-            response = paynow.send_mobile(payment, formatted_phone, method)
+            response = paynow.send_mobile(payment, recipient, method)
         
-        # Log the raw response attributes
         debug_log(f"PayNow response - success: {response.success}, poll_url: {response.poll_url}, error: {response.error}")
         
         if response.success:
             PAYMENT_QUEUE[reference] = {
                 "phone": phone,
+                "mobile_number": recipient,
                 "poll_url": response.poll_url,
                 "status": "pending",
                 "start_time": datetime.now(),
@@ -242,11 +255,10 @@ def start_mobile_payment(phone, name, amount, currency, method, innbucks_code=No
                 })
             return True, response.poll_url
         else:
-            error_msg = response.error or "Payment initiation failed (no error message from PayNow)"
+            error_msg = response.error or "Payment initiation failed"
             debug_log(f"❌ PayNow error: {error_msg}")
             return False, error_msg
     except Exception as e:
-        # Catch any exception and log full details
         error_msg = f"PayNow exception: {type(e).__name__} - {str(e)}"
         debug_log(f"❌ {error_msg}")
         return False, error_msg
@@ -260,37 +272,29 @@ def generate_payment_link(phone, name, amount, currency, method_name):
     reference = f"Ref-{formatted_phone}-{currency}-{int(time.time())}"
     payment = paynow.create_payment(reference, f"{formatted_phone}@tobacco.ai")
     payment.add("Tobacco AI Service", amount)
+    response = paynow.send(payment)
     
-    try:
-        debug_log(f"🔗 Generating payment link: {amount} {currency}")
-        response = paynow.send(payment)
-        debug_log(f"PayNow link response - success: {response.success}, redirect_url: {response.redirect_url}, error: {response.error}")
-        
-        if response.success:
-            PAYMENT_QUEUE[reference] = {
-                "phone": phone,
-                "poll_url": None,
-                "status": "pending",
-                "start_time": datetime.now(),
-                "currency": currency,
-                "amount": amount,
-                "method": method_name,
-                "is_link": True
-            }
-            if db:
-                db.collection("users").document(phone).update({
-                    "pending_payment_ref": reference,
-                    "payment_status": "pending",
-                    "last_payment_attempt": firestore.SERVER_TIMESTAMP
-                })
-            return True, response.redirect_url
-        else:
-            error_msg = response.error or "Could not generate payment link"
-            debug_log(f"❌ PayNow link error: {error_msg}")
-            return False, error_msg
-    except Exception as e:
-        error_msg = f"PayNow link exception: {type(e).__name__} - {str(e)}"
-        debug_log(f"❌ {error_msg}")
+    if response.success:
+        PAYMENT_QUEUE[reference] = {
+            "phone": phone,
+            "poll_url": None,
+            "status": "pending",
+            "start_time": datetime.now(),
+            "currency": currency,
+            "amount": amount,
+            "method": method_name,
+            "is_link": True
+        }
+        if db:
+            db.collection("users").document(phone).update({
+                "pending_payment_ref": reference,
+                "payment_status": "pending",
+                "last_payment_attempt": firestore.SERVER_TIMESTAMP
+            })
+        return True, response.redirect_url
+    else:
+        error_msg = response.error or "Could not generate payment link"
+        debug_log(f"❌ PayNow link error: {error_msg}")
         return False, error_msg
 
 # ==============================
@@ -823,7 +827,12 @@ def handle_message(phone, msg_type, content):
             methods = PAYMENT_METHODS.get(currency, [])
             if 0 <= idx < len(methods):
                 method = methods[idx]
-                save_user(phone, {"state": USER_STATES["PAYMENT_AMOUNT"], "payment_currency": currency, "payment_method_name": method, "payment_method_info": METHOD_TYPE[method]})
+                save_user(phone, {
+                    "state": USER_STATES["PAYMENT_AMOUNT"],
+                    "payment_currency": currency,
+                    "payment_method_name": method,
+                    "payment_method_info": METHOD_TYPE[method]
+                })
                 return send_amount_request(phone, currency, method)
             return send_methods_menu(phone, currency)
         except:
@@ -843,21 +852,19 @@ def handle_message(phone, msg_type, content):
                 send_whatsapp(phone, f"❌ Minimum {min_amt} {currency}")
                 return send_amount_request(phone, currency, method)
             
+            # Store amount
+            save_user(phone, {"payment_amount": amount})
+            
+            # Branch based on payment type
             if info["type"] == "mobile" and info["method"] == "innbucks":
                 save_user(phone, {"state": USER_STATES["PAYMENT_INNBUCKS_CODE"], "payment_currency": currency, "payment_amount": amount, "payment_mobile_method": info["method"]})
                 return send_whatsapp(phone, "🔑 *InnBucks*\n1. Open InnBucks app\n2. Generate Authorization Code\n3. Type code here\n\nType *cancel*")
             elif info["type"] == "mobile":
-                save_user(phone, {"state": USER_STATES["PAYMENT_PROCESSING"]})
-                success, result = start_mobile_payment(phone, name, amount, currency, info["method"])
-                if success:
-                    send_safe(phone, f"💸 *EcoCash Payment*\nAmount: {amount:.2f} {currency}\n\n📲 Check your phone now\nEnter your EcoCash PIN to confirm")
-                    save_user(phone, {"state": USER_STATES["ACTIVE"]})
-                    send_main_menu(phone)
-                else:
-                    send_whatsapp(phone, f"❌ Payment failed: {result}")
-                    save_user(phone, {"state": USER_STATES["ACTIVE"]})
-                    send_main_menu(phone)
+                # NEW: ask for mobile number
+                save_user(phone, {"state": USER_STATES["PAYMENT_MOBILE_NUMBER"]})
+                return send_whatsapp(phone, "📱 *Enter your EcoCash/OneMoney/Telecash number:*\n\nExample: 0771234567 or 263771234567\n\nType *cancel* to abort")
             else:
+                # Link payments
                 success, link = generate_payment_link(phone, name, amount, currency, method)
                 if success:
                     send_whatsapp(phone, f"💳 *{method}*\nAmount: {amount:.2f} {currency}\n\nPay here: {link}")
@@ -877,6 +884,39 @@ def handle_message(phone, msg_type, content):
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
             send_main_menu(phone)
     
+    # NEW STATE: collect mobile number for EcoCash/OneMoney/Telecash
+    if state == USER_STATES["PAYMENT_MOBILE_NUMBER"] and msg_type == "text":
+        if content.lower() == "cancel":
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            return send_main_menu(phone)
+        
+        raw_number = content.strip()
+        cleaned = re.sub(r'[^0-9+]', '', raw_number)
+        if not re.match(r'^(0|263|\+263)[7]\d{8}$', cleaned):
+            send_whatsapp(phone, "❌ Invalid Zimbabwe mobile number. Please enter a valid number like 0771234567 or 263771234567.")
+            return  # stay in same state
+        
+        formatted_mobile = format_phone(cleaned)
+        
+        currency = user.get("payment_currency")
+        amount = user.get("payment_amount")
+        method_info = user.get("payment_method_info")
+        method = method_info["method"]
+        name = user.get("name", "Farmer")
+        
+        save_user(phone, {"state": USER_STATES["PAYMENT_PROCESSING"]})
+        success, result = start_mobile_payment(phone, name, amount, currency, method, mobile_number=formatted_mobile)
+        
+        if success:
+            display_name = method_info.get("display", method.upper())
+            send_safe(phone, f"💸 *{display_name} Payment*\nAmount: {amount:.2f} {currency}\nTo: {formatted_mobile}\n\n📲 Check your phone now and enter your PIN to confirm.")
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            send_main_menu(phone)
+        else:
+            send_whatsapp(phone, f"❌ Payment failed: {result}")
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            send_main_menu(phone)
+    
     if state == USER_STATES["PAYMENT_INNBUCKS_CODE"] and msg_type == "text":
         if content.lower() == "cancel":
             save_user(phone, {"state": USER_STATES["ACTIVE"]})
@@ -885,7 +925,7 @@ def handle_message(phone, msg_type, content):
         currency = user.get("payment_currency")
         amount = user.get("payment_amount")
         method = user.get("payment_mobile_method")
-        success, result = start_mobile_payment(phone, name, amount, currency, method, code)
+        success, result = start_mobile_payment(phone, name, amount, currency, method, innbucks_code=code)
         if success:
             send_safe(phone, f"💸 *InnBucks*\nAmount: {amount:.2f} {currency}\n\nAuthorize in app")
         else:
@@ -893,7 +933,7 @@ def handle_message(phone, msg_type, content):
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         send_main_menu(phone)
     
-    # NEW: Check payment status command
+    # Check payment status command
     if msg_type == "text" and content.lower().strip() in ["status", "payment status"]:
         pending_ref = user.get("pending_payment_ref")
         if pending_ref and pending_ref in PAYMENT_QUEUE:
