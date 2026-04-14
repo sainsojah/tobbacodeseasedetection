@@ -1,7 +1,5 @@
 """
-Tobacco AI Assistant - WhatsApp Bot with PayNow Payments
-COMPLETE VERSION - All original features + Payments
-Minimum donation: $0.50 USD / 15 ZWG
+Tobacco AI Assistant
 """
 
 import os
@@ -12,8 +10,9 @@ import time
 import base64
 import re
 import gc
+import threading
 from flask import Flask, request, jsonify
-from datetime import datetime
+from datetime import datetime, timedelta
 import firebase_admin
 from firebase_admin import credentials, firestore
 from requests.adapters import HTTPAdapter
@@ -173,8 +172,29 @@ MIN_AMOUNT_USD = 0.50
 MIN_AMOUNT_ZWG = 15
 
 # ==============================
-# PAYMENT FUNCTIONS
+# PAYMENT QUEUE & TRACKING (NEW)
 # ==============================
+PAYMENT_QUEUE = {}
+PROCESSED_PAYMENTS = set()
+SENT_MESSAGES = set()
+PAYMENT_TIMEOUT_MINUTES = 5
+
+def format_phone(phone):
+    """Ensure phone number is in 263 format for EcoCash."""
+    phone = phone.replace("+", "").strip()
+    if phone.startswith("0"):
+        return "263" + phone[1:]
+    return phone
+
+def send_safe(phone, text):
+    """Prevent duplicate identical messages to same recipient."""
+    key = f"{phone}:{hash(text)}"
+    if key in SENT_MESSAGES:
+        debug_log(f"⏭️ Duplicate message skipped: {text[:30]}...")
+        return
+    SENT_MESSAGES.add(key)
+    send_whatsapp_with_retry(phone, text)
+
 def get_paynow_instance(currency):
     return paynow_usd if currency == "USD" else paynow_zwg
 
@@ -182,31 +202,127 @@ def start_mobile_payment(phone, name, amount, currency, method, innbucks_code=No
     paynow = get_paynow_instance(currency)
     if not paynow:
         return False, f"PayNow {currency} not configured"
-    reference = f"Ref-{phone.replace('+', '')}-{currency}"
-    payment = paynow.create_payment(reference, f"{phone}@tobacco.ai")
+    
+    formatted_phone = format_phone(phone)
+    reference = f"Ref-{formatted_phone}-{currency}-{int(time.time())}"
+    payment = paynow.create_payment(reference, f"{formatted_phone}@tobacco.ai")
     payment.add("Tobacco AI Service", amount)
+    
     try:
         if method == 'innbucks' and innbucks_code:
-            response = paynow.send_mobile(payment, phone, method, innbucks_code)
+            response = paynow.send_mobile(payment, formatted_phone, method, innbucks_code)
         else:
-            response = paynow.send_mobile(payment, phone, method)
+            response = paynow.send_mobile(payment, formatted_phone, method)
+        
         if response.success:
+            PAYMENT_QUEUE[reference] = {
+                "phone": phone,
+                "poll_url": response.poll_url,
+                "status": "pending",
+                "start_time": datetime.now(),
+                "currency": currency,
+                "amount": amount,
+                "method": method
+            }
+            if db:
+                db.collection("users").document(phone).update({
+                    "pending_payment_ref": reference,
+                    "payment_status": "pending",
+                    "last_payment_attempt": firestore.SERVER_TIMESTAMP
+                })
             return True, response.poll_url
-        return False, "Payment initiation failed"
+        else:
+            error_msg = response.error or "Payment initiation failed"
+            debug_log(f"❌ PayNow error: {error_msg}")
+            return False, error_msg
     except Exception as e:
-        return False, f"Error: {str(e)}"
+        error_msg = f"Error: {str(e)}"
+        debug_log(f"❌ PayNow exception: {error_msg}")
+        return False, error_msg
 
 def generate_payment_link(phone, name, amount, currency, method_name):
     paynow = get_paynow_instance(currency)
     if not paynow:
         return False, f"PayNow {currency} not configured"
-    reference = f"Ref-{phone.replace('+', '')}-{currency}"
-    payment = paynow.create_payment(reference, f"{phone}@tobacco.ai")
+    
+    formatted_phone = format_phone(phone)
+    reference = f"Ref-{formatted_phone}-{currency}-{int(time.time())}"
+    payment = paynow.create_payment(reference, f"{formatted_phone}@tobacco.ai")
     payment.add("Tobacco AI Service", amount)
     response = paynow.send(payment)
+    
     if response.success:
+        PAYMENT_QUEUE[reference] = {
+            "phone": phone,
+            "poll_url": None,
+            "status": "pending",
+            "start_time": datetime.now(),
+            "currency": currency,
+            "amount": amount,
+            "method": method_name,
+            "is_link": True
+        }
+        if db:
+            db.collection("users").document(phone).update({
+                "pending_payment_ref": reference,
+                "payment_status": "pending",
+                "last_payment_attempt": firestore.SERVER_TIMESTAMP
+            })
         return True, response.redirect_url
-    return False, "Could not generate payment link"
+    else:
+        error_msg = response.error or "Could not generate payment link"
+        debug_log(f"❌ PayNow link error: {error_msg}")
+        return False, error_msg
+
+# ==============================
+# BACKGROUND POLLING THREAD (NEW)
+# ==============================
+def poll_payments():
+    debug_log("🔄 Payment polling thread started")
+    while True:
+        try:
+            for ref, data in list(PAYMENT_QUEUE.items()):
+                if data["status"] != "pending":
+                    continue
+                if data.get("is_link"):
+                    continue
+
+                elapsed = (datetime.now() - data["start_time"]).total_seconds()
+                if elapsed > PAYMENT_TIMEOUT_MINUTES * 60:
+                    debug_log(f"⏰ Payment {ref} timed out")
+                    data["status"] = "timeout"
+                    send_safe(data["phone"], f"⏳ Payment of {data['amount']:.2f} {data['currency']} timed out. Please try again.")
+                    continue
+
+                try:
+                    res = requests.get(data["poll_url"], timeout=10)
+                    result = res.json()
+                    if result.get("status") == "paid" and ref not in PROCESSED_PAYMENTS:
+                        PROCESSED_PAYMENTS.add(ref)
+                        data["status"] = "paid"
+                        phone = data["phone"]
+                        amount = data["amount"]
+                        currency = data["currency"]
+                        
+                        if db:
+                            db.collection("users").document(phone).update({
+                                "premium": True,
+                                "payment_status": "completed",
+                                "pending_payment_ref": firestore.DELETE_FIELD
+                            })
+                        
+                        send_safe(phone, f"🎉 Payment of {amount:.2f} {currency} received! Thank you for your support.")
+                        debug_log(f"✅ Payment confirmed via polling: {ref}")
+                except Exception as e:
+                    debug_log(f"Polling error for {ref}: {e}")
+            
+            time.sleep(5)
+        except Exception as e:
+            debug_log(f"❌ Polling loop error: {e}")
+            time.sleep(10)
+
+polling_thread = threading.Thread(target=poll_payments, daemon=True)
+polling_thread.start()
 
 # ==============================
 # DISEASE KNOWLEDGE BASE
@@ -430,7 +546,7 @@ def get_user_statistics(phone):
         return {"total_scans": 0, "hf_scans": 0, "ai_vision_scans": 0, "curing_scans": 0, "top_disease": "None", "healthy_count": 0}
 
 # ==============================
-# AI FUNCTIONS (FULL VERSION)
+# AI FUNCTIONS
 # ==============================
 def ask_ai_advisor(question):
     if not AI_API_KEY or AI_API_KEY == "your_api_key_here":
@@ -669,7 +785,7 @@ def handle_message(phone, msg_type, content):
         save_user(phone, {"name": clean_name, "state": USER_STATES["ACTIVE"]})
         return send_whatsapp(phone, f"✅ *Welcome, {clean_name}!*\n\nSend a photo or type *menu*")
     
-    # ========== PAYMENT HANDLERS ==========
+    # ========== PAYMENT HANDLERS (UPDATED) ==========
     if state == USER_STATES["PAYMENT_MENU"] and msg_type == "text":
         cmd = content.strip()
         if cmd == "0":
@@ -715,8 +831,9 @@ def handle_message(phone, msg_type, content):
                 save_user(phone, {"state": USER_STATES["PAYMENT_PROCESSING"]})
                 success, result = start_mobile_payment(phone, name, amount, currency, info["method"])
                 if success:
-                    save_user(phone, {"pending_payment": result})
-                    send_whatsapp(phone, f"💸 *{method}*\nAmount: {amount:.2f} {currency}\n\nCheck your phone for PIN prompt")
+                    send_safe(phone, f"💸 *EcoCash Payment*\nAmount: {amount:.2f} {currency}\n\n📲 Check your phone now\nEnter your EcoCash PIN to confirm")
+                    save_user(phone, {"state": USER_STATES["ACTIVE"]})
+                    send_main_menu(phone)
                 else:
                     send_whatsapp(phone, f"❌ {result}")
                     save_user(phone, {"state": USER_STATES["ACTIVE"]})
@@ -726,7 +843,6 @@ def handle_message(phone, msg_type, content):
                 if success:
                     send_whatsapp(phone, f"💳 *{method}*\nAmount: {amount:.2f} {currency}\n\nPay here: {link}")
                     save_user(phone, {"pending_payment": link})
-                    time.sleep(5)
                     save_user(phone, {"state": USER_STATES["ACTIVE"]})
                     send_main_menu(phone)
                 else:
@@ -747,14 +863,29 @@ def handle_message(phone, msg_type, content):
         method = user.get("payment_mobile_method")
         success, result = start_mobile_payment(phone, name, amount, currency, method, code)
         if success:
-            send_whatsapp(phone, f"💸 *InnBucks*\nAmount: {amount:.2f} {currency}\n\nAuthorize in app")
-            save_user(phone, {"pending_payment": result})
+            send_safe(phone, f"💸 *InnBucks*\nAmount: {amount:.2f} {currency}\n\nAuthorize in app")
         else:
             send_whatsapp(phone, f"❌ {result}")
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         send_main_menu(phone)
     
-    # ========== EXISTING HANDLERS (ALL WORKING) ==========
+    # NEW: Check payment status command
+    if msg_type == "text" and content.lower().strip() in ["status", "payment status"]:
+        pending_ref = user.get("pending_payment_ref")
+        if pending_ref and pending_ref in PAYMENT_QUEUE:
+            data = PAYMENT_QUEUE[pending_ref]
+            if data["status"] == "paid":
+                send_whatsapp(phone, f"✅ Your payment of {data['amount']:.2f} {data['currency']} was successful!")
+            elif data["status"] == "pending":
+                elapsed = (datetime.now() - data["start_time"]).seconds // 60
+                send_whatsapp(phone, f"⏳ Payment is still pending. Please check your phone for PIN prompt. ({elapsed} min ago)")
+            else:
+                send_whatsapp(phone, "No recent payment found. Type *8* to make a donation.")
+        else:
+            send_whatsapp(phone, "No active payment session. Type *8* to make a donation.")
+        return
+    
+    # ========== EXISTING HANDLERS ==========
     if state == USER_STATES["EXPERT_MENU"] and msg_type == "text":
         cmd = content.strip()
         if cmd == "0":
@@ -811,7 +942,6 @@ def handle_message(phone, msg_type, content):
         send_whatsapp(phone, "🤔 Thinking...")
         result = ask_ai_advisor(content)
         send_whatsapp_with_retry(phone, result)
-        time.sleep(20)
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         return send_main_menu(phone)
     
@@ -839,7 +969,6 @@ def handle_message(phone, msg_type, content):
         grade, analysis = grade_leaf_with_ai(img, phone, name)
         if analysis:
             send_whatsapp_with_retry(phone, analysis)
-        time.sleep(20)
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         send_main_menu(phone)
         gc.collect()
@@ -877,7 +1006,6 @@ def handle_message(phone, msg_type, content):
         send_whatsapp(phone, resp)
         if not result["is_healthy"] and not result["low_confidence"] and conf >= 50:
             send_whatsapp(phone, get_offline_disease_advice(disease))
-        time.sleep(20)
         send_main_menu(phone)
         gc.collect()
         return
@@ -905,7 +1033,6 @@ def handle_message(phone, msg_type, content):
         _, analysis = ai_vision_disease_detection(img, phone, name)
         if analysis:
             send_whatsapp_with_retry(phone, analysis)
-        time.sleep(10)
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         send_main_menu(phone)
         gc.collect()
@@ -921,7 +1048,6 @@ def handle_message(phone, msg_type, content):
         _, analysis = ai_vision_curing_monitoring(img, phone, name)
         if analysis:
             send_whatsapp_with_retry(phone, analysis)
-        time.sleep(10)
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
         send_main_menu(phone)
         gc.collect()
@@ -936,7 +1062,6 @@ def handle_message(phone, msg_type, content):
                 send_whatsapp(ADMIN_PHONE, msg)
             send_whatsapp(phone, "✅ Thank you!")
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
-        time.sleep(2)
         return send_main_menu(phone)
     
     if state == USER_STATES["AWAITING_EXPERT"] and msg_type == "text":
@@ -948,7 +1073,6 @@ def handle_message(phone, msg_type, content):
                 send_whatsapp(ADMIN_PHONE, msg)
             send_whatsapp(phone, "👨‍🌾 Request sent! Expert will respond within 24-48 hours")
         save_user(phone, {"state": USER_STATES["ACTIVE"]})
-        time.sleep(2)
         return send_main_menu(phone)
     
     # TEXT COMMANDS
@@ -987,13 +1111,12 @@ def handle_message(phone, msg_type, content):
                 send_whatsapp(phone, "🤔 Thinking...")
                 result = ask_ai_advisor(q)
                 send_whatsapp_with_retry(phone, result)
-                time.sleep(20)
                 return send_main_menu(phone)
         elif cmd == "help":
             help_text = ("📚 *HELP*\n━━━━━━━━━━━━━━━━━━\n"
                         "• *menu* - Main menu\n• *1* - Detect\n• *2* - Guides\n• *3* - Dashboard\n"
                         "• *4* - Grade\n• *5* - AI Vision\n• *6* - Expert\n• *7* - Feedback\n"
-                        "• *8* - Payments\n• *ai [question]* - Ask AI")
+                        "• *8* - Payments\n• *ai [question]* - Ask AI\n• *status* - Check payment")
             return send_whatsapp(phone, help_text)
         else:
             return send_whatsapp(phone, "❓ Type *menu* for options")
@@ -1025,14 +1148,18 @@ def webhook():
 @app.route("/paynow_update", methods=["POST"])
 def paynow_update():
     data = request.form
+    debug_log(f"PayNow webhook: {dict(data)}")
     status = data.get("status")
     ref = data.get("reference", "")
-    if ref.startswith("Ref-") and status == "paid":
-        phone = ref.split("-")[1]
-        debug_log(f"✅ Payment confirmed: {phone}")
-        if db:
-            db.collection("users").document(phone).update({"premium": True, "payment_status": "completed", "pending_payment": firestore.DELETE_FIELD})
-        send_whatsapp(phone, "🎉 *PAYMENT RECEIVED!* Thank you!")
+    if ref.startswith("Ref-") and status == "paid" and ref not in PROCESSED_PAYMENTS:
+        PROCESSED_PAYMENTS.add(ref)
+        parts = ref.split("-")
+        if len(parts) >= 2:
+            phone = parts[1]
+            debug_log(f"✅ Payment confirmed via webhook: {phone}")
+            if db:
+                db.collection("users").document(phone).update({"premium": True, "payment_status": "completed", "pending_payment_ref": firestore.DELETE_FIELD})
+            send_safe(phone, "🎉 *PAYMENT RECEIVED!* Thank you for your support!")
     return "OK", 200
 
 @app.route("/health", methods=["GET"])
