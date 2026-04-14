@@ -196,12 +196,12 @@ def start_mobile_payment(phone, name, amount, method, mobile_number=None, innbuc
     phone: WhatsApp user's phone number (for tracking/notifications)
     mobile_number: actual mobile money number to charge
     """
-    if not paynow_usd:
+    if not PAYNOW_USD_API_KEY or not PAYNOW_USD_MERCHANT_ID:
         return False, "PayNow USD not configured"
 
     recipient = format_phone(mobile_number) if mobile_number else format_phone(phone)
-    merchant_id = paynow_usd.merchant_id
-    api_key = paynow_usd.api_key
+    merchant_id = PAYNOW_USD_MERCHANT_ID
+    api_key = PAYNOW_USD_API_KEY
     reference = f"Ref-{format_phone(phone)}-USD-{int(time.time())}"
 
     payload = {
