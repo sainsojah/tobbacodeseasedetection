@@ -1,5 +1,5 @@
 """
-Tobacco AI Assistant
+Tobacco AI Assistant - WhatsApp Bot
 """
 
 import os
@@ -61,11 +61,17 @@ paynow_zwg = None
 
 if PAYNOW_AVAILABLE:
     if PAYNOW_USD_API_KEY and PAYNOW_USD_MERCHANT_ID:
-        paynow_usd = Paynow(PAYNOW_USD_MERCHANT_ID, PAYNOW_USD_API_KEY, RESULT_URL, RESULT_URL)
-        debug_log("✅ PayNow USD initialized")
+        try:
+            paynow_usd = Paynow(PAYNOW_USD_MERCHANT_ID, PAYNOW_USD_API_KEY, RESULT_URL, RESULT_URL)
+            debug_log("✅ PayNow USD initialized")
+        except Exception as e:
+            debug_log(f"❌ PayNow USD init failed: {e}")
     if PAYNOW_ZWG_API_KEY and PAYNOW_ZWG_MERCHANT_ID:
-        paynow_zwg = Paynow(PAYNOW_ZWG_MERCHANT_ID, PAYNOW_ZWG_API_KEY, RESULT_URL, RESULT_URL)
-        debug_log("✅ PayNow ZWG initialized")
+        try:
+            paynow_zwg = Paynow(PAYNOW_ZWG_MERCHANT_ID, PAYNOW_ZWG_API_KEY, RESULT_URL, RESULT_URL)
+            debug_log("✅ PayNow ZWG initialized")
+        except Exception as e:
+            debug_log(f"❌ PayNow ZWG init failed: {e}")
 
 # Configure Google Generative AI
 if AI_API_KEY and AI_API_KEY != "your_api_key_here":
@@ -172,7 +178,7 @@ MIN_AMOUNT_USD = 0.50
 MIN_AMOUNT_ZWG = 15
 
 # ==============================
-# PAYMENT QUEUE & TRACKING (NEW)
+# PAYMENT QUEUE & TRACKING
 # ==============================
 PAYMENT_QUEUE = {}
 PROCESSED_PAYMENTS = set()
@@ -209,10 +215,14 @@ def start_mobile_payment(phone, name, amount, currency, method, innbucks_code=No
     payment.add("Tobacco AI Service", amount)
     
     try:
+        debug_log(f"📱 Initiating {method} payment: {amount} {currency} for {formatted_phone}")
         if method == 'innbucks' and innbucks_code:
             response = paynow.send_mobile(payment, formatted_phone, method, innbucks_code)
         else:
             response = paynow.send_mobile(payment, formatted_phone, method)
+        
+        # Log the raw response attributes
+        debug_log(f"PayNow response - success: {response.success}, poll_url: {response.poll_url}, error: {response.error}")
         
         if response.success:
             PAYMENT_QUEUE[reference] = {
@@ -232,12 +242,13 @@ def start_mobile_payment(phone, name, amount, currency, method, innbucks_code=No
                 })
             return True, response.poll_url
         else:
-            error_msg = response.error or "Payment initiation failed"
+            error_msg = response.error or "Payment initiation failed (no error message from PayNow)"
             debug_log(f"❌ PayNow error: {error_msg}")
             return False, error_msg
     except Exception as e:
-        error_msg = f"Error: {str(e)}"
-        debug_log(f"❌ PayNow exception: {error_msg}")
+        # Catch any exception and log full details
+        error_msg = f"PayNow exception: {type(e).__name__} - {str(e)}"
+        debug_log(f"❌ {error_msg}")
         return False, error_msg
 
 def generate_payment_link(phone, name, amount, currency, method_name):
@@ -249,33 +260,41 @@ def generate_payment_link(phone, name, amount, currency, method_name):
     reference = f"Ref-{formatted_phone}-{currency}-{int(time.time())}"
     payment = paynow.create_payment(reference, f"{formatted_phone}@tobacco.ai")
     payment.add("Tobacco AI Service", amount)
-    response = paynow.send(payment)
     
-    if response.success:
-        PAYMENT_QUEUE[reference] = {
-            "phone": phone,
-            "poll_url": None,
-            "status": "pending",
-            "start_time": datetime.now(),
-            "currency": currency,
-            "amount": amount,
-            "method": method_name,
-            "is_link": True
-        }
-        if db:
-            db.collection("users").document(phone).update({
-                "pending_payment_ref": reference,
-                "payment_status": "pending",
-                "last_payment_attempt": firestore.SERVER_TIMESTAMP
-            })
-        return True, response.redirect_url
-    else:
-        error_msg = response.error or "Could not generate payment link"
-        debug_log(f"❌ PayNow link error: {error_msg}")
+    try:
+        debug_log(f"🔗 Generating payment link: {amount} {currency}")
+        response = paynow.send(payment)
+        debug_log(f"PayNow link response - success: {response.success}, redirect_url: {response.redirect_url}, error: {response.error}")
+        
+        if response.success:
+            PAYMENT_QUEUE[reference] = {
+                "phone": phone,
+                "poll_url": None,
+                "status": "pending",
+                "start_time": datetime.now(),
+                "currency": currency,
+                "amount": amount,
+                "method": method_name,
+                "is_link": True
+            }
+            if db:
+                db.collection("users").document(phone).update({
+                    "pending_payment_ref": reference,
+                    "payment_status": "pending",
+                    "last_payment_attempt": firestore.SERVER_TIMESTAMP
+                })
+            return True, response.redirect_url
+        else:
+            error_msg = response.error or "Could not generate payment link"
+            debug_log(f"❌ PayNow link error: {error_msg}")
+            return False, error_msg
+    except Exception as e:
+        error_msg = f"PayNow link exception: {type(e).__name__} - {str(e)}"
+        debug_log(f"❌ {error_msg}")
         return False, error_msg
 
 # ==============================
-# BACKGROUND POLLING THREAD (NEW)
+# BACKGROUND POLLING THREAD
 # ==============================
 def poll_payments():
     debug_log("🔄 Payment polling thread started")
@@ -785,7 +804,7 @@ def handle_message(phone, msg_type, content):
         save_user(phone, {"name": clean_name, "state": USER_STATES["ACTIVE"]})
         return send_whatsapp(phone, f"✅ *Welcome, {clean_name}!*\n\nSend a photo or type *menu*")
     
-    # ========== PAYMENT HANDLERS (UPDATED) ==========
+    # ========== PAYMENT HANDLERS ==========
     if state == USER_STATES["PAYMENT_MENU"] and msg_type == "text":
         cmd = content.strip()
         if cmd == "0":
@@ -835,7 +854,7 @@ def handle_message(phone, msg_type, content):
                     save_user(phone, {"state": USER_STATES["ACTIVE"]})
                     send_main_menu(phone)
                 else:
-                    send_whatsapp(phone, f"❌ {result}")
+                    send_whatsapp(phone, f"❌ Payment failed: {result}")
                     save_user(phone, {"state": USER_STATES["ACTIVE"]})
                     send_main_menu(phone)
             else:
@@ -846,12 +865,17 @@ def handle_message(phone, msg_type, content):
                     save_user(phone, {"state": USER_STATES["ACTIVE"]})
                     send_main_menu(phone)
                 else:
-                    send_whatsapp(phone, f"❌ {link}")
+                    send_whatsapp(phone, f"❌ Payment failed: {link}")
                     save_user(phone, {"state": USER_STATES["ACTIVE"]})
                     send_main_menu(phone)
-        except:
-            send_whatsapp(phone, "❌ Invalid amount")
+        except ValueError:
+            send_whatsapp(phone, "❌ Invalid amount. Please enter a number (e.g., 1.00)")
             return send_amount_request(phone, currency, method)
+        except Exception as e:
+            send_whatsapp(phone, f"❌ An unexpected error occurred: {str(e)}")
+            debug_log(f"❌ Amount handler error: {e}")
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            send_main_menu(phone)
     
     if state == USER_STATES["PAYMENT_INNBUCKS_CODE"] and msg_type == "text":
         if content.lower() == "cancel":
@@ -885,7 +909,7 @@ def handle_message(phone, msg_type, content):
             send_whatsapp(phone, "No active payment session. Type *8* to make a donation.")
         return
     
-    # ========== EXISTING HANDLERS ==========
+    # ========== EXISTING HANDLERS (UNCHANGED) ==========
     if state == USER_STATES["EXPERT_MENU"] and msg_type == "text":
         cmd = content.strip()
         if cmd == "0":
