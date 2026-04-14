@@ -192,16 +192,14 @@ def get_paynow_instance():
 
 def start_mobile_payment(phone, name, amount, method, mobile_number=None, innbucks_code=None):
     """
-    Initiate a mobile money payment via PayNow API directly (no library).
-    phone: WhatsApp user's phone number (for tracking/notifications)
-    mobile_number: actual mobile money number to charge
+    Initiate a mobile money payment via PayNow Remote API using Basic Auth.
     """
     if not PAYNOW_USD_API_KEY or not PAYNOW_USD_MERCHANT_ID:
         return False, "PayNow USD not configured"
 
     recipient = format_phone(mobile_number) if mobile_number else format_phone(phone)
-    merchant_id = PAYNOW_USD_MERCHANT_ID
-    api_key = PAYNOW_USD_API_KEY
+    integration_id = PAYNOW_USD_MERCHANT_ID      # This is the Integration ID
+    integration_key = PAYNOW_USD_API_KEY         # This is the Integration Key (password)
     reference = f"Ref-{format_phone(phone)}-USD-{int(time.time())}"
 
     payload = {
@@ -209,7 +207,7 @@ def start_mobile_payment(phone, name, amount, method, mobile_number=None, innbuc
         "returnurl": RESULT_URL,
         "reference": reference,
         "amount": f"{amount:.2f}",
-        "id": merchant_id,
+        "id": integration_id,
         "additionalinfo": "Tobacco AI Service",
         "authemail": f"{recipient}@tobacco.ai",
         "method": method,
@@ -219,17 +217,16 @@ def start_mobile_payment(phone, name, amount, method, mobile_number=None, innbuc
         payload["innbuckscode"] = innbucks_code
 
     url = "https://www.paynow.co.zw/interface/remotepayment"
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Authorization": f"Bearer {api_key}"
-    }
 
     try:
         debug_log(f"📱 Direct API call: {method} {amount} USD to {recipient}")
-        response = requests.post(url, data=payload, headers=headers, timeout=30)
+        # Use Basic Authentication (Integration ID as username, Integration Key as password)
+        response = requests.post(url, data=payload, auth=(integration_id, integration_key), timeout=30)
         response_text = response.text.strip()
+        debug_log(f"PayNow response status: {response.status_code}")
         debug_log(f"PayNow raw response: {response_text}")
 
+        # Parse key=value response
         result = {}
         for pair in response_text.split('&'):
             if '=' in pair:
