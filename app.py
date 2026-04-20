@@ -439,8 +439,11 @@ def get_confidence_message(confidence):
         return "✔ *High Accuracy*"
     elif confidence > 60:
         return "⚠ *Medium Accuracy*"
+    elif 10 < confidence < 60::
+         return "❗ *Low Accuracy - please retake photo*"
+        
     else:
-        return "❗ *Low Accuracy - please retake photo*"
+        return "✔ Healthy "
 
 def estimate_severity(disease_area, leaf_area):
     """Estimate disease severity based on area ratio."""
