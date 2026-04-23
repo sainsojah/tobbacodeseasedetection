@@ -1,7 +1,7 @@
 """
 Tobacco AI Assistant - WhatsApp Bot
-Uses Hugging Face Space for both disease detection (/predict) and curing monitoring (/predict_curing)
-All ML is hosted on Hugging Face, this Render service only handles WhatsApp logic.
+- Option 1: ML Services (HF) for Disease Detection & Curing Monitor
+- Option 5: AI Vision (Gemini) for Disease Detection & Curing Monitor (original)
 """
 
 import os
@@ -57,7 +57,7 @@ if PAYNOW_AVAILABLE and PAYNOW_USD_API_KEY and PAYNOW_USD_MERCHANT_ID:
     except Exception as e:
         debug_log(f"❌ PayNow USD init failed: {e}")
 
-# Google Generative AI configuration (for AI advisor, tips, fallbacks)
+# Google Generative AI configuration
 if AI_API_KEY and AI_API_KEY != "your_api_key_here":
     genai.configure(api_key=AI_API_KEY)
     debug_log("✅ Google Generative AI configured")
@@ -130,7 +130,9 @@ USER_STATES = {
     "PAYMENT_MENU": "payment_menu",
     "PAYMENT_AMOUNT": "payment_amount",
     "PAYMENT_INNBUCKS_CODE": "payment_innbucks_code",
-    "PAYMENT_MOBILE_NUMBER": "payment_mobile_number"
+    "PAYMENT_MOBILE_NUMBER": "payment_mobile_number",
+    "ML_MENU": "ml_menu",                     # NEW: ML sub-menu
+    "WAITING_ML_CURING": "waiting_ml_curing"  # NEW: ML curing
 }
 
 PAYMENT_METHODS = {"USD": ["EcoCash USD", "InnBucks USD"]}
@@ -537,7 +539,7 @@ def ask_ai_advisor(question):
     return "⚠️ AI service unavailable. Please try again later."
 
 def ai_vision_disease_detection(image_bytes, phone, name):
-    """Gemini vision for disease (fallback if HF fails)"""
+    """Gemini vision for disease (used by Option 5 AI Vision)"""
     if not AI_API_KEY:
         return None, "AI vision not configured"
     for model_name in GEMINI_MODELS[:3]:
@@ -575,7 +577,7 @@ def ai_vision_disease_detection(image_bytes, phone, name):
     return None, "⚠️ AI Vision unavailable"
 
 def ai_vision_curing_monitoring(image_bytes, phone, name):
-    """Gemini vision for curing (fallback if HF fails)"""
+    """Gemini vision for curing (used by Option 5 AI Vision)"""
     if not AI_API_KEY:
         return None, "AI vision not configured"
     for model_name in GEMINI_MODELS[:3]:
@@ -690,15 +692,22 @@ def get_gemini_fact():
 # Menu display functions
 def send_main_menu(phone):
     menu = ("🌿 *TOBACCO AI MAIN MENU*\n━━━━━━━━━━━━━━━━━━\n"
-            "1️⃣ *Disease Detection* - Send photo\n"
+            "1️⃣ *ML Services* - Disease/Curing (HF)\n"
             "2️⃣ *Farming Practices* - Guides & AI advice\n"
             "3️⃣ *My Dashboard* - Stats, History, Tips\n"
             "4️⃣ *Leaf Grading* - Quality assessment\n"
-            "5️⃣ *AI Vision* - Disease/Curing analysis\n"
+            "5️⃣ *AI Vision* - Gemini Disease/Curing\n"
             "6️⃣ *Expert Help* - Agronomist & AI\n"
             "7️⃣ *Feedback* - Send comments\n"
             "8️⃣ *Payments* - Donate\n"
             "Reply with number or *help*")
+    return send_whatsapp(phone, menu)
+
+def send_ml_menu(phone):
+    menu = ("🤖 *ML SERVICES (Hugging Face)*\n━━━━━━━━━━━━━━━━━━\n"
+            "1️⃣ *Disease Detection* - Send photo\n"
+            "2️⃣ *Curing Monitor* - Send photo\n\n"
+            "0️⃣ Main Menu")
     return send_whatsapp(phone, menu)
 
 def send_farming_menu(phone):
@@ -719,7 +728,10 @@ def send_expert_menu(phone):
     return send_whatsapp(phone, menu)
 
 def send_ai_vision_menu(phone):
-    menu = ("🔬 *AI VISION*\n━━━━━━━━━━━━━━━━━━\n1️⃣ *Disease Detection*\n2️⃣ *Curing Monitor*\n\n0️⃣ Main Menu")
+    menu = ("🔬 *AI VISION (Gemini)*\n━━━━━━━━━━━━━━━━━━\n"
+            "1️⃣ *Disease Detection* - Send photo\n"
+            "2️⃣ *Curing Monitor* - Send photo\n\n"
+            "0️⃣ Main Menu")
     return send_whatsapp(phone, menu)
 
 def send_payment_methods_menu(phone):
@@ -840,6 +852,138 @@ def handle_message(phone, msg_type, content):
             send_whatsapp(phone, "No active payment session. Type *8* to make a donation.")
         return
 
+    # ML MENU (Option 1) - NEW
+    if state == USER_STATES["ML_MENU"] and msg_type == "text":
+        cmd = content.strip()
+        if cmd == "0":
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            return send_main_menu(phone)
+        elif cmd == "1":
+            save_user(phone, {"state": USER_STATES["WAITING_IMAGE"]})
+            return send_whatsapp(phone, "📸 Send clear photo of leaf for *disease detection* (ML)")
+        elif cmd == "2":
+            save_user(phone, {"state": USER_STATES["WAITING_ML_CURING"]})
+            return send_whatsapp(phone, "🔥 Send photo of leaf for *curing stage* (ML)")
+        else:
+            return send_whatsapp(phone, "❌ Choose 1, 2, or 0")
+
+    # DISEASE DETECTION (ML via HF) - unchanged logic
+    if state == USER_STATES["WAITING_IMAGE"] and msg_type == "image":
+        if phone in LAST_SCAN and time.time() - LAST_SCAN[phone] < 5:
+            return send_whatsapp(phone, "⏱️ Please wait 5 seconds")
+        LAST_SCAN[phone] = time.time()
+        send_whatsapp(phone, f"🔍 Analyzing, {name}...")
+        img = download_image(content)
+        if not img:
+            send_whatsapp(phone, "❌ Download failed")
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            return send_main_menu(phone)
+        result = call_huggingface_detection(img)
+        if not result:
+            # Fallback to Gemini if HF fails
+            _, analysis = ai_vision_disease_detection(img, phone, name)
+            if analysis and "⚠️" not in analysis:
+                send_whatsapp_with_retry(phone, analysis)
+            else:
+                send_whatsapp(phone, "❌ Analysis failed. Please try again later.")
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            send_main_menu(phone)
+            gc.collect()
+            return
+        disease, conf = result["disease"], result["confidence"]
+        conf_msg = get_confidence_message(conf)
+        log_detection(phone, name, disease, conf, result.get("severity"))
+        if result["low_confidence"]:
+            resp = f"⚠️ *Low Confidence ({conf:.1f}%)*\n\n{conf_msg}\n\nTry AI Vision (type *5*) or a clearer photo."
+        elif result["is_healthy"]:
+            resp = f"🎉 *Healthy Leaf!*\n\nConfidence: {conf:.1f}%\n{conf_msg}"
+        else:
+            resp = f"📊 *{disease} DETECTED*\n\nConfidence: {conf:.1f}%\n{conf_msg}"
+            if result.get("severity"):
+                resp += f"\nSeverity: *{result['severity']}*"
+            resp += f"\n\n*Treatment:*\n{result['treatment']}"
+        send_whatsapp(phone, resp)
+        if not result["is_healthy"] and not result["low_confidence"] and conf >= 50:
+            send_whatsapp(phone, get_offline_disease_advice(disease))
+        save_user(phone, {"state": USER_STATES["ACTIVE"]})
+        send_main_menu(phone)
+        gc.collect()
+        return
+
+    # ML CURING (new)
+    if state == USER_STATES["WAITING_ML_CURING"] and msg_type == "image":
+        send_whatsapp(phone, f"🔥 Analyzing curing stage, {name}...")
+        img = download_image(content)
+        if not img:
+            send_whatsapp(phone, "❌ Download failed")
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            return send_main_menu(phone)
+        result = call_huggingface_curing(img)
+        if result and result.get("stage"):
+            stage = result["stage"]
+            confidence = result["confidence"]
+            advice = result.get("advice", "Monitor curing conditions.")
+            log_curing_result(phone, name, stage, confidence)
+            msg = f"🍂 *Curing Stage: {stage}*\n\nConfidence: {confidence:.1f}%\n\n{advice}"
+            send_whatsapp_with_retry(phone, msg)
+        else:
+            send_whatsapp(phone, "❌ Curing analysis failed. Please try again later.")
+        save_user(phone, {"state": USER_STATES["ACTIVE"]})
+        send_main_menu(phone)
+        gc.collect()
+        return
+
+    # AI VISION MENU (Option 5) - unchanged from original
+    if state == USER_STATES["WAITING_AI_VISION"] and msg_type == "text":
+        cmd = content.strip()
+        if cmd == "0":
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            return send_main_menu(phone)
+        elif cmd == "1":
+            save_user(phone, {"state": USER_STATES["WAITING_AI_VISION_DISEASE"]})
+            return send_whatsapp(phone, "🔬 Send clear photo of leaf for *disease detection* (AI Vision)")
+        elif cmd == "2":
+            save_user(phone, {"state": USER_STATES["WAITING_AI_VISION_CURING"]})
+            return send_whatsapp(phone, "🔥 Send photo of leaf for *curing monitor* (AI Vision)")
+        else:
+            return send_whatsapp(phone, "❌ Choose 1, 2, or 0")
+
+    # AI Vision Disease (Gemini)
+    if state == USER_STATES["WAITING_AI_VISION_DISEASE"] and msg_type == "image":
+        send_whatsapp(phone, f"🔬 Analyzing with AI Vision, {name}...")
+        img = download_image(content)
+        if not img:
+            send_whatsapp(phone, "❌ Download failed")
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            return send_main_menu(phone)
+        _, analysis = ai_vision_disease_detection(img, phone, name)
+        if analysis:
+            send_whatsapp_with_retry(phone, analysis)
+        else:
+            send_whatsapp(phone, "❌ AI Vision disease analysis failed.")
+        save_user(phone, {"state": USER_STATES["ACTIVE"]})
+        send_main_menu(phone)
+        gc.collect()
+        return
+
+    # AI Vision Curing (Gemini)
+    if state == USER_STATES["WAITING_AI_VISION_CURING"] and msg_type == "image":
+        send_whatsapp(phone, f"🔥 Analyzing curing with AI Vision, {name}...")
+        img = download_image(content)
+        if not img:
+            send_whatsapp(phone, "❌ Download failed")
+            save_user(phone, {"state": USER_STATES["ACTIVE"]})
+            return send_main_menu(phone)
+        _, analysis = ai_vision_curing_monitoring(img, phone, name)
+        if analysis:
+            send_whatsapp_with_retry(phone, analysis)
+        else:
+            send_whatsapp(phone, "❌ AI Vision curing analysis failed.")
+        save_user(phone, {"state": USER_STATES["ACTIVE"]})
+        send_main_menu(phone)
+        gc.collect()
+        return
+
     # EXPERT MENU
     if state == USER_STATES["EXPERT_MENU"] and msg_type == "text":
         cmd = content.strip()
@@ -934,107 +1078,6 @@ def handle_message(phone, msg_type, content):
         gc.collect()
         return
 
-    # DISEASE DETECTION (Option 1) - unchanged, uses Hugging Face
-    if state == USER_STATES["WAITING_IMAGE"] and msg_type == "image":
-        if phone in LAST_SCAN and time.time() - LAST_SCAN[phone] < 5:
-            return send_whatsapp(phone, "⏱️ Please wait 5 seconds")
-        LAST_SCAN[phone] = time.time()
-        send_whatsapp(phone, f"🔍 Analyzing, {name}...")
-        img = download_image(content)
-        if not img:
-            send_whatsapp(phone, "❌ Download failed")
-            save_user(phone, {"state": USER_STATES["ACTIVE"]})
-            return send_main_menu(phone)
-        result = call_huggingface_detection(img)
-        if not result:
-            # Fallback to Gemini vision if HF fails
-            _, analysis = ai_vision_disease_detection(img, phone, name)
-            if analysis and "⚠️" not in analysis:
-                send_whatsapp_with_retry(phone, analysis)
-            else:
-                send_whatsapp(phone, "❌ Analysis failed. Please try again later.")
-            save_user(phone, {"state": USER_STATES["ACTIVE"]})
-            send_main_menu(phone)
-            gc.collect()
-            return
-        disease, conf = result["disease"], result["confidence"]
-        conf_msg = get_confidence_message(conf)
-        log_detection(phone, name, disease, conf, result.get("severity"))
-        if result["low_confidence"]:
-            resp = f"⚠️ *Low Confidence ({conf:.1f}%)*\n\n{conf_msg}\n\nTry AI Vision (type *5*) or a clearer photo."
-        elif result["is_healthy"]:
-            resp = f"🎉 *Healthy Leaf!*\n\nConfidence: {conf:.1f}%\n{conf_msg}"
-        else:
-            resp = f"📊 *{disease} DETECTED*\n\nConfidence: {conf:.1f}%\n{conf_msg}"
-            if result.get("severity"):
-                resp += f"\nSeverity: *{result['severity']}*"
-            resp += f"\n\n*Treatment:*\n{result['treatment']}"
-        send_whatsapp(phone, resp)
-        if not result["is_healthy"] and not result["low_confidence"] and conf >= 50:
-            send_whatsapp(phone, get_offline_disease_advice(disease))
-        send_main_menu(phone)
-        gc.collect()
-        return
-
-    # AI VISION MENU (Option 5)
-    if state == USER_STATES["WAITING_AI_VISION"] and msg_type == "text":
-        cmd = content.strip()
-        if cmd == "0":
-            save_user(phone, {"state": USER_STATES["ACTIVE"]})
-            return send_main_menu(phone)
-        elif cmd == "1":
-            save_user(phone, {"state": USER_STATES["WAITING_AI_VISION_DISEASE"]})
-            return send_whatsapp(phone, "🔬 Send clear photo of leaf for disease analysis (AI Vision fallback)")
-        elif cmd == "2":
-            save_user(phone, {"state": USER_STATES["WAITING_AI_VISION_CURING"]})
-            return send_whatsapp(phone, "🔥 Send photo of curing leaf (ML service)")
-        return send_whatsapp(phone, "❌ Choose 1, 2, or 0")
-
-    # AI VISION DISEASE (fallback) - unchanged
-    if state == USER_STATES["WAITING_AI_VISION_DISEASE"] and msg_type == "image":
-        send_whatsapp(phone, f"🔬 Analyzing, {name}...")
-        img = download_image(content)
-        if not img:
-            send_whatsapp(phone, "❌ Download failed")
-            save_user(phone, {"state": USER_STATES["ACTIVE"]})
-            return send_main_menu(phone)
-        _, analysis = ai_vision_disease_detection(img, phone, name)
-        if analysis:
-            send_whatsapp_with_retry(phone, analysis)
-        save_user(phone, {"state": USER_STATES["ACTIVE"]})
-        send_main_menu(phone)
-        gc.collect()
-        return
-
-    # CURING MONITOR (Option 5 -> 2) - uses Hugging Face curing endpoint
-    if state == USER_STATES["WAITING_AI_VISION_CURING"] and msg_type == "image":
-        send_whatsapp(phone, f"🔥 Analyzing curing stage, {name}...")
-        img = download_image(content)
-        if not img:
-            send_whatsapp(phone, "❌ Download failed")
-            save_user(phone, {"state": USER_STATES["ACTIVE"]})
-            return send_main_menu(phone)
-        # Use Hugging Face curing endpoint
-        result = call_huggingface_curing(img)
-        if result and result.get("stage"):
-            stage = result["stage"]
-            confidence = result["confidence"]
-            advice = result.get("advice", "Monitor curing conditions.")
-            log_curing_result(phone, name, stage, confidence)
-            msg = f"🍂 *Curing Stage: {stage}*\n\nConfidence: {confidence:.1f}%\n\n{advice}"
-            send_whatsapp_with_retry(phone, msg)
-        else:
-            # Fallback to Gemini vision for curing
-            _, analysis = ai_vision_curing_monitoring(img, phone, name)
-            if analysis and "⚠️" not in analysis:
-                send_whatsapp_with_retry(phone, analysis)
-            else:
-                send_whatsapp(phone, "❌ Curing analysis failed. Please try again later.")
-        save_user(phone, {"state": USER_STATES["ACTIVE"]})
-        send_main_menu(phone)
-        gc.collect()
-        return
-
     # FEEDBACK
     if state == USER_STATES["AWAITING_FEEDBACK"] and msg_type == "text":
         if content.lower() == "cancel":
@@ -1062,9 +1105,9 @@ def handle_message(phone, msg_type, content):
         cmd = content.lower().strip()
         if cmd in ["menu", "0", "main"]:
             return send_main_menu(phone)
-        elif cmd in ["1", "detect"]:
-            save_user(phone, {"state": USER_STATES["WAITING_IMAGE"]})
-            return send_whatsapp(phone, "📸 Send clear photo of leaf (disease detection)")
+        elif cmd in ["1", "ml", "ml services"]:
+            save_user(phone, {"state": USER_STATES["ML_MENU"]})
+            return send_ml_menu(phone)
         elif cmd in ["2", "farming"]:
             save_user(phone, {"state": USER_STATES["FARMING_MENU"]})
             return send_farming_menu(phone)
@@ -1096,12 +1139,12 @@ def handle_message(phone, msg_type, content):
                 return send_main_menu(phone)
         elif cmd == "help":
             help_text = ("📚 *HELP*\n━━━━━━━━━━━━━━━━━━\n"
-                        "• *menu* - Main menu\n• *1* - Detect disease\n• *2* - Guides\n• *3* - Dashboard\n"
-                        "• *4* - Leaf grading\n• *5* - AI Vision (disease/curing)\n• *6* - Expert help\n"
-                        "• *7* - Feedback\n• *8* - Donate\n• *ai [question]* - Ask AI\n• *status* - Check payment")
+                        "• *1* - ML Services (HF Disease/Curing)\n• *2* - Farming Practices\n• *3* - Dashboard\n"
+                        "• *4* - Leaf Grading\n• *5* - AI Vision (Gemini)\n• *6* - Expert Help\n• *7* - Feedback\n"
+                        "• *8* - Donate\n• *ai [question]* - Ask AI\n• *status* - Check payment")
             return send_whatsapp(phone, help_text)
         else:
-            return send_whatsapp(phone, "❓ Type *menu* for options")
+            return send_whatsapp(phone, "❓ Type *menu* or *help*")
 
 # Flask routes
 @app.route("/webhook", methods=["GET", "POST"])
