@@ -424,15 +424,44 @@ def call_huggingface_curing(image_bytes):
         debug_log("🔄 Calling Hugging Face curing endpoint...")
         files = {'file': ('image.jpg', image_bytes, 'image/jpeg')}
         response = requests.post(f"{HF_SPACE_URL}/predict_curing", files=files, timeout=35)
+        debug_log(f"Curing response status: {response.status_code}")
+        
         if response.status_code == 200:
-            result = response.json()
-            if result.get("success"):
+            try:
+                result = response.json()
+                debug_log(f"Curing raw response: {json.dumps(result)}")
+            except Exception as json_err:
+                debug_log(f"❌ Failed to parse JSON: {json_err}")
+                debug_log(f"Raw text: {response.text[:500]}")
+                return None
+            
+            # Case 1: Standard format with 'success' and 'stage'
+            if result.get("success") and result.get("stage"):
                 return {
-                    "stage": result.get("stage"),
+                    "stage": result["stage"],
                     "confidence": result.get("confidence", 0),
                     "advice": result.get("advice", "")
                 }
-        return None
+            
+            # Case 2: Maybe 'probabilities' only? Try to extract top stage
+            if result.get("probabilities"):
+                probs = result["probabilities"]
+                # Find stage with highest probability
+                top_stage = max(probs, key=probs.get)
+                confidence = probs[top_stage]
+                advice = result.get("advice", f"Curing stage: {top_stage}")
+                return {
+                    "stage": top_stage,
+                    "confidence": confidence,
+                    "advice": advice
+                }
+            
+            # Case 3: Unexpected format – log keys and return None
+            debug_log(f"Unexpected curing response structure. Keys: {result.keys()}")
+            return None
+        else:
+            debug_log(f"HF curing returned non-200: {response.status_code}")
+            return None
     except Exception as e:
         debug_log(f"❌ HF curing error: {e}")
         return None
