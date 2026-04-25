@@ -798,7 +798,7 @@ def menu_main(phone: str) -> bool:
         "2️⃣  Farming Practices — Guides & AI advice\n"
         "3️⃣  My Dashboard      — Stats, History, Tips\n"
         "4️⃣  Leaf Grading      — Quality assessment\n"
-        "5️⃣  AI Vision         — Gemini Disease & Curing\n"
+        "5️⃣  AI Vision         — AI Disease & Curing\n"
         "6️⃣  Expert Help       — Agronomist & AI\n"
         "7️⃣  Feedback          — Send us comments\n"
         "8️⃣  Payments          — Donate / Support\n\n"
@@ -808,7 +808,7 @@ def menu_main(phone: str) -> bool:
 
 def menu_ml(phone: str) -> bool:
     return send_msg(phone,
-        "🤖 *ML SERVICES  (Hugging Face)*\n"
+        "🤖 *ML SERVICES  *\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "1️⃣  Disease Detection — send photo\n"
         "2️⃣  Curing Monitor    — send photo\n\n"
@@ -861,7 +861,7 @@ def menu_expert(phone: str) -> bool:
 
 def menu_ai_vision(phone: str) -> bool:
     return send_msg(phone,
-        "🔬 *AI VISION  (Gemini)*\n"
+        "🔬 *AI VISION  *\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "1️⃣  Disease Detection — send photo\n"
         "2️⃣  Curing Monitor    — send photo\n\n"
