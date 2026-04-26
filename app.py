@@ -794,7 +794,7 @@ def menu_main(phone: str) -> bool:
     return send_msg(phone,
         "🌿 *TOBACCO AI — MAIN MENU*\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "1️⃣  ML Services       — Disease & Curing (HF)\n"
+        "1️⃣  ML Services       — Disease & Curing \n"
         "2️⃣  Farming Practices — Guides & AI advice\n"
         "3️⃣  My Dashboard      — Stats, History, Tips\n"
         "4️⃣  Leaf Grading      — Quality assessment\n"
