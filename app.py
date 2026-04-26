@@ -1340,11 +1340,11 @@ def handle_message(phone: str, msg_type: str, content: str) -> None:
             send_msg(phone,
                 "📚 *HELP*\n"
                 "━━━━━━━━━━━━━━━━━━\n"
-                "• *1* — ML Services (HF Disease & Curing)\n"
+                "• *1* — ML Services ( Disease & Curing)\n"
                 "• *2* — Farming Practices\n"
                 "• *3* — My Dashboard\n"
                 "• *4* — Leaf Grading\n"
-                "• *5* — AI Vision (Gemini)\n"
+                "• *5* — AI Vision (detection and curing )\n"
                 "• *6* — Expert Help\n"
                 "• *7* — Feedback\n"
                 "• *8* — Donate / Support\n"
