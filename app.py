@@ -1426,6 +1426,151 @@ def health():
 def home():
     return "🌿 Tobacco AI Assistant is running!", 200
 
+IOT_DEVICES = {
+    "263714364950": {
+        "name":     "Main Tobacco Barn",
+        "location": "Harare",
+    },
+    # "263771234567": {"name": "Barn 2", "location": "Chinhoyi"},
+}
+
+
+@app.route("/esp32_image", methods=["POST"])
+def esp32_image():
+    """
+    Receive image + sensor data from ESP32-CAM, run curing detection,
+    and send a WhatsApp report to the device phone number.
+    """
+    try:
+        # ── 1. Phone number ───────────────────────────────────────────────────
+        raw_phone = (request.form.get("phone") or "").strip()
+        if not raw_phone:
+            return jsonify({"error": "Missing phone field"}), 400
+
+        phone = raw_phone.lstrip("+")
+        if phone.startswith("0"):
+            phone = "263" + phone[1:]
+        elif not phone.startswith("263"):
+            phone = "263" + phone
+
+        # ── 2. Sensor readings ────────────────────────────────────────────────
+        def _safe_float(key):
+            try:
+                return f"{float(request.form.get(key, '')):.1f}"
+            except (ValueError, TypeError):
+                return "N/A"
+
+        temp = _safe_float("temperature")
+        hum  = _safe_float("humidity")
+
+        # ── 3. Fan / heater state reported by the board ───────────────────────
+        fan_state    = request.form.get("fan_state",    "N/A")
+        heater_state = request.form.get("heater_state", None)   # None = not connected yet
+
+        # ── 4. Image ──────────────────────────────────────────────────────────
+        if "image" not in request.files:
+            return jsonify({"error": "No image attached"}), 400
+        img_bytes = request.files["image"].read()
+        if not img_bytes:
+            return jsonify({"error": "Empty image"}), 400
+
+        # ── 5. Barn info ──────────────────────────────────────────────────────
+        barn      = IOT_DEVICES.get(phone, {"name": f"Barn ({phone[-4:]})", "location": "Unknown"})
+        barn_name = barn["name"]
+        location  = barn["location"]
+
+        log(f"📷 ESP32 [{barn_name}] Temp={temp}C  Hum={hum}%  Fan={fan_state}  Size={len(img_bytes)}B")
+
+        # ── 6. Build control status line for WhatsApp message ─────────────────
+        ctrl_lines = f"💨 *Fan:*        {fan_state}"
+        if heater_state is not None:
+            ctrl_lines += f"\n🔥 *Heater:*     {heater_state}"
+        else:
+            ctrl_lines += "\n🔥 *Heater:*     not connected"
+
+        # ── 7. Run curing detection (HF first, Gemini fallback) ───────────────
+        hf_result = hf_curing_detect(img_bytes) if HF_SPACE_URL else None
+
+        if hf_result and hf_result.get("stage"):
+            stage  = hf_result["stage"]
+            conf   = hf_result.get("confidence", 0)
+            advice = hf_result.get("advice", "")
+
+            whatsapp_msg = (
+                f"📷 *Curing Node Update*\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🏚️ *Barn:*      {barn_name}\n"
+                f"📍 *Location:*  {location}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🍂 *Stage:*       {stage}\n"
+                f"📊 *Confidence:*  {conf:.1f}%\n"
+                f"🌡️ *Temperature:* {temp}°C\n"
+                f"💧 *Humidity:*    {hum}%\n"
+                f"{ctrl_lines}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"💡 {advice}\n\n"
+                f"_{_curing_tip(stage)}_"
+            )
+
+            log_detection(
+                phone, barn_name,
+                curing_stage=stage,
+                confidence=conf,
+                temperature=temp,
+                humidity=hum,
+                fan_state=fan_state,
+                heater_state=heater_state or "not_connected",
+                detection_type="esp32_curing_hf",
+            )
+
+        else:
+            # Gemini fallback
+            log("🔄 HF unavailable — falling back to Gemini.")
+            _, analysis = gemini_curing(img_bytes, phone, barn_name)
+
+            if analysis and "⚠️" not in analysis:
+                whatsapp_msg = (
+                    f"📷 *Curing Node Update (AI Vision)*\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"🏚️ *Barn:*     {barn_name}  |  📍 {location}\n"
+                    f"🌡️ *Temp:* {temp}°C  |  💧 *Hum:* {hum}%\n"
+                    f"{ctrl_lines}\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"{analysis}"
+                )
+            else:
+                whatsapp_msg = (
+                    f"⚠️ *Curing Node Alert*\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"🏚️ {barn_name}  |  📍 {location}\n"
+                    f"🌡️ Temp: {temp}°C  |  💧 Hum: {hum}%\n"
+                    f"{ctrl_lines}\n\n"
+                    "Image received but analysis failed — please check the camera lens."
+                )
+
+        # ── 8. Send WhatsApp message ──────────────────────────────────────────
+        success = send_msg(phone, whatsapp_msg)
+        log(f"{'✅' if success else '❌'} WhatsApp sent to {phone}")
+
+        return jsonify({"status": "ok", "whatsapp_sent": success}), 200
+
+    except Exception as e:
+        log(f"❌ ESP32 endpoint error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+def _curing_tip(stage: str) -> str:
+    """One-line tip matched to the detected curing stage."""
+    s = stage.lower()
+    if "fresh"  in s: return "Not yet cured — ensure barn temperature is rising steadily."
+    if "medium" in s: return "Good progress. Maintain temperature and check airflow."
+    if "well"   in s: return "Perfect golden leaf — ready to move to storage."
+    if "bad"    in s: return "Reduce heat and increase ventilation immediately."
+    if "yellow" in s: return "Maintain 32-38C, 85-90% RH for 48 hours."
+    if "leaf"   in s: return "Raise to 38-52C, reduce RH to 70-80%."
+    if "midrib" in s: return "52-60C, 50-60% RH until midribs are fully dry."
+    if "kill"   in s: return "60-71C, 30-40% RH for final colour fixation."
+    return "Monitor barn conditions closely."
 
 # ══════════════════════════════════════════════
 #  ENTRY POINT
