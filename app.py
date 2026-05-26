@@ -1473,6 +1473,9 @@ def esp32_image():
         img_bytes = request.files["image"].read()
         if not img_bytes:
             return jsonify({"error": "Empty image"}), 400
+        if len(img_bytes) < 5000:
+            log(f"❌ Image too small: {len(img_bytes)} bytes — likely corrupt frame")
+            return jsonify({"error": f"Image too small ({len(img_bytes)} bytes)"}), 400
 
         # ── 5. Barn info ──────────────────────────────────────────────────────
         barn      = IOT_DEVICES.get(phone, {"name": f"Barn ({phone[-4:]})", "location": "Unknown"})
