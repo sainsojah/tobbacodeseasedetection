@@ -6,6 +6,7 @@
 ║   • Option 1: ML Services (Hugging Face) — Disease & Curing      ║
 ║   • Option 5: AI Vision (Gemini)  — Disease & Curing             ║
 ║   • Payments: EcoCash USD & InnBucks USD (PayNow)                ║
+║   • Fallback: Zuripay USD payment link                           ║
 ║   • Firebase Firestore for user state & detection history        ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
@@ -76,6 +77,9 @@ RESULT_URL              = os.environ.get("RESULT_URL")
 
 MIN_AMOUNT_USD = 0.50
 
+# Zuripay fallback link (USD, supports any amount)
+ZURIPAY_USD_LINK = "https://checkout-staging.zuripay.app?checkout_id=zp_chk_304de1f289"
+
 
 # ══════════════════════════════════════════════
 #  USER STATE CONSTANTS
@@ -132,7 +136,7 @@ PAYMENT_METHODS = {
 # In-memory stores
 PAYMENT_QUEUE      : dict = {}
 PROCESSED_PAYMENTS : set  = set()
-SENT_MESSAGES      : set  = set()
+SENT_MESSAGES      : set  = set()          # Fixed: now a real set
 LAST_SCAN          : dict = {}
 
 PAYMENT_TIMEOUT_MINUTES = 10
@@ -323,12 +327,15 @@ def send_msg(phone: str, text: str, retries: int = 3) -> bool:
 
 
 def send_once(phone: str, text: str) -> None:
-    """Deduplicated send — skips identical recent messages."""
+    """Deduplicated send — skips identical recent messages. Auto‑clears set if too large."""
     key = f"{phone}:{hash(text)}"
     if key in SENT_MESSAGES:
         log(f"⏭️ Duplicate skipped: {text[:30]}...")
         return
     SENT_MESSAGES.add(key)
+    if len(SENT_MESSAGES) > 500:
+        SENT_MESSAGES.clear()
+        log("🧹 Cleared SENT_MESSAGES (size > 500)")
     send_msg(phone, text)
 
 
@@ -408,9 +415,9 @@ def get_user_stats(phone: str) -> dict:
             dtype = d.get("detection_type", "")
             if dtype == "hf_disease":                        hf += 1
             elif dtype == "ai_vision_disease":               ai += 1
-            elif dtype in ("ai_vision_curing", "hf_curing"): curing += 1
+            elif dtype in ("ai_vision_curing", "hf_curing", "esp32_curing_hf"): curing += 1
             disease = d.get("disease", "")
-            if dtype not in ("hf_curing", "ai_vision_curing"):
+            if dtype not in ("hf_curing", "ai_vision_curing", "esp32_curing_hf"):
                 if "healthy" in disease.lower(): healthy += 1
                 elif disease: diseases[disease] = diseases.get(disease, 0) + 1
         return {
@@ -673,7 +680,7 @@ def get_fun_fact() -> str:
 
 
 # ══════════════════════════════════════════════
-#  PAYMENT — PayNow direct API
+#  PAYMENT — PayNow direct API + Zuripay fallback
 # ══════════════════════════════════════════════
 
 def _paynow_initiate(phone: str, name: str, amount: float,
@@ -971,7 +978,18 @@ def handle_payment_mobile_number(phone: str, user: dict, text: str) -> None:
     )
 
     if not success:
-        send_msg(phone, f"❌ Payment initiation failed: {result}\n\nPlease try again later.")
+        # Payment initiation failed – send fallback Zuripay link
+        fallback_msg = (
+            f"❌ *EcoCash payment could not be initiated.*\n\n"
+            f"Reason: {result}\n\n"
+            "💳 *Alternative payment method (USD)*\n"
+            "You can pay any amount using this secure link:\n"
+            f"{ZURIPAY_USD_LINK}\n\n"
+            "👉 The link supports *any amount* — you can pay more if you wish.\n\n"
+            "After completing the payment, your account will be upgraded automatically.\n"
+            "Thank you for supporting Tobacco AI! 🌿"
+        )
+        send_msg(phone, fallback_msg)
         save_user(phone, {"state": STATE["ACTIVE"]})
         menu_main(phone)
         return
@@ -1250,7 +1268,7 @@ def handle_message(phone: str, msg_type: str, content: str) -> None:
                     dtype = h.get("detection_type", "")
                     if   dtype == "hf_disease":        lines.append(f"{i}. 🔬 {h.get('disease')} — {h.get('confidence', 0):.0f}%")
                     elif dtype == "ai_vision_disease":  lines.append(f"{i}. 👁  {h.get('disease')}")
-                    elif dtype in ("ai_vision_curing", "hf_curing"): lines.append(f"{i}. 🔥 {h.get('curing_stage')}")
+                    elif dtype in ("ai_vision_curing", "hf_curing", "esp32_curing_hf"): lines.append(f"{i}. 🔥 {h.get('curing_stage')}")
                     elif dtype == "leaf_grading":       lines.append(f"{i}. 📊 Grade {h.get('grade')}")
                     if h.get("date"):
                         lines.append(f"   📅 {h['date']}")
@@ -1356,6 +1374,130 @@ def handle_message(phone: str, msg_type: str, content: str) -> None:
 
 
 # ══════════════════════════════════════════════
+#  ESP32 BACKGROUND PROCESSING
+# ══════════════════════════════════════════════
+
+IOT_DEVICES = {
+    "263714364950": {
+        "name":     "Main Tobacco Barn",
+        "location": "Harare",
+    },
+    # "263771234567": {"name": "Barn 2", "location": "Chinhoyi"},
+}
+
+def _curing_tip(stage: str) -> str:
+    """One-line tip matched to the detected curing stage."""
+    s = stage.lower()
+    if "fresh"  in s: return "Not yet cured — ensure barn temperature is rising steadily."
+    if "medium" in s: return "Good progress. Maintain temperature and check airflow."
+    if "well"   in s: return "Perfect golden leaf — ready to move to storage."
+    if "bad"    in s: return "Reduce heat and increase ventilation immediately."
+    if "yellow" in s: return "Maintain 32-38C, 85-90% RH for 48 hours."
+    if "leaf"   in s: return "Raise to 38-52C, reduce RH to 70-80%."
+    if "midrib" in s: return "52-60C, 50-60% RH until midribs are fully dry."
+    if "kill"   in s: return "60-71C, 30-40% RH for final colour fixation."
+    return "Monitor barn conditions closely."
+
+def _process_esp32_image(raw_phone: str, img_bytes: bytes, temp: str, hum: str, fan_state: str) -> None:
+    """Background processing — runs after ESP32 already got its 200 OK."""
+    try:
+        # Normalise phone
+        phone = raw_phone.lstrip("+")
+        if phone.startswith("0"):
+            phone = "263" + phone[1:]
+        elif not phone.startswith("263"):
+            phone = "263" + phone
+
+        barn      = IOT_DEVICES.get(phone, {"name": f"Barn ({phone[-4:]})", "location": "Unknown"})
+        barn_name = barn["name"]
+        location  = barn["location"]
+
+        log(f"📷 Processing ESP32 [{barn_name}] {len(img_bytes)}B")
+
+        ctrl_lines = f"💨 *Fan:* {fan_state}\n🔥 *Heater:* not connected"
+
+        hf_result = hf_curing_detect(img_bytes) if HF_SPACE_URL else None
+
+        if hf_result and hf_result.get("stage"):
+            stage  = hf_result["stage"]
+            conf   = hf_result.get("confidence", 0)
+            advice = hf_result.get("advice", "")
+            whatsapp_msg = (
+                f"📷 *Curing Node Update*\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🏚️ *Barn:* {barn_name}  📍 {location}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🍂 *Stage:*      {stage}\n"
+                f"📊 *Confidence:* {conf:.1f}%\n"
+                f"🌡️ *Temp:* {temp}°C  💧 *Hum:* {hum}%\n"
+                f"{ctrl_lines}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"💡 {advice}\n_{_curing_tip(stage)}_"
+            )
+            log_detection(phone, f"ESP32_{phone[-4:]}",
+                          curing_stage=stage, confidence=conf,
+                          temperature=temp, humidity=hum,
+                          detection_type="esp32_curing_hf")
+        else:
+            # Gemini fallback – user name uses last 4 digits of phone instead of barn name
+            _, analysis = gemini_curing(img_bytes, phone, f"ESP32_{phone[-4:]}")
+            whatsapp_msg = (
+                f"📷 *Curing Node — AI Vision*\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🏚️ {barn_name}  📍 {location}\n"
+                f"🌡️ {temp}°C  💧 {hum}%\n"
+                f"{ctrl_lines}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"{analysis or 'Analysis unavailable — check camera.'}"
+            )
+
+        send_msg(phone, whatsapp_msg)
+        log(f"✅ ESP32 processing complete for {phone}")
+
+    except Exception as e:
+        log(f"❌ ESP32 background processing error: {e}")
+
+
+@app.route("/esp32_image", methods=["POST"])
+def esp32_image():
+    """
+    Receive image + sensor data from ESP32-CAM, run curing detection in background,
+    and return immediately to avoid ESP32 timeout.
+    """
+    try:
+        # Read everything from request BEFORE threading
+        raw_phone = (request.form.get("phone") or "").strip()
+        if not raw_phone:
+            return jsonify({"error": "Missing phone"}), 400
+
+        if "image" not in request.files:
+            return jsonify({"error": "No image attached"}), 400
+        img_bytes = request.files["image"].read()
+        if not img_bytes:
+            return jsonify({"error": "Empty image"}), 400
+        if len(img_bytes) < 5000:
+            log(f"❌ Frame too small: {len(img_bytes)}B")
+            return jsonify({"error": f"Image too small ({len(img_bytes)} bytes)"}), 400
+
+        temp      = request.form.get("temperature", "N/A")
+        hum       = request.form.get("humidity", "N/A")
+        fan_state = request.form.get("fan_state", "N/A")
+
+        # Process in background – ESP32 gets 200 right away
+        threading.Thread(
+            target=_process_esp32_image,
+            args=(raw_phone, img_bytes, temp, hum, fan_state),
+            daemon=True
+        ).start()
+
+        return jsonify({"status": "received"}), 200
+
+    except Exception as e:
+        log(f"❌ ESP32 endpoint error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ══════════════════════════════════════════════
 #  FLASK ROUTES
 # ══════════════════════════════════════════════
 
@@ -1414,11 +1556,12 @@ def paynow_update():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
-        "status":    "healthy",
-        "firebase":  db is not None,
-        "gemini":    bool(AI_API_KEY),
-        "hf_space":  bool(HF_SPACE_URL),
-        "paynow":    bool(PAYNOW_USD_API_KEY and PAYNOW_USD_MERCHANT_ID),
+        "status":      "healthy",
+        "firebase":    db is not None,
+        "gemini":      bool(AI_API_KEY),
+        "hf_space":    bool(HF_SPACE_URL),
+        "paynow":      bool(PAYNOW_USD_API_KEY and PAYNOW_USD_MERCHANT_ID),
+        "iot_devices": len(IOT_DEVICES),
     }), 200
 
 
@@ -1426,154 +1569,6 @@ def health():
 def home():
     return "🌿 Tobacco AI Assistant is running!", 200
 
-IOT_DEVICES = {
-    "263714364950": {
-        "name":     "Main Tobacco Barn",
-        "location": "Harare",
-    },
-    # "263771234567": {"name": "Barn 2", "location": "Chinhoyi"},
-}
-
-
-@app.route("/esp32_image", methods=["POST"])
-def esp32_image():
-    """
-    Receive image + sensor data from ESP32-CAM, run curing detection,
-    and send a WhatsApp report to the device phone number.
-    """
-    try:
-        # ── 1. Phone number ───────────────────────────────────────────────────
-        raw_phone = (request.form.get("phone") or "").strip()
-        if not raw_phone:
-            return jsonify({"error": "Missing phone field"}), 400
-
-        phone = raw_phone.lstrip("+")
-        if phone.startswith("0"):
-            phone = "263" + phone[1:]
-        elif not phone.startswith("263"):
-            phone = "263" + phone
-
-        # ── 2. Sensor readings ────────────────────────────────────────────────
-        def _safe_float(key):
-            try:
-                return f"{float(request.form.get(key, '')):.1f}"
-            except (ValueError, TypeError):
-                return "N/A"
-
-        temp = _safe_float("temperature")
-        hum  = _safe_float("humidity")
-
-        # ── 3. Fan / heater state reported by the board ───────────────────────
-        fan_state    = request.form.get("fan_state",    "N/A")
-        heater_state = request.form.get("heater_state", None)   # None = not connected yet
-
-        # ── 4. Image ──────────────────────────────────────────────────────────
-        if "image" not in request.files:
-            return jsonify({"error": "No image attached"}), 400
-        img_bytes = request.files["image"].read()
-        if not img_bytes:
-            return jsonify({"error": "Empty image"}), 400
-        if len(img_bytes) < 5000:
-            log(f"❌ Image too small: {len(img_bytes)} bytes — likely corrupt frame")
-            return jsonify({"error": f"Image too small ({len(img_bytes)} bytes)"}), 400
-
-        # ── 5. Barn info ──────────────────────────────────────────────────────
-        barn      = IOT_DEVICES.get(phone, {"name": f"Barn ({phone[-4:]})", "location": "Unknown"})
-        barn_name = barn["name"]
-        location  = barn["location"]
-
-        log(f"📷 ESP32 [{barn_name}] Temp={temp}C  Hum={hum}%  Fan={fan_state}  Size={len(img_bytes)}B")
-
-        # ── 6. Build control status line for WhatsApp message ─────────────────
-        ctrl_lines = f"💨 *Fan:*        {fan_state}"
-        if heater_state is not None:
-            ctrl_lines += f"\n🔥 *Heater:*     {heater_state}"
-        else:
-            ctrl_lines += "\n🔥 *Heater:*     not connected"
-
-        # ── 7. Run curing detection (HF first, Gemini fallback) ───────────────
-        hf_result = hf_curing_detect(img_bytes) if HF_SPACE_URL else None
-
-        if hf_result and hf_result.get("stage"):
-            stage  = hf_result["stage"]
-            conf   = hf_result.get("confidence", 0)
-            advice = hf_result.get("advice", "")
-
-            whatsapp_msg = (
-                f"📷 *Curing Node Update*\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"🏚️ *Barn:*      {barn_name}\n"
-                f"📍 *Location:*  {location}\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"🍂 *Stage:*       {stage}\n"
-                f"📊 *Confidence:*  {conf:.1f}%\n"
-                f"🌡️ *Temperature:* {temp}°C\n"
-                f"💧 *Humidity:*    {hum}%\n"
-                f"{ctrl_lines}\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"💡 {advice}\n\n"
-                f"_{_curing_tip(stage)}_"
-            )
-
-            log_detection(
-                phone, barn_name,
-                curing_stage=stage,
-                confidence=conf,
-                temperature=temp,
-                humidity=hum,
-                fan_state=fan_state,
-                heater_state=heater_state or "not_connected",
-                detection_type="esp32_curing_hf",
-            )
-
-        else:
-            # Gemini fallback
-            log("🔄 HF unavailable — falling back to Gemini.")
-            _, analysis = gemini_curing(img_bytes, phone, barn_name)
-
-            if analysis and "⚠️" not in analysis:
-                whatsapp_msg = (
-                    f"📷 *Curing Node Update (AI Vision)*\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"🏚️ *Barn:*     {barn_name}  |  📍 {location}\n"
-                    f"🌡️ *Temp:* {temp}°C  |  💧 *Hum:* {hum}%\n"
-                    f"{ctrl_lines}\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"{analysis}"
-                )
-            else:
-                whatsapp_msg = (
-                    f"⚠️ *Curing Node Alert*\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"🏚️ {barn_name}  |  📍 {location}\n"
-                    f"🌡️ Temp: {temp}°C  |  💧 Hum: {hum}%\n"
-                    f"{ctrl_lines}\n\n"
-                    "Image received but analysis failed — please check the camera lens."
-                )
-
-        # ── 8. Send WhatsApp message ──────────────────────────────────────────
-        success = send_msg(phone, whatsapp_msg)
-        log(f"{'✅' if success else '❌'} WhatsApp sent to {phone}")
-
-        return jsonify({"status": "ok", "whatsapp_sent": success}), 200
-
-    except Exception as e:
-        log(f"❌ ESP32 endpoint error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-def _curing_tip(stage: str) -> str:
-    """One-line tip matched to the detected curing stage."""
-    s = stage.lower()
-    if "fresh"  in s: return "Not yet cured — ensure barn temperature is rising steadily."
-    if "medium" in s: return "Good progress. Maintain temperature and check airflow."
-    if "well"   in s: return "Perfect golden leaf — ready to move to storage."
-    if "bad"    in s: return "Reduce heat and increase ventilation immediately."
-    if "yellow" in s: return "Maintain 32-38C, 85-90% RH for 48 hours."
-    if "leaf"   in s: return "Raise to 38-52C, reduce RH to 70-80%."
-    if "midrib" in s: return "52-60C, 50-60% RH until midribs are fully dry."
-    if "kill"   in s: return "60-71C, 30-40% RH for final colour fixation."
-    return "Monitor barn conditions closely."
 
 # ══════════════════════════════════════════════
 #  ENTRY POINT
@@ -1586,4 +1581,5 @@ if __name__ == "__main__":
     log(f"🤖 Hugging Face: {'✅' if HF_SPACE_URL       else '❌'}")
     log(f"🔮 Gemini AI   : {'✅' if AI_API_KEY          else '❌'}")
     log(f"🔥 Firebase    : {'✅' if db                  else '❌'}")
+    log(f"💳 Zuripay link: {ZURIPAY_USD_LINK}")
     app.run(host="0.0.0.0", port=port, debug=False)
