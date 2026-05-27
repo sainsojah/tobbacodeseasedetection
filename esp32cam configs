@@ -1,0 +1,351 @@
+/*
+ * tobacco_cam.ino — Final for Presentation
+ * ========================================
+ * - VGA resolution (640x480) -> larger images
+ * - JPEG quality 8 (good detail)
+ * - Flash disabled, no watchdog
+ * - SD failover, HTTP retries
+ */
+
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include "SD_MMC.h"
+
+// ══════════════════════════════════════════════
+//  CONFIGURATION (edit only these)
+// ══════════════════════════════════════════════
+
+const char* ssid         = "Pop9";
+const char* password     = "wzyl8423";
+const char* SERVER_URL   = "https://tobbacodeseasedetection-j08x.onrender.com/esp32_image";
+const char* DEVICE_PHONE = "263714364950";
+
+const unsigned long INTERVAL_MS   = 60000;   // 60 seconds
+const int           HTTP_RETRIES  = 3;
+const int           MIN_IMG_BYTES = 3000;    // still low, but images will be much larger
+
+#define LED_PIN 4   // Flash LED (disabled)
+
+// ══════════════════════════════════════════════
+//  CAMERA PINS (AI-Thinker – do not change)
+// ══════════════════════════════════════════════
+
+#define PWDN_GPIO_NUM  32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM   0
+#define SIOD_GPIO_NUM  26
+#define SIOC_GPIO_NUM  27
+#define Y9_GPIO_NUM    35
+#define Y8_GPIO_NUM    34
+#define Y7_GPIO_NUM    39
+#define Y6_GPIO_NUM    36
+#define Y5_GPIO_NUM    21
+#define Y4_GPIO_NUM    19
+#define Y3_GPIO_NUM    18
+#define Y2_GPIO_NUM     5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM  23
+#define PCLK_GPIO_NUM  22
+
+// ══════════════════════════════════════════════
+//  GLOBALS
+// ══════════════════════════════════════════════
+
+unsigned long lastSend    = 0;
+bool          cameraReady = false;
+bool          sdReady     = false;
+int           imgCounter  = 0;
+int           successCount = 0;
+int           failCount    = 0;
+
+void blink(int times, int ms = 150) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(ms);
+    digitalWrite(LED_PIN, LOW);
+    delay(ms);
+  }
+}
+
+void sdLog(String msg) {
+  if (!sdReady) return;
+  File f = SD_MMC.open("/log.txt", FILE_APPEND);
+  if (f) {
+    f.println("[" + String(millis() / 1000) + "s] " + msg);
+    f.close();
+  }
+}
+
+void saveToSD(uint8_t* data, size_t len, String filename) {
+  if (!sdReady) return;
+  File f = SD_MMC.open("/" + filename, FILE_WRITE);
+  if (f) {
+    f.write(data, len);
+    f.close();
+    Serial.println("[SD] Saved: /" + filename);
+    sdLog("Saved: " + filename);
+  }
+}
+
+void retrySDQueue() {
+  if (!sdReady || WiFi.status() != WL_CONNECTED) return;
+  File root = SD_MMC.open("/");
+  File file = root.openNextFile();
+  int retried = 0;
+  while (file && retried < 3) {
+    String name = file.name();
+    if (name.startsWith("/queued_") && name.endsWith(".jpg")) {
+      Serial.println("[SD] Retrying queued: " + name);
+      size_t len = file.size();
+      uint8_t* buf = (uint8_t*)ps_malloc(len);
+      if (!buf) buf = (uint8_t*)malloc(len);
+      if (buf) {
+        file.read(buf, len);
+        file.close();
+        if (httpPost(buf, len)) {
+          SD_MMC.remove(name);
+          Serial.println("[SD] Queued image sent.");
+          sdLog("Retry OK: " + name);
+        }
+        free(buf);
+        retried++;
+      } else {
+        file.close();
+      }
+    } else {
+      file.close();
+    }
+    file = root.openNextFile();
+  }
+}
+
+bool httpPost(uint8_t* imgBuf, size_t imgLen) {
+  String boundary = "TobaccoBoundary7860";
+  String head = "--" + boundary + "\r\n";
+  head += "Content-Disposition: form-data; name=\"phone\"\r\n\r\n";
+  head += String(DEVICE_PHONE) + "\r\n";
+  head += "--" + boundary + "\r\n";
+  head += "Content-Disposition: form-data; name=\"image\"; filename=\"leaf.jpg\"\r\n";
+  head += "Content-Type: image/jpeg\r\n\r\n";
+  String tail = "\r\n--" + boundary + "--\r\n";
+
+  size_t totalLen = head.length() + imgLen + tail.length();
+  uint8_t* body = (uint8_t*)ps_malloc(totalLen);
+  if (!body) body = (uint8_t*)malloc(totalLen);
+  if (!body) {
+    Serial.println("[HTTP] No RAM for body.");
+    return false;
+  }
+
+  size_t pos = 0;
+  memcpy(body + pos, head.c_str(), head.length()); pos += head.length();
+  memcpy(body + pos, imgBuf,       imgLen);        pos += imgLen;
+  memcpy(body + pos, tail.c_str(), tail.length());
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(15000);
+
+  HTTPClient http;
+  http.begin(client, SERVER_URL);
+  http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+  http.setTimeout(15000);
+
+  int code = http.POST(body, totalLen);
+  http.end();
+  free(body);
+
+  Serial.printf("[HTTP] %d\n", code);
+  return (code == 200);
+}
+
+void connectWiFi() {
+  WiFi.disconnect(true);
+  delay(300);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.printf("[WIFI] Connecting to %s", ssid);
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 50) {
+    delay(500);
+    Serial.print(".");
+    tries++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n[WIFI] Connected. IP: %s\n", WiFi.localIP().toString().c_str());
+    sdLog("WiFi connected: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\n[WIFI] Failed — will retry.");
+    sdLog("WiFi failed");
+  }
+}
+
+bool initCamera() {
+  camera_config_t cfg;
+  cfg.ledc_channel = LEDC_CHANNEL_0;
+  cfg.ledc_timer   = LEDC_TIMER_0;
+  cfg.pin_d0       = Y2_GPIO_NUM;
+  cfg.pin_d1       = Y3_GPIO_NUM;
+  cfg.pin_d2       = Y4_GPIO_NUM;
+  cfg.pin_d3       = Y5_GPIO_NUM;
+  cfg.pin_d4       = Y6_GPIO_NUM;
+  cfg.pin_d5       = Y7_GPIO_NUM;
+  cfg.pin_d6       = Y8_GPIO_NUM;
+  cfg.pin_d7       = Y9_GPIO_NUM;
+  cfg.pin_xclk     = XCLK_GPIO_NUM;
+  cfg.pin_pclk     = PCLK_GPIO_NUM;
+  cfg.pin_vsync    = VSYNC_GPIO_NUM;
+  cfg.pin_href     = HREF_GPIO_NUM;
+  cfg.pin_sscb_sda = SIOD_GPIO_NUM;
+  cfg.pin_sscb_scl = SIOC_GPIO_NUM;
+  cfg.pin_pwdn     = PWDN_GPIO_NUM;
+  cfg.pin_reset    = RESET_GPIO_NUM;
+  cfg.xclk_freq_hz = 20000000;
+  cfg.pixel_format = PIXFORMAT_JPEG;
+  cfg.jpeg_quality = 8;                     // high quality -> larger file
+  cfg.fb_count     = 1;
+  cfg.frame_size   = FRAMESIZE_VGA;          // 640x480 (much larger than QVGA)
+
+  esp_err_t err = esp_camera_init(&cfg);
+  if (err != ESP_OK) {
+    Serial.printf("[CAM] Init error: 0x%x\n", err);
+    return false;
+  }
+
+  // Disable flash LED
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_brightness(s, 0);
+  s->set_contrast(s, 0);
+  s->set_saturation(s, 0);
+  s->set_exposure_ctrl(s, 1);
+  s->set_gain_ctrl(s, 1);
+
+  Serial.println("[CAM] Ready (VGA 640x480) - Flash disabled");
+  return true;
+}
+
+void setup() {
+  setCpuFrequencyMhz(160);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n[TOBACCO-CAM] Starting...");
+
+  connectWiFi();
+  delay(3000);
+
+  cameraReady = initCamera();
+  if (!cameraReady) {
+    blink(5, 100);
+    Serial.println("[ERROR] Camera failed — halting.");
+    while (true) { delay(1000); }
+  }
+  delay(500);
+
+  if (SD_MMC.begin("/sdcard", true)) {
+    sdReady = true;
+    Serial.println("[SD] Card ready");
+    sdLog("=== Boot ===");
+  } else {
+    Serial.println("[SD] No card detected");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    delay(1000);
+    captureAndSend();
+    lastSend = millis();
+  }
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WIFI] Lost — reconnecting...");
+    connectWiFi();
+    delay(3000);
+  }
+
+  if (millis() - lastSend >= INTERVAL_MS) {
+    retrySDQueue();
+    captureAndSend();
+    lastSend = millis();
+  }
+
+  delay(1000);
+}
+
+void captureAndSend() {
+  blink(1);
+  Serial.println("[CAM] Capturing...");
+  digitalWrite(LED_PIN, LOW);
+
+  // Discard stale frame
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (fb) { esp_camera_fb_return(fb); delay(200); }
+
+  fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("[CAM] Capture failed.");
+    sdLog("Capture failed");
+    return;
+  }
+
+  Serial.printf("[CAM] %d bytes captured.\n", fb->len);
+  if ((int)fb->len < MIN_IMG_BYTES) {
+    Serial.printf("[CAM] Frame too small (%d bytes) — skipping.\n", fb->len);
+    sdLog("Frame too small: " + String(fb->len) + " bytes");
+    esp_camera_fb_return(fb);
+    blink(5, 80);
+    return;
+  }
+
+  size_t imgLen = fb->len;
+  uint8_t* imgBuf = (uint8_t*)ps_malloc(imgLen);
+  if (!imgBuf) imgBuf = (uint8_t*)malloc(imgLen);
+  if (!imgBuf) {
+    Serial.println("[CAM] No RAM to copy frame.");
+    esp_camera_fb_return(fb);
+    return;
+  }
+  memcpy(imgBuf, fb->buf, imgLen);
+  esp_camera_fb_return(fb);
+
+  imgCounter++;
+
+  bool sent = false;
+  for (int attempt = 1; attempt <= HTTP_RETRIES; attempt++) {
+    Serial.printf("[HTTP] Attempt %d/%d...\n", attempt, HTTP_RETRIES);
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[HTTP] No WiFi — skipping.");
+      break;
+    }
+    if (httpPost(imgBuf, imgLen)) {
+      sent = true;
+      successCount++;
+      Serial.println("[HTTP] Sent successfully.");
+      sdLog("SENT OK img#" + String(imgCounter) + " (" + String(imgLen) + " bytes) success=" + String(successCount));
+      blink(2);
+      break;
+    }
+    Serial.println("[HTTP] Attempt failed — waiting 3s...");
+    delay(3000);
+  }
+
+  if (!sent) {
+    failCount++;
+    String queueName = "queued_" + String(imgCounter) + ".jpg";
+    saveToSD(imgBuf, imgLen, queueName);
+    sdLog("FAILED img#" + String(imgCounter) + " queued as " + queueName + " success=" + String(successCount) + " fail=" + String(failCount));
+    blink(3);
+    Serial.println("[HTTP] All retries failed — saved to SD queue.");
+  }
+
+  free(imgBuf);
+  Serial.println("[CAM] Done.\n");
+}
